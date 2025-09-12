@@ -1,0 +1,21 @@
+[project]
+name = "opym"
+version = "0.1.0"
+description = "A GPU-accelerated pipeline for OPM data processing."
+authors = [{ name = "Brandon Scott", email = "brandon.scott@sdsmt.edu" }]
+requires-python = ">=3.10"
+dependencies = [
+    "cupy-cuda12x",
+    "numpy",
+    "tifffile",
+    "pyyaml",
+    "requests",
+    "llspy"
+]
+
+[project.scripts]
+opym = "opym.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
