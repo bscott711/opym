@@ -59,7 +59,6 @@ def main() -> None:
     # --- Get Processing Parameters ---
     dz = meta_params.get("voxel_size_z", 1.0)
     angle = 31.5  # Standard for OPM
-    iterations = 10  # A reasonable default
 
     # --- Process Each File ---
     all_successful = True
@@ -70,7 +69,6 @@ def main() -> None:
             output_dir=output_dir,
             dz=dz,
             angle=angle,
-            decon_iterations=iterations,
         )
         if not success:
             all_successful = False
