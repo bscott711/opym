@@ -30,11 +30,9 @@ def process_file(
         print(f"  - Loaded raw data with shape: {raw_stack.shape}")
 
         # --- Define ROIs and Split Channels ---
-        # Using the exact coordinates you provided.
-        # Format is (y_start, y_end, x_start, x_end).
         rois = [
-            (657, 1161, 1224, 2262),  # ROI for channels 0 and 1
-            (1296, 1800, 1224, 2262),  # ROI for channels 2 and 3
+            (657, 1161, 1224, 2262),  # ch0 (cam1) & ch1 (cam2)
+            (1296, 1800, 1224, 2262),  # ch2 (cam1) & ch3 (cam2)
         ]
         channels = crop_and_split_channels(raw_stack, rois)
         print(f"  - Cropped and split into {len(channels)} channels.")
@@ -93,68 +91,70 @@ def combined_transform(
 ) -> cp.ndarray:
     """
     Applies a single, combined affine transformation for deskewing and
-    rotation to coverslip coordinates.
+    rotation to coverslip coordinates, based on the logic from the
+    deskewRotateFrame3D.m script.
     """
     nz, ny, nx = image_stack.shape
     angle_rad = np.deg2rad(angle)
 
-    # --- Build the forward transformation matrix ---
-    # This maps points from the original image to the new, transformed space.
+    # --- Calculate Geometric Parameters ---
+    # Shear factor: pixels shifted in x per z-slice
+    shear_factor = dz * np.cos(angle_rad) / dx
+    # Z-anisotropy: new z-spacing in pixel units after projection
+    z_aniso = dz * np.sin(angle_rad) / dx
 
-    # 1. Deskew (shear)
-    deskew_mat = np.eye(4)
-    deskew_mat[2, 0] = dz * np.cos(angle_rad) / dx
+    # --- Calculate Final Output Shape (as per MATLAB script) ---
+    # The new dimensions are calculated based on the geometry of the rotation.
+    # Note the coordinate system differences: MATLAB is (Y, X, Z), NumPy is (Z, Y, X).
+    out_nz = int(
+        np.round((nx - 1) * np.sin(angle_rad) + (nz - 1) * z_aniso * np.cos(angle_rad))
+    )
+    out_ny = ny
+    out_nx = int(
+        np.round((nx - 1) * np.cos(angle_rad) + (nz - 1) * z_aniso * np.sin(angle_rad))
+    )
+    output_shape = (out_nz, out_ny, out_nx)
 
-    # 2. Z-scaling (to make voxels isotropic before rotation)
+    # --- Build Forward Transformation Matrix (Input -> Output) ---
+    # 1. Deskew Matrix
+    deskew_mat = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [shear_factor, 0, 1, 0], [0, 0, 0, 1]]
+    )
+
+    # 2. Translate to Center for Rotation
+    center_in = np.array([(nz - 1) / 2, (ny - 1) / 2, (nx - 1) / 2])
+    t1 = np.eye(4)
+    t1[:3, 3] = -center_in
+
+    # 3. Scale Z for Isotropic Rotation
     scale_mat = np.eye(4)
-    scale_mat[0, 0] = np.sin(angle_rad)
+    scale_mat[0, 0] = z_aniso
 
-    # 3. Rotation around Y-axis
-    rot_mat = np.eye(4)
+    # 4. Rotate around Y-axis
     theta = -angle_rad
+    rot_mat = np.eye(4)
     rot_mat[0, 0] = np.cos(theta)
     rot_mat[0, 2] = -np.sin(theta)
     rot_mat[2, 0] = np.sin(theta)
     rot_mat[2, 2] = np.cos(theta)
 
-    # Combine transformations
-    forward_transform = rot_mat @ scale_mat @ deskew_mat
+    # 5. Translate to Center of Output Volume
+    center_out = np.array([(out_nz - 1) / 2, (out_ny - 1) / 2, (out_nx - 1) / 2])
+    t2 = np.eye(4)
+    t2[:3, 3] = center_out
 
-    # --- Calculate the output shape ---
-    corners = np.array(
-        [
-            [0, 0, 0, 1],
-            [0, 0, nx, 1],
-            [0, ny, 0, 1],
-            [0, ny, nx, 1],
-            [nz, 0, 0, 1],
-            [nz, 0, nx, 1],
-            [nz, ny, 0, 1],
-            [nz, ny, nx, 1],
-        ]
-    ).T
+    # Combine matrices to create the full forward transformation
+    forward_transform = t2 @ rot_mat @ scale_mat @ t1 @ deskew_mat
 
-    transformed_corners = forward_transform @ corners
-    min_coords = transformed_corners[:3].min(axis=1)
-    max_coords = transformed_corners[:3].max(axis=1)
-    output_shape = tuple(np.ceil(max_coords - min_coords).astype(int))
+    # --- Invert Matrix for the Library Function ---
+    # The affine_transform function requires a matrix that maps points from
+    # the output space back to the original input space.
+    inverse_transform = np.linalg.inv(forward_transform)
 
-    # --- Build the inverse transformation matrix for cupyx.scipy.ndimage ---
-    # This maps points from the new, transformed space back to the original image.
-
-    # Create a translation matrix to move the transformed volume to the origin
-    translation_mat = np.eye(4)
-    translation_mat[:3, 3] = -min_coords
-
-    # The final forward transformation matrix
-    final_forward_mat = translation_mat @ forward_transform
-
-    # The inverse transformation matrix
-    inverse_mat = np.linalg.inv(final_forward_mat)
-
+    # Apply the transformation
     return affine_transform(
         image_stack,
-        cp.asarray(inverse_mat),
+        cp.asarray(inverse_transform),
         output_shape=output_shape,
         order=1,
         prefilter=False,
