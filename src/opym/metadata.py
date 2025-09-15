@@ -37,4 +37,3 @@ def parse_acq_settings(settings_path: str) -> Optional[Dict[str, Any]]:
     except (json.JSONDecodeError, IOError) as e:
         print(f"Warning: Could not read or parse AcqSettings.txt: {e}")
         return None
-

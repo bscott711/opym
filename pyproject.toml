@@ -1,29 +1,58 @@
+# Ruff style: Compliant
+# Description:
+# This file configures the opym project using the Hatchling build backend.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# --- Core Project Metadata ---
 [project]
 name = "opym"
 version = "0.1.0"
 description = "A GPU-accelerated pipeline for OPM data processing."
-authors = [{ name = "Brandon Scott", email = "brandon.scott@sdsmt.edu" }]
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+authors = [
+    { name = "Brandon Scott", email = "brandon.scott@sdsmt.edu" },
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
-]
-dependencies = [
-    "cupy-cuda12x",
-    "numpy",
-    "tifffile",
-    "scipy",
-    "requests",
+    "Topic :: Scientific/Engineering",
 ]
 
+# NOTE: Project dependencies are now managed by the micromamba environment.
+# See the README.md file for installation instructions.
+
+[project.optional-dependencies]
+# Development dependencies, installed with `uv pip install -e .[dev]`
+dev = ["ruff"]
+
+# --- Entry Points & URLs ---
 [project.scripts]
 opym = "opym.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# --- Tool Configuration ---
+[tool.hatch.build.targets.wheel]
+# This explicitly tells Hatchling where to find the package,
+# resolving any auto-discovery mismatch with the src layout.
+packages = ["src/opym"]
 
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+[tool.ruff]
+# Set the minimum Python version to target for linting.
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+# Rules: https://docs.astral.sh/ruff/rules/
+# "F" - Pyflakes | "E" - pycodestyle Error | "W" - pycodestyle Warning
+# "I" - isort | "UP" - pyupgrade
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.ruff.format]
+# Use double quotes for strings where possible.
+quote-style = "double"
+
