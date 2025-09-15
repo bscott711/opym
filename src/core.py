@@ -1,8 +1,9 @@
 # Ruff style: Compliant
 # Description:
-# This module contains the core functions for the OPM processing pipeline,
-# including data loading, de-interlacing, deskewing, and deconvolution.
+# This file contains the core image processing functions for the opym pipeline.
+# Imports are updated to use the local cudawrapper module.
 
+import glob
 import os
 import tempfile
 import time
@@ -11,136 +12,162 @@ import cupy as cp
 import numpy as np
 import tifffile
 from cupyx.scipy.ndimage import affine_transform
-from llspy import cudabinwrapper
+
+from . import cudawrapper  # Updated import
 
 
-def load_and_deinterlace(
-    filepath: str, num_channels: int
-) -> dict[int, np.ndarray]:
+def find_tiff_files(directory: str, prefix: str) -> list[str]:
+    """Find all TIFF files in a directory that start with a given prefix."""
+    search_path = os.path.join(directory, f"{prefix}*.tif")
+    return sorted(glob.glob(search_path))
+
+
+def load_and_deinterlace(filepath: str, num_channels: int) -> dict[int, np.ndarray]:
     """
-    Loads a multi-page TIFF and de-interlaces it into separate channels.
+    Load an interlaced TIFF and split it into separate channels.
+
+    Returns a dictionary mapping channel ID to the 3D numpy array for that channel.
     """
-    print(f"Loading and de-interlacing {filepath}...")
     try:
+        print(f"Loading and de-interlacing {os.path.basename(filepath)}...")
         with tifffile.TiffFile(filepath) as tif:
-            stack = tif.asarray()
-    except FileNotFoundError:
-        print(f"Error: File not found at {filepath}")
+            interlaced_stack = tif.asarray()
+
+        if interlaced_stack.ndim != 3:
+            raise ValueError(
+                f"Expected a 3D stack (frames, y, x), but got shape {interlaced_stack.shape}"
+            )
+
+        channel_stacks = {}
+        for i in range(num_channels):
+            channel_stacks[i] = interlaced_stack[i::num_channels, :, :]
+        return channel_stacks
+    except Exception as e:
+        print(f"Error loading or de-interlacing file {filepath}: {e}")
         return {}
-
-    if stack.ndim != 3:
-        raise ValueError("Input TIFF must be a 3D stack (Z, Y, X).")
-
-    channels = {i: stack[i::num_channels, :, :] for i in range(num_channels)}
-    print(f"Separated into {num_channels} channels.")
-    return channels
 
 
 def deskew_gpu(
-    volume: cp.ndarray,
-    angle: float,
-    voxel_size_z: float,
+    stack_cpu: np.ndarray, angle: float, voxel_size_z: float, voxel_size_xy: float
+) -> np.ndarray:
+    """Deskew a 3D stack on the GPU using an affine transformation."""
+    # Calculate the shear factor
+    shear_factor = 1 / np.tan(np.deg2rad(angle))
+
+    # Z-step per slice in microns
+    z_step_um = voxel_size_z
+
+    # XY pixel size in microns
+    xy_pixel_size_um = voxel_size_xy
+
+    # Calculate the shift per slice in pixels
+    shift_per_slice_pixels = (z_step_um / xy_pixel_size_um) * shear_factor
+
+    # Create the affine transformation matrix for deskewing
+    # This matrix applies a shear in the x-z plane
+    transform_matrix = np.array(
+        [[1, 0, 0], [0, 1, 0], [shift_per_slice_pixels, 0, 1]]
+    )
+
+    # Transfer the data to the GPU
+    stack_gpu = cp.asarray(stack_cpu)
+
+    # Apply the affine transformation on the GPU
+    deskewed_gpu = affine_transform(stack_gpu, transform_matrix, order=1, prefilter=False)
+
+    # Transfer the result back to the CPU
+    return cp.asnumpy(deskewed_gpu)
+
+
+def deconvolve_channel(
+    deskewed_stack: np.ndarray,
+    psf_path: str | None,
+    iterations: int,
     voxel_size_xy: float,
-) -> cp.ndarray:
-    """
-    Deskews a 3D volume on the GPU using an affine transformation.
-    """
-    angle_rad = np.deg2rad(angle)
-    shear_factor = 1 / np.tan(angle_rad)
-    transform_matrix = cp.asarray(
-        [
-            [voxel_size_z / voxel_size_xy * np.cos(angle_rad), 0, 0],
-            [0, 1, 0],
-            [shear_factor, 0, 1],
-        ]
+) -> np.ndarray:
+    """Deconvolve a 3D stack using the cudaDeconv binary."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Prepare paths for temporary files
+        img_path = os.path.join(tmpdir, "deskewed_image.tif")
+        decon_path = os.path.join(tmpdir, "deconvolved_image.tif")
+
+        # Use a default PSF if none is provided
+        if psf_path is None or not os.path.exists(psf_path):
+            print("Warning: No valid PSF provided. Using a generated Gaussian PSF.")
+            psf = generate_psf(deskewed_stack.shape, voxel_size_xy)
+            psf_path_to_use = os.path.join(tmpdir, "generated_psf.tif")
+            tifffile.imwrite(psf_path_to_use, psf)
+        else:
+            psf_path_to_use = psf_path
+
+        # Save the deskewed stack to the temporary file
+        tifffile.imwrite(img_path, deskewed_stack.astype(np.float32))
+
+        # Run the deconvolution
+        result = cudawrapper.deconvolve(
+            image=img_path,
+            psf=psf_path_to_use,
+            output=decon_path,
+            iterations=iterations,
+        )
+
+        if result.returncode != 0:
+            print(f"Error during deconvolution: {result.stderr}")
+            return deskewed_stack  # Return the deskewed stack on failure
+
+        # Load the deconvolved result
+        deconvolved_stack = tifffile.imread(decon_path)
+
+    return deconvolved_stack
+
+
+def generate_psf(shape: tuple, voxel_size_xy: float) -> np.ndarray:
+    """Generate a simple Gaussian PSF for testing."""
+    sigma_xy_pix = 1.5
+    sigma_z_pix = 3.0
+    z, y, x = np.mgrid[-shape[0] // 2 : shape[0] // 2, -shape[1] // 2 : shape[1] // 2, -shape[2] // 2 : shape[2] // 2]
+    psf = np.exp(
+        -(
+            (x**2 + y**2) / (2 * sigma_xy_pix**2)
+            + (z**2) / (2 * sigma_z_pix**2)
+        )
     )
-    output_shape = (
-        int(volume.shape[0] * (voxel_size_z / voxel_size_xy) * np.cos(angle_rad)),
-        volume.shape[1],
-        int(volume.shape[2] + volume.shape[0] * shear_factor),
-    )
-    print(f"Deskewing volume of shape {volume.shape} to {output_shape} on GPU...")
-    return affine_transform(
-        volume,
-        matrix=transform_matrix,
-        output_shape=output_shape,
-        order=1,
-        prefilter=True,
-    )
-
-
-def deconvolve_llspy_gpu(image: np.ndarray, psf: np.ndarray, num_iter: int) -> np.ndarray:
-    """
-    Deconvolves a 3D image using LLSpy's cudaDeconv binary.
-    """
-    print(f"Performing {num_iter} deconvolution iterations via LLSpy binary...")
-    with tempfile.TemporaryDirectory() as tempdir:
-        im_path = os.path.join(tempdir, "image.tif")
-        psf_path = os.path.join(tempdir, "psf.tif")
-        out_path = os.path.join(tempdir, "deconvolved.tif")
-
-        tifffile.imwrite(im_path, image.astype(np.float32))
-        tifffile.imwrite(psf_path, psf.astype(np.float32))
-
-        cudabinwrapper.run(im_path, psf_path, out_path, n_iters=num_iter)
-
-        if os.path.exists(out_path):
-            with tifffile.TiffFile(out_path) as tif:
-                return tif.asarray()
-        raise RuntimeError("cudaDeconv binary failed to produce an output file.")
+    return (psf / psf.sum()).astype(np.float32)
 
 
 def process_channel(
     channel_id: int,
-    skewed_stack: np.ndarray,
-    psf_path: str,
+    stack: np.ndarray,
+    psf_path: str | None,
     output_dir: str,
-    base_filename: str,
+    base_name: str,
     params: dict,
 ):
-    """Processes a single channel through the entire pipeline."""
+    """Run the full deskew and deconvolution pipeline for a single channel."""
     print(f"\n--- Processing Channel {channel_id} ---")
-    channel_start_time = time.time()
 
-    if psf_path:
-        print(f"Loading PSF from {psf_path}...")
-        with tifffile.TiffFile(psf_path) as tif:
-            psf = tif.asarray()
-    else:
-        # Generate a placeholder PSF if none is provided
-        print("Warning: No PSF provided. Generating a placeholder Gaussian PSF.")
-        psf_shape = (15, 15, 15)
-        psf_sigma = 1.5
-        psf_grid = np.mgrid[
-            -psf_shape[0] // 2 + 1 : psf_shape[0] // 2 + 1,
-            -psf_shape[1] // 2 + 1 : psf_shape[1] // 2 + 1,
-            -psf_shape[2] // 2 + 1 : psf_shape[2] // 2 + 1,
-        ]
-        psf = np.exp(-((psf_grid**2).sum(0)) / (2 * psf_sigma**2))
-        psf /= psf.sum()
-
-    print("Transferring data to GPU for deskew...")
-    skewed_stack_gpu = cp.asarray(skewed_stack, dtype=cp.float32)
-
-    deskewed_gpu = deskew_gpu(
-        skewed_stack_gpu,
+    # Deskew
+    start_deskew = time.time()
+    print("Deskewing on GPU...")
+    deskewed = deskew_gpu(
+        stack,
         params["angle"],
         params["voxel_size_z"],
         params["voxel_size_xy"],
     )
+    print(f"Deskewing complete in {time.time() - start_deskew:.2f} seconds.")
 
-    print("Transferring deskewed data back to CPU...")
-    deskewed_cpu = cp.asnumpy(deskewed_gpu)
-    del skewed_stack_gpu, deskewed_gpu
-    cp.get_default_memory_pool().free_all_blocks()
+    # Deconvolve
+    start_decon = time.time()
+    print("Deconvolving with cudaDeconv...")
+    deconvolved = deconvolve_channel(
+        deskewed, psf_path, params["iterations"], params["voxel_size_xy"]
+    )
+    print(f"Deconvolution complete in {time.time() - start_decon:.2f} seconds.")
 
-    processed_stack = deconvolve_llspy_gpu(deskewed_cpu, psf, params["iterations"])
+    # Save the final result
+    output_filename = f"{base_name}_ch{channel_id}_processed.tif"
+    output_path = os.path.join(output_dir, output_filename)
+    print(f"Saving final result to: {output_path}")
+    tifffile.imwrite(output_path, deconvolved.astype(np.uint16))
 
-    output_filename = f"{base_filename}_channel_{channel_id}_processed.tif"
-    output_filepath = os.path.join(output_dir, output_filename)
-
-    print(f"Saving processed channel to {output_filepath}")
-    processed_stack = np.clip(processed_stack, 0, 65535).astype(np.uint16)
-    tifffile.imwrite(output_filepath, processed_stack, imagej=True)
-
-    print(f"Channel {channel_id} processed in {time.time() - channel_start_time:.2f}s.")

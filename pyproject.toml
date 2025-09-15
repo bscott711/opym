@@ -3,18 +3,26 @@ name = "opym"
 version = "0.1.0"
 description = "A GPU-accelerated pipeline for OPM data processing."
 authors = [{ name = "Brandon Scott", email = "brandon.scott@sdsmt.edu" }]
+readme = "README.md"
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "cupy-cuda12x",
     "numpy",
     "tifffile",
-    "pyyaml",
+    "scipy",
     "requests",
-    "llspy"
 ]
 
 [project.scripts]
 opym = "opym.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
