@@ -40,8 +40,6 @@ def main() -> None:
     if not meta_params:
         print(f"Could not find or parse {settings_path}. Exiting.")
         sys.exit(1)
-    # This print statement was duplicated in the log, but not in the code.
-    # The logic is correct, so we will leave it as is.
 
     # --- Find Image Files ---
     prefix = meta_params.get("save_name_prefix")
@@ -57,7 +55,8 @@ def main() -> None:
     print(f"Found {len(image_files)} TIFF files to process.")
 
     # --- Get Processing Parameters ---
-    dz = meta_params.get("voxel_size_z", 1.0)
+    dx = meta_params.get("dx")
+    dz = meta_params.get("voxel_size_z")
     angle = 31.5  # Standard for OPM
 
     # --- Process Each File ---
@@ -67,6 +66,7 @@ def main() -> None:
         success = core.process_file(
             filepath=image_file,
             output_dir=output_dir,
+            dx=dx,  # FIX: Added the missing dx parameter
             dz=dz,
             angle=angle,
         )

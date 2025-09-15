@@ -13,6 +13,7 @@ from cupyx.scipy.ndimage import affine_transform
 def process_file(
     filepath: Path,
     output_dir: Path,
+    dx: float,
     dz: float,
     angle: float,
 ) -> bool:
@@ -29,19 +30,14 @@ def process_file(
         print(f"  - Loaded raw data with shape: {raw_stack.shape}")
 
         # --- Define ROIs and Split Channels ---
-        # NOTE: These ROI coordinates are placeholders based on the previous discussion.
+        # Using the exact coordinates you provided.
         # Format is (y_start, y_end, x_start, x_end).
         rois = [
-            (1200, 2400, 0, 2400),  # ch0: cam1_bottom (blue)
-            (0, 1200, 0, 2400),  # ch1: cam1_top (green)
-            (0, 1200, 0, 2400),  # ch2: cam2_top (red)
-            (1200, 2400, 0, 2400),  # ch3: cam2_bottom (far red)
+            (657, 1161, 1224, 2262),  # ROI for channels 0 and 1
+            (1296, 1800, 1224, 2262),  # ROI for channels 2 and 3
         ]
         channels = crop_and_split_channels(raw_stack, rois)
         print(f"  - Cropped and split into {len(channels)} channels.")
-
-        # Standard pixel size for this type of microscope
-        dx = 0.104
 
         for i, channel_stack in enumerate(channels):
             print(f"\n  --- Processing Channel {i} ---")
@@ -79,17 +75,15 @@ def crop_and_split_channels(raw_stack: np.ndarray, rois: list) -> list:
     cam1_data = raw_stack[:, 0, ...]
     cam2_data = raw_stack[:, 1, ...]
 
+    # ROI for ch0 and ch1
     y1_start, y1_end, x1_start, x1_end = rois[0]
     ch0 = cam1_data[:, y1_start:y1_end, x1_start:x1_end]
+    ch1 = cam2_data[:, y1_start:y1_end, x1_start:x1_end]
 
+    # ROI for ch2 and ch3
     y2_start, y2_end, x2_start, x2_end = rois[1]
-    ch1 = cam1_data[:, y2_start:y2_end, x2_start:x2_end]
-
-    y3_start, y3_end, x3_start, x3_end = rois[2]
-    ch2 = cam2_data[:, y3_start:y3_end, x3_start:x3_end]
-
-    y4_start, y4_end, x4_start, x4_end = rois[3]
-    ch3 = cam2_data[:, y4_start:y4_end, x4_start:x4_end]
+    ch2 = cam1_data[:, y2_start:y2_end, x2_start:x2_end]
+    ch3 = cam2_data[:, y2_start:y2_end, x2_start:x2_end]
 
     return [ch0, ch1, ch2, ch3]
 
@@ -99,49 +93,35 @@ def combined_transform(
 ) -> cp.ndarray:
     """
     Applies a single, combined affine transformation for deskewing and
-    rotation to coverslip coordinates, correctly handling memory allocation.
+    rotation to coverslip coordinates.
     """
     nz, ny, nx = image_stack.shape
     angle_rad = np.deg2rad(angle)
 
-    # --- Check Skew Factor ---
-    fsk = dz / (dx / np.tan(angle_rad))
-    if fsk > 2:
-        print(
-            f"  - WARNING: Skew factor is {fsk:.2f} > 2. "
-            "Interpolation of raw data may be required for optimal results."
-        )
+    # --- Build the forward transformation matrix ---
+    # This maps points from the original image to the new, transformed space.
 
-    # --- Build Transformation Matrices (Forward mapping) ---
-    # NOTE: These matrices map points from the original image to the new canvas.
-    # The coordinate system is (Z, Y, X).
+    # 1. Deskew (shear)
+    deskew_mat = np.eye(4)
+    deskew_mat[2, 0] = dz * np.cos(angle_rad) / dx
 
-    # 1. Deskew (shear X based on Z)
-    s_ds = cp.eye(4)
-    s_ds[2, 0] = dz * np.cos(angle_rad) / dx
+    # 2. Z-scaling (to make voxels isotropic before rotation)
+    scale_mat = np.eye(4)
+    scale_mat[0, 0] = np.sin(angle_rad)
 
-    # 2. Translate to center for rotation
-    t1 = cp.eye(4)
-    t1[:3, 3] = cp.array([-nz / 2, -ny / 2, -nx / 2])
-
-    # 3. Z-scaling for isotropic voxels after rotation
-    s_z = cp.eye(4)
-    s_z[0, 0] = np.sin(angle_rad)
-
-    # 4. Rotate around Y-axis
+    # 3. Rotation around Y-axis
+    rot_mat = np.eye(4)
     theta = -angle_rad
-    r_y = cp.eye(4)
-    r_y[0, 0] = np.cos(theta)
-    r_y[0, 2] = -np.sin(theta)
-    r_y[2, 0] = np.sin(theta)
-    r_y[2, 2] = np.cos(theta)
+    rot_mat[0, 0] = np.cos(theta)
+    rot_mat[0, 2] = -np.sin(theta)
+    rot_mat[2, 0] = np.sin(theta)
+    rot_mat[2, 2] = np.cos(theta)
 
-    # --- Calculate Final Output Shape and Offset ---
-    # Combine all forward transformations except the final translation
-    transform_no_offset = r_y @ s_z @ t1 @ s_ds
+    # Combine transformations
+    forward_transform = rot_mat @ scale_mat @ deskew_mat
 
-    # Find the bounding box of the transformed volume
-    corners = cp.array(
+    # --- Calculate the output shape ---
+    corners = np.array(
         [
             [0, 0, 0, 1],
             [0, 0, nx, 1],
@@ -153,31 +133,28 @@ def combined_transform(
             [nz, ny, nx, 1],
         ]
     ).T
-    transformed_corners = transform_no_offset @ corners
+
+    transformed_corners = forward_transform @ corners
     min_coords = transformed_corners[:3].min(axis=1)
     max_coords = transformed_corners[:3].max(axis=1)
+    output_shape = tuple(np.ceil(max_coords - min_coords).astype(int))
 
-    # The final output shape is the size of this bounding box
-    output_shape = tuple(cp.ceil(max_coords - min_coords).astype(int).get())
+    # --- Build the inverse transformation matrix for cupyx.scipy.ndimage ---
+    # This maps points from the new, transformed space back to the original image.
 
-    # Offset is the translation needed to bring the most negative corner to the origin
-    offset = min_coords
+    # Create a translation matrix to move the transformed volume to the origin
+    translation_mat = np.eye(4)
+    translation_mat[:3, 3] = -min_coords
 
-    # --- Create the final inverse matrix for the transform function ---
-    # The affine_transform function requires a matrix that maps output
-    # coordinates to input coordinates (the inverse transformation).
+    # The final forward transformation matrix
+    final_forward_mat = translation_mat @ forward_transform
 
-    # Create the final translation matrix
-    t2 = cp.eye(4)
-    t2[:3, 3] = -offset
-
-    # Combine all matrices and take the inverse
-    full_forward_transform = t2 @ transform_no_offset
-    inverse_transform = cp.linalg.inv(full_forward_transform)
+    # The inverse transformation matrix
+    inverse_mat = np.linalg.inv(final_forward_mat)
 
     return affine_transform(
         image_stack,
-        inverse_transform,
+        cp.asarray(inverse_mat),
         output_shape=output_shape,
         order=1,
         prefilter=False,
