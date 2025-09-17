@@ -32,13 +32,18 @@ def main() -> None:
 
     output_dir.mkdir(exist_ok=True)
 
-    print("--- OPM GPU Processing Pipeline ---")
+    print("--- Universal Light Sheet Processing Pipeline ---")
 
     # --- Parse Metadata ---
-    settings_path = input_dir / "AcqSettings.txt"
-    meta_params = metadata.parse_acq_settings(settings_path)
+    # Find the settings file, whether it's AcqSettings.txt or Settings.txt
+    settings_path = next(input_dir.glob("*ettings.txt"), None)
+    if not settings_path:
+        print(f"Could not find a settings file in {input_dir}. Exiting.")
+        sys.exit(1)
+
+    meta_params = metadata.parse_settings(settings_path)
     if not meta_params:
-        print(f"Could not find or parse {settings_path}. Exiting.")
+        print(f"Could not parse {settings_path}. Exiting.")
         sys.exit(1)
 
     # --- Find Image Files ---
@@ -54,11 +59,6 @@ def main() -> None:
 
     print(f"Found {len(image_files)} TIFF files to process.")
 
-    # --- Get Processing Parameters ---
-    dx = meta_params.get("dx")
-    dz = meta_params.get("voxel_size_z")
-    angle = 31.5  # Standard for OPM
-
     # --- Process Each File ---
     all_successful = True
     for image_file in image_files:
@@ -66,13 +66,11 @@ def main() -> None:
         success = core.process_file(
             filepath=image_file,
             output_dir=output_dir,
-            dx=dx,  # FIX: Added the missing dx parameter
-            dz=dz,
-            angle=angle,
+            params=meta_params,
         )
         if not success:
             all_successful = False
-            break  # Stop processing on the first error
+            break
 
     # --- Final Status Message ---
     if all_successful:
