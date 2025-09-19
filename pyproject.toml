@@ -23,6 +23,11 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
+dependencies = [
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
+    "tifffile>=2025.5.10",
+]
 
 # NOTE: Project dependencies are now managed by the micromamba environment.
 # See the README.md file for installation instructions.

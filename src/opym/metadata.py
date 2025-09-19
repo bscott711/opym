@@ -5,10 +5,11 @@
 import configparser
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 
-def parse_settings(settings_path: str) -> dict[str, Any] | None:
+def parse_settings(settings_path: str | Path) -> dict[str, Any] | None:
     """
     Detects the microscope type from the settings file and calls the
     appropriate parser.
@@ -27,7 +28,7 @@ def parse_settings(settings_path: str) -> dict[str, Any] | None:
         return None
 
 
-def _parse_opm_settings(settings_path: str, raw_text: str) -> dict[str, Any] | None:
+def _parse_opm_settings(settings_path: str | Path, raw_text: str) -> dict[str, Any] | None:  # noqa: E501
     """Parses OPM AcqSettings.txt file."""
     try:
         dx = 0.136
@@ -68,16 +69,22 @@ def _parse_opm_settings(settings_path: str, raw_text: str) -> dict[str, Any] | N
         return None
 
 
-def _parse_llsm_settings(settings_path: str, raw_text: str) -> dict[str, Any] | None:
+def _parse_llsm_settings(settings_path: str | Path, raw_text: str) -> dict[str, Any] | None:  # noqa: E501
     """Parses LLSM Settings.txt file, based on llspy logic."""
     try:
         cp = configparser.ConfigParser(strict=False)
-        cp.optionxform = str
+        # The following line is correct for making options case-sensitive.
+        # We ignore the Pylance error as it's a known type-checker limitation.
+        cp.optionxform = str  # type: ignore[assignment]
         cp.read_string(raw_text.split("***** ***** *****")[-1])
 
         angle = cp.getfloat("Sample stage", "Angle between stage and bessel beam (deg)")
 
-        z_motion = re.search(r"Z motion\s*:\s*(.*)", raw_text).group(1)
+        z_motion_match = re.search(r"Z motion\s*:\s*(.*)", raw_text)
+        if not z_motion_match:
+            raise ValueError("'Z motion' key not found in settings file")
+        z_motion = z_motion_match.group(1)
+
         if "Sample piezo" in z_motion:
             dz_line = re.search(
                 (
@@ -94,6 +101,9 @@ def _parse_llsm_settings(settings_path: str, raw_text: str) -> dict[str, Any] | 
                 ),
                 raw_text,
             )
+
+        if not dz_line:
+            raise ValueError("Could not find Z-step interval in settings file")
         dz = float(dz_line.group(1))
 
         magnification = cp.getfloat("Detection optics", "Magnification")
@@ -112,9 +122,9 @@ def _parse_llsm_settings(settings_path: str, raw_text: str) -> dict[str, Any] | 
             "angle": angle,
             "rois": None,  # LLSM files are pre-split, no ROIs needed
         }
-        print(f"  - Successfully parsed LLSM metadata from {settings_path}")
+        print(f"   - Successfully parsed LLSM metadata from {settings_path}")
         return params
 
     except Exception as e:
-        print(f"  - Warning: Could not read or parse LLSM Settings.txt: {e}")
+        print(f"   - Warning: Could not read or parse LLSM Settings.txt: {e}")
         return None
