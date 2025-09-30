@@ -27,6 +27,7 @@ dependencies = [
     "numpy>=2.2.6",
     "scipy>=1.15.3",
     "tifffile>=2025.5.10",
+    "torch>=2.8.0",
 ]
 
 # NOTE: Project dependencies are now managed by the micromamba environment.

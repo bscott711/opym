@@ -28,7 +28,9 @@ def parse_settings(settings_path: str | Path) -> dict[str, Any] | None:
         return None
 
 
-def _parse_opm_settings(settings_path: str | Path, raw_text: str) -> dict[str, Any] | None:  # noqa: E501
+def _parse_opm_settings(
+    settings_path: str | Path, raw_text: str
+) -> dict[str, Any] | None:  # noqa: E501
     """Parses OPM AcqSettings.txt file."""
     try:
         dx = 0.136
@@ -69,7 +71,9 @@ def _parse_opm_settings(settings_path: str | Path, raw_text: str) -> dict[str, A
         return None
 
 
-def _parse_llsm_settings(settings_path: str | Path, raw_text: str) -> dict[str, Any] | None:  # noqa: E501
+def _parse_llsm_settings(
+    settings_path: str | Path, raw_text: str
+) -> dict[str, Any] | None:  # noqa: E501
     """Parses LLSM Settings.txt file, based on llspy logic."""
     try:
         cp = configparser.ConfigParser(strict=False)
