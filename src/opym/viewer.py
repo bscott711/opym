@@ -225,7 +225,6 @@ def composite_viewer(
             (c0_on, c0_cmap, c0_contrast),
             (c1_on, c1_cmap, c1_contrast),
             (c2_on, c2_cmap, c2_contrast),
-            # --- THIS WAS THE BUG ---
             (c3_on, c3_cmap, c3_contrast),
         ]
 
@@ -250,7 +249,10 @@ def composite_viewer(
             final_image = np.clip(final_image, 0.0, 1.0)
             img_comp.set_data(final_image)
             title_label_comp.value = f"T={t}, Z={z}"
-            fig_comp.canvas.draw()
+
+            # --- FIX: Use draw_idle() to match the working viewer ---
+            fig_comp.canvas.draw_idle()
+            # --- End Fix ---
 
         def on_refresh_button_clicked(b):
             t = t_slider_comp.value
