@@ -136,29 +136,34 @@ def process_dataset(
                             ch2_stack[z, :, :] = top_crop  # C2 = Top, Cam 2
                             ch3_stack[z, :, :] = bottom_crop  # C3 = Bottom, Cam 2
 
-                # Now write the 4 complete Z-stacks
-                tif_meta = {"axes": "ZYX", "imagej": True}
+                # --- FIX: Correct arguments for tifffile.imwrite ---
+                tif_meta = {"axes": "ZYX"}
                 out_name = f"{sanitized_name}_T{t:03d}"
                 tifffile.imwrite(
                     output_dir / f"{out_name}_C0.tif",
                     ch0_stack,
-                    **tif_meta,
+                    imagej=True,
+                    metadata=tif_meta,
                 )
                 tifffile.imwrite(
                     output_dir / f"{out_name}_C1.tif",
                     ch1_stack,
-                    **tif_meta,
+                    imagej=True,
+                    metadata=tif_meta,
                 )
                 tifffile.imwrite(
                     output_dir / f"{out_name}_C2.tif",
                     ch2_stack,
-                    **tif_meta,
+                    imagej=True,
+                    metadata=tif_meta,
                 )
                 tifffile.imwrite(
                     output_dir / f"{out_name}_C3.tif",
                     ch3_stack,
-                    **tif_meta,
+                    imagej=True,
+                    metadata=tif_meta,
                 )
+                # --- End fix ---
 
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
 

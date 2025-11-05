@@ -37,9 +37,7 @@ def sanitize_filename(name: str) -> str:
     return name.replace(".ome.tif", "").replace(" ", "_")
 
 
-def derive_paths(
-    base_file: Path, output_format: OutputFormat
-) -> DerivedPaths:
+def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
     """Derives all associated input and output paths from the base file."""
     base_name_no_ext = base_file.name.replace(".ome.tif", "")
     sanitized_name = sanitize_filename(base_file.name)
