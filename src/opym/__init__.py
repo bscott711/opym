@@ -5,6 +5,7 @@ opym: OPM Cropper Package
 
 # Expose the main functions for library use (e.g., in notebooks)
 from .core import process_dataset
+from .dataloader import load_tiff_series
 from .metadata import create_processing_log, parse_timestamps
 from .utils import (
     DerivedPaths,
@@ -14,8 +15,6 @@ from .utils import (
     parse_roi_string,
     save_rois_to_log,
 )
-
-# --- NEW: Import the viewer functions ---
 from .viewer import composite_viewer, single_channel_viewer
 
 __all__ = [
@@ -30,4 +29,5 @@ __all__ = [
     "load_rois_from_log",
     "single_channel_viewer",
     "composite_viewer",
+    "load_tiff_series",
 ]
