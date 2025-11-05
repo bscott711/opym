@@ -31,27 +31,28 @@ dependencies = [
 # Development dependencies, installed with `uv pip install -e .[dev]`
 dev = ["ruff"]
 
+# --- NEW: Dependencies for the optional Jupyter viewers ---
+viewer = [
+    "ipywidgets",
+    "matplotlib",
+    "ipyfilechooser",
+    "ipython"
+]
+
 # --- Entry Points & URLs ---
 [project.scripts]
 opym = "opym.cli:main"
 
 # --- Tool Configuration ---
 [tool.hatch.build.targets.wheel]
-# This explicitly tells Hatchling where to find the package,
-# resolving any auto-discovery mismatch with the src layout.
 packages = ["src/opym"]
 
 [tool.ruff]
-# Set the minimum Python version to target for linting.
 target-version = "py310"
 line-length = 88
 
 [tool.ruff.lint]
-# Rules: https://docs.astral.sh/ruff/rules/
-# "F" - Pyflakes | "E" - pycodestyle Error | "W" - pycodestyle Warning
-# "I" - isort | "UP" - pyupgrade
 select = ["E", "F", "W", "I", "UP"]
 
 [tool.ruff.format]
-# Use double quotes for strings where possible.
 quote-style = "double"

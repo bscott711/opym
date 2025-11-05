@@ -15,6 +15,9 @@ from .utils import (
     save_rois_to_log,
 )
 
+# --- NEW: Import the viewer functions ---
+from .viewer import composite_viewer, single_channel_viewer
+
 __all__ = [
     "process_dataset",
     "create_processing_log",
@@ -25,4 +28,6 @@ __all__ = [
     "DerivedPaths",
     "save_rois_to_log",
     "load_rois_from_log",
+    "single_channel_viewer",
+    "composite_viewer",
 ]
