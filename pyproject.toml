@@ -25,6 +25,7 @@ dependencies = [
     "tifffile",
     "zarr",
     "tqdm",
+    "scikit-image",
 ]
 
 [project.optional-dependencies]

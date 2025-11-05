@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
+import zarr
+from skimage.registration import phase_cross_correlation
+
 
 class OutputFormat(str, Enum):
     """Defines the allowed output formats."""
@@ -145,3 +149,61 @@ def load_rois_from_log(
     except Exception as e:
         print(f"Error loading ROI log: {e}", file=sys.stderr)
         return {}
+
+
+def align_rois(
+    lazy_data: zarr.Array,
+    top_roi: tuple[slice, slice],
+    bottom_roi: tuple[slice, slice],
+    t_index: int,
+    z_index: int | None = None,
+) -> tuple[slice, slice]:
+    """
+    Calculates the pixel shift between two ROIs using phase cross-correlation
+    and returns the adjusted second ROI.
+
+    Args:
+        lazy_data: The 5D (T, Z, C, Y, X) zarr array.
+        top_roi: (slice, slice) for the reference ROI (Y, X). Assumed C=0.
+        bottom_roi: (slice, slice) for the target ROI (Y, X). Assumed C=1.
+        t_index: The T index to use for the alignment plane.
+        z_index: The Z index to use. If None, uses the middle Z-slice.
+
+    Returns:
+        The adjusted (slice, slice) for the bottom ROI.
+    """
+    if z_index is None:
+        z_index = lazy_data.shape[1] // 2
+
+    print(f"Aligning ROIs using T={t_index}, Z={z_index}...")
+
+    try:
+        # Get the reference image (Top, C=0)
+        top_img = lazy_data[t_index, z_index, 0, top_roi[0], top_roi[1]]
+        # Get the image to shift (Bottom, C=1)
+        bottom_img = lazy_data[t_index, z_index, 1, bottom_roi[0], bottom_roi[1]]
+
+        # Calculate shift
+        shift, _, _ = phase_cross_correlation(
+            np.asarray(top_img), np.asarray(bottom_img), upsample_factor=10
+        )
+        dy, dx = shift[0], shift[1]
+        print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
+
+        # Calculate new slices
+        new_y_start = bottom_roi[0].start + int(round(dy))
+        new_y_end = bottom_roi[0].stop + int(round(dy))
+        new_x_start = bottom_roi[1].start + int(round(dx))
+        new_x_end = bottom_roi[1].stop + int(round(dx))
+
+        aligned_bottom_roi = (
+            slice(new_y_start, new_y_end),
+            slice(new_x_start, new_x_end),
+        )
+        print(f"Adjusted Bottom ROI Slice: {aligned_bottom_roi}")
+        return aligned_bottom_roi
+
+    except Exception as e:
+        print(f"❌ ERROR during alignment: {e}")
+        print("Returning original bottom ROI.")
+        return bottom_roi

@@ -10,12 +10,19 @@ from .metadata import create_processing_log, parse_timestamps
 from .utils import (
     DerivedPaths,
     OutputFormat,
+    align_rois,
     derive_paths,
     load_rois_from_log,
     parse_roi_string,
     save_rois_to_log,
 )
-from .viewer import composite_viewer, single_channel_viewer
+from .viewer import (
+    composite_viewer,
+    create_mip,
+    interactive_roi_selector,
+    single_channel_viewer,
+    visualize_alignment,
+)
 
 __all__ = [
     "process_dataset",
@@ -30,4 +37,8 @@ __all__ = [
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",
+    "create_mip",
+    "interactive_roi_selector",
+    "align_rois",
+    "visualize_alignment",
 ]
