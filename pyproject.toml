@@ -1,7 +1,4 @@
 # Ruff style: Compliant
-# Description:
-# This file configures the opym project using the Hatchling build backend.
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -10,7 +7,7 @@ build-backend = "hatchling.build"
 [project]
 name = "opym"
 version = "0.1.0"
-description = "A GPU-accelerated pipeline for OPM data processing."
+description = "A pre-processor for OPM data to crop and split channels for pypetakit5d."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -24,14 +21,11 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "numpy>=2.2.6",
-    "scipy>=1.15.3",
-    "tifffile>=2025.5.10",
-    "torch>=2.8.0",
+    "numpy",
+    "tifffile",
+    "zarr",
+    "tqdm",
 ]
-
-# NOTE: Project dependencies are now managed by the micromamba environment.
-# See the README.md file for installation instructions.
 
 [project.optional-dependencies]
 # Development dependencies, installed with `uv pip install -e .[dev]`
@@ -61,4 +55,3 @@ select = ["E", "F", "W", "I", "UP"]
 [tool.ruff.format]
 # Use double quotes for strings where possible.
 quote-style = "double"
-
