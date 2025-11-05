@@ -3,6 +3,7 @@
 Utilities for the OPM Cropper
 """
 
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -36,7 +37,9 @@ def sanitize_filename(name: str) -> str:
     return name.replace(".ome.tif", "").replace(" ", "_")
 
 
-def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
+def derive_paths(
+    base_file: Path, output_format: OutputFormat
+) -> DerivedPaths:
     """Derives all associated input and output paths from the base file."""
     base_name_no_ext = base_file.name.replace(".ome.tif", "")
     sanitized_name = sanitize_filename(base_file.name)
@@ -77,3 +80,70 @@ def parse_roi_string(roi_str: str) -> tuple[slice, slice]:
     x_start, x_stop = map(int, x_str.strip().split(":"))
 
     return (slice(y_start, y_stop), slice(x_start, x_stop))
+
+
+# --- NEW ROI LOG FUNCTIONS ---
+
+
+def _roi_to_tuple(roi: tuple[slice, slice]) -> tuple[int, int, int, int]:
+    """Converts (slice(y1, y2), slice(x1, x2)) to (y1, y2, x1, x2)"""
+    # Ensure slice attributes are not None before accessing
+    y_start = roi[0].start if roi[0].start is not None else 0
+    y_stop = roi[0].stop if roi[0].stop is not None else -1
+    x_start = roi[1].start if roi[1].start is not None else 0
+    x_stop = roi[1].stop if roi[1].stop is not None else -1
+    return (y_start, y_stop, x_start, x_stop)
+
+
+def _tuple_to_roi(tpl: tuple[int, int, int, int]) -> tuple[slice, slice]:
+    """Converts (y1, y2, x1, x2) to (slice(y1, y2), slice(x1, x2))"""
+    return (slice(tpl[0], tpl[1]), slice(tpl[2], tpl[3]))
+
+
+def _tuple_to_cli_string(tpl: tuple[int, int, int, int]) -> str:
+    """Converts (y1, y2, x1, x2) to 'y1:y2,x1:x2'"""
+    return f"{tpl[0]}:{tpl[1]},{tpl[2]}:{tpl[3]}"
+
+
+def save_rois_to_log(
+    log_file: Path,
+    base_file: Path,
+    top_roi: tuple[slice, slice],
+    bottom_roi: tuple[slice, slice],
+):
+    """Appends the ROIs for a given file to a central JSON log."""
+    data = {}
+    if log_file.exists():
+        try:
+            with log_file.open("r") as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            print(f"Warning: Overwriting corrupted ROI log {log_file.name}")
+            data = {}
+
+    data[base_file.name] = {
+        "top_roi": _roi_to_tuple(top_roi),
+        "bottom_roi": _roi_to_tuple(bottom_roi),
+    }
+
+    try:
+        with log_file.open("w") as f:
+            json.dump(data, f, indent=4)
+        print(f"✅ Saved ROIs for {base_file.name} to {log_file.name}")
+    except Exception as e:
+        print(f"Error saving ROI log: {e}", file=sys.stderr)
+
+
+def load_rois_from_log(
+    log_file: Path,
+) -> dict[str, dict[str, tuple[int, int, int, int]]]:
+    """Loads the ROI log. Returns an empty dict if not found."""
+    if not log_file.exists():
+        return {}
+    try:
+        with log_file.open("r") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        print(f"Error loading ROI log: {e}", file=sys.stderr)
+        return {}
