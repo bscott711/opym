@@ -522,7 +522,8 @@ def visualize_alignment(
     vmax: float,
 ):
     """Displays the two ROIs side-by-side on the MIP."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    # --- FIX: Change subplots to 2 rows, 1 column ---
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 12))
     fig.suptitle("Final Aligned ROIs")
 
     # Top ROI

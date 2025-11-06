@@ -161,16 +161,7 @@ def align_rois(
     """
     Calculates the pixel shift between two ROIs using phase cross-correlation
     and returns the adjusted second ROI.
-
-    Args:
-        lazy_data: The 5D (T, Z, C, Y, X) zarr array.
-        top_roi: (slice, slice) for the reference ROI (Y, X). Assumed C=0.
-        bottom_roi: (slice, slice) for the target ROI (Y, X). Assumed C=1.
-        t_index: The T index to use for the alignment plane.
-        z_index: The Z index to use. If None, uses the middle Z-slice.
-
-    Returns:
-        The adjusted (slice, slice) for the bottom ROI.
+    ...
     """
     if z_index is None:
         z_index = lazy_data.shape[1] // 2
@@ -178,9 +169,8 @@ def align_rois(
     print(f"Aligning ROIs using T={t_index}, Z={z_index}...")
 
     try:
-        # Get the reference image (Top, C=0)
+        # ... (no change to image fetching) ...
         top_img = lazy_data[t_index, z_index, 0, top_roi[0], top_roi[1]]
-        # Get the image to shift (Bottom, C=1)
         bottom_img = lazy_data[t_index, z_index, 1, bottom_roi[0], bottom_roi[1]]
 
         # Calculate shift
@@ -190,11 +180,12 @@ def align_rois(
         dy, dx = shift[0], shift[1]
         print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
 
-        # Calculate new slices
-        new_y_start = bottom_roi[0].start + int(round(dy))
-        new_y_end = bottom_roi[0].stop + int(round(dy))
-        new_x_start = bottom_roi[1].start + int(round(dx))
-        new_x_end = bottom_roi[1].stop + int(round(dx))
+        # --- FIX: Apply the INVERSE shift to the CROP ---
+        # The shift is for the image; the crop moves the opposite way.
+        new_y_start = bottom_roi[0].start - int(round(dy))
+        new_y_end = bottom_roi[0].stop - int(round(dy))
+        new_x_start = bottom_roi[1].start - int(round(dx))
+        new_x_end = bottom_roi[1].stop - int(round(dx))
 
         aligned_bottom_roi = (
             slice(new_y_start, new_y_end),
