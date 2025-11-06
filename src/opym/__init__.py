@@ -7,6 +7,12 @@ opym: OPM Cropper Package
 from .core import process_dataset, run_processing_job
 from .dataloader import load_tiff_series
 from .metadata import create_processing_log, parse_timestamps
+from .petakit import (
+    PetaKitContext,
+    get_petakit_context,
+    run_petakit_from_config,
+    run_petakit_processing,
+)
 from .utils import (
     DerivedPaths,
     OutputFormat,
@@ -42,4 +48,8 @@ __all__ = [
     "interactive_roi_selector",
     "align_rois",
     "visualize_alignment",
+    "PetaKitContext",
+    "get_petakit_context",
+    "run_petakit_processing",
+    "run_petakit_from_config",
 ]
