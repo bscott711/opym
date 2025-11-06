@@ -419,7 +419,10 @@ class ROISelector:
         self.fig.suptitle("Select TOP ROI, then BOTTOM ROI")
         print("--- 📝 INSTRUCTIONS ---")
         print("1. Click and drag to draw a box around the TOP (cyan) ROI.")
-        print("2. Click and drag again to draw a box around the BOTTOM (lime) ROI.")
+        print(
+            "2. Click and drag near the center of the BOTTOM (lime) ROI."
+            " The box size will be matched automatically."
+        )
         print("3. When finished, call the .get_rois() method on this object.")
 
         self.ax.imshow(self.mip_data, cmap="gray", vmin=self.vmin, vmax=self.vmax)
@@ -521,9 +524,26 @@ def visualize_alignment(
     vmin: float,
     vmax: float,
 ):
-    """Displays the two ROIs side-by-side on the MIP."""
-    # --- FIX: Change subplots to 2 rows, 1 column ---
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 12))
+    """Displays the two ROIs stacked vertically on the MIP."""
+
+    # --- FIX: Calculate figsize based on ROI aspect ratio ---
+    try:
+        # Get shape from the first ROI
+        y_slice, x_slice = top_roi
+        height = y_slice.stop - y_slice.start
+        width = x_slice.stop - x_slice.start
+        aspect_ratio = height / width
+    except Exception:
+        # Fallback in case of slice error
+        aspect_ratio = 1
+
+    base_width = 7  # Base width in inches
+    # Height for both plots, plus 1.0 inch for titles/padding
+    fig_height = (base_width * aspect_ratio) * 2 + 1.0
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(base_width, fig_height))
+    # --------------------------------------------------------
+
     fig.suptitle("Final Aligned ROIs")
 
     # Top ROI

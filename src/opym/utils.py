@@ -180,12 +180,12 @@ def align_rois(
         dy, dx = shift[0], shift[1]
         print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
 
-        # --- FIX: Apply the INVERSE shift to the CROP ---
-        # The shift is for the image; the crop moves the opposite way.
-        new_y_start = bottom_roi[0].start - int(round(dy))
-        new_y_end = bottom_roi[0].stop - int(round(dy))
-        new_x_start = bottom_roi[1].start - int(round(dx))
-        new_x_end = bottom_roi[1].stop - int(round(dx))
+        # The shift vector (dy, dx) is the amount the crop
+        # window needs to move to follow the content.
+        new_y_start = bottom_roi[0].start + int(round(dy))
+        new_y_end = bottom_roi[0].stop + int(round(dy))
+        new_x_start = bottom_roi[1].start + int(round(dx))
+        new_x_end = bottom_roi[1].stop + int(round(dx))
 
         aligned_bottom_roi = (
             slice(new_y_start, new_y_end),
