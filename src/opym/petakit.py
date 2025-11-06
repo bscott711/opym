@@ -9,6 +9,7 @@ has successfully generated a 'processed_tiff_series_split' directory.
 import inspect
 import json
 import os
+import re
 import sys
 import traceback
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ class PetaKitContext:
 
     base_data_dir: Path
     processed_dir: Path
-    log_file: Path | None  # <-- THIS IS THE FIX
+    log_file: Path | None
     base_name: str
     job_log_dir: Path
     ds_output_dir: Path
@@ -56,20 +57,23 @@ def get_petakit_context(
     base_data_dir = processed_dir.parent
 
     # 2. Find the opym processing log *inside* the provided path
-    log_files = list(processed_dir.glob("*_processing_log.json"))
-    if not log_files:
-        # Fallback: try to get from a file name
-        first_file = next(processed_dir.glob("*_T000_C0.tif"), None)
+    log_file = next(processed_dir.glob("*_processing_log.json"), None)
+    if log_file:
+        base_name = log_file.stem.replace("_processing_log", "")
+    else:
+        # --- START OF FIX: Robust base_name finding ---
+        first_file = next(processed_dir.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None)
         if not first_file:
             raise FileNotFoundError(
-                "Could not find a '*_processing_log.json' file or a "
-                "'*_T000_C0.tif' file to determine base_name."
+                "Could not find a '*_processing_log.json' file or any "
+                "'*_T..._C..tif' file to determine base_name."
             )
-        base_name = first_file.name.replace("_T000_C0.tif", "")
-        log_file = None  # This is why we need Optional[Path]
-    else:
-        log_file = log_files[0]
-        base_name = log_file.stem.replace("_processing_log", "")
+        # Use regex to parse the base name
+        match = re.search(r"^(.*?)_T\d{3}_C\d\.tif$", first_file.name)
+        if not match:
+            raise ValueError(f"Could not parse base name from file: {first_file.name}")
+        base_name = match.group(1)
+        # --- END OF FIX ---
 
     # 4. Define all output paths
     job_log_dir = base_data_dir / "job_logs"
