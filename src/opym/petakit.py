@@ -137,7 +137,6 @@ def run_petakit_processing(
         dsr_dir_name: The name for the deskewed+rotated output subdirectory.
         **kwargs: See function signature for all processing options.
     """
-    # --- START OF FUNCTION BODY (FIXED INDENTATION) ---
     if block_size is None:
         block_size = [256, 256, 256]
     if ff_image_paths is None:
@@ -209,7 +208,6 @@ def run_petakit_processing(
         print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         raise
-    # --- END OF FUNCTION BODY ---
 
 
 def run_petakit_from_config(
@@ -258,7 +256,6 @@ def run_petakit_from_config(
     )
 
 
-# --- NEWLY REWRITTEN FUNCTION ---
 def tune_single_stack(
     stack_3d: np.ndarray,
     base_name: str,
@@ -292,7 +289,9 @@ def tune_single_stack(
         temp_input_dir = temp_path / "input_tiffs"
         temp_output_ds_dir = "output_ds"
         temp_output_dsr_dir = "output_dsr"
+        temp_job_log_dir = temp_path / "job_logs"  # <-- FIX 1: Define log dir
         os.makedirs(temp_input_dir)
+        os.makedirs(temp_job_log_dir)  # <-- FIX 2: Create log dir
 
         # PyPetaKit wrapper expects a T- and C- formatted file name
         # We'll just hardcode T=0, C=0 for this single stack
@@ -320,6 +319,7 @@ def tune_single_stack(
                 channelPatterns=[base_name],
                 DSDirName=temp_output_ds_dir,
                 DSRDirName=temp_output_dsr_dir,
+                jobLogDir=str(temp_job_log_dir),  # <-- FIX 3: Pass log dir
                 largeFile=False,
                 zarrFile=False,
                 saveZarr=False,
