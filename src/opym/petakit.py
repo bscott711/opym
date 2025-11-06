@@ -16,9 +16,6 @@ from pathlib import Path
 
 import PyPetaKit5D as ppk
 
-# No longer need OutputFormat from utils
-# from .utils import OutputFormat
-
 
 @dataclass(frozen=True)
 class PetaKitContext:
@@ -33,7 +30,11 @@ class PetaKitContext:
     dsr_output_dir: Path
 
 
-def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
+def get_petakit_context(
+    processed_dir_path: Path,
+    ds_dir_name: str = "DS",
+    dsr_dir_name: str = "DSR",
+) -> PetaKitContext:
     """
     Dynamically generates all necessary paths for a PyPetaKit5D job
     from the user-selected processed directory.
@@ -41,13 +42,17 @@ def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
     Args:
         processed_dir_path: The path to the processed TIFF directory
                             (e.g., '.../processed_tiff_series_split').
+        ds_dir_name: The name for the deskewed output subdirectory.
+        dsr_dir_name: The name for the deskewed+rotated output subdirectory.
 
     Returns:
         A PetaKitContext dataclass instance with all paths.
     """
     processed_dir = processed_dir_path.resolve()
     if not processed_dir.exists():
-        raise FileNotFoundError(f"Processed TIFF directory not found: {processed_dir}")
+        raise FileNotFoundError(
+            f"Processed TIFF directory not found: {processed_dir}"
+        )
 
     # 1. The base data dir is one level up
     base_data_dir = processed_dir.parent
@@ -65,11 +70,10 @@ def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
     base_name = log_file.stem.replace("_processing_log", "")
 
     # 4. Define all output paths
-    # Job logs are stored in the base data dir
     job_log_dir = base_data_dir / "job_logs"
     # PyPetaKit outputs are stored *inside* the processed dir
-    ds_output_dir = processed_dir / "DS"
-    dsr_output_dir = processed_dir / "DSR"
+    ds_output_dir = processed_dir / ds_dir_name
+    dsr_output_dir = processed_dir / dsr_dir_name
 
     return PetaKitContext(
         base_data_dir=base_data_dir,
@@ -85,6 +89,9 @@ def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
 def run_petakit_processing(
     processed_dir_path: Path,
     *,
+    # --- Custom Output Dirs ---
+    ds_dir_name: str = "DS",
+    dsr_dir_name: str = "DSR",
     # --- Physical Parameters ---
     xy_pixel_size: float = 0.108,
     z_step_um: float = 1.0,
@@ -125,8 +132,11 @@ def run_petakit_processing(
     Args:
         processed_dir_path: The path to the processed TIFF directory
                             (e.g., '.../processed_tiff_series_split').
+        ds_dir_name: The name for the deskewed output subdirectory.
+        dsr_dir_name: The name for the deskewed+rotated output subdirectory.
         **kwargs: See function signature for all processing options.
     """
+    # --- THIS IS THE START OF THE FUNCTION BODY ---
     if block_size is None:
         block_size = [256, 256, 256]
     if ff_image_paths is None:
@@ -137,11 +147,14 @@ def run_petakit_processing(
     try:
         # 1. Get all paths
         print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
-        ctx = get_petakit_context(processed_dir_path)
+        ctx = get_petakit_context(
+            processed_dir_path,
+            ds_dir_name=ds_dir_name,
+            dsr_dir_name=dsr_dir_name,
+        )
 
         # 2. Create required directories
         os.makedirs(ctx.job_log_dir, exist_ok=True)
-        # Note: PyPetaKit5D creates the DS/DSR directories
 
         print(f"\nRunning job locally for TIFF series in: {ctx.processed_dir.name}")
         print(f"  Base name: {ctx.base_name}")
@@ -190,11 +203,12 @@ def run_petakit_processing(
     except FileNotFoundError as fnfe:
         print(f"\n❌ SETUP ERROR: {fnfe}", file=sys.stderr)
         print("Ensure the input path and files exist.", file=sys.stderr)
-        raise  # Re-raise for the notebook to catch
+        raise
     except Exception as e:
         print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        raise  # Re-raise for the notebook to catch
+        raise
+    # --- THIS IS THE END OF THE FUNCTION BODY ---
 
 
 def run_petakit_from_config(
