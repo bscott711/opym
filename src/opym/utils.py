@@ -128,6 +128,10 @@ def save_rois_to_log(
     }
 
     try:
+        # --- FIX: Create the output directory if it doesn't exist ---
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        # -----------------------------------------------------------
+
         with log_file.open("w") as f:
             json.dump(data, f, indent=4)
         print(f"✅ Saved ROIs for {base_file.name} to {log_file.name}")
