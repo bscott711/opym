@@ -342,14 +342,25 @@ def create_mip(
     print(f"Opening {file_path.name} as lazy Zarr array...")
 
     try:
-        lazy_data = tifffile.imread(file_path, aszarr=True, series=0)
+        # --- FIX: Revert to correct TiffFile + zarr.open logic ---
+        # 1. Open the TiffFile and get the Zarr store for series 0
+        store = tifffile.TiffFile(file_path).series[0].aszarr()
+        # 2. Open the store as a Zarr Group
+        zarr_group = zarr.open(store, mode="r")
+        # 3. The actual 5D array is the '0' dataset within this group
+        lazy_data = zarr_group["0"]  # type: ignore[reportArgumentType]
+        # ---------------------------------------------------------
+
     except Exception as e:
         print(f"❌ ERROR: Could not open {file_path.name} as zarr.")
         print(f"  Details: {e}")
         raise
 
+    # This check will now validate that lazy_data is the array
     if not isinstance(lazy_data, zarr.Array):
-        raise TypeError(f"Expected zarr.Array, but tifffile returned {type(lazy_data)}")
+        raise TypeError(
+            f"Expected zarr.Array, but found {type(lazy_data)} inside Zarr group."
+        )
 
     T, Z, C, Y, X = lazy_data.shape
     print(f"Full data shape: {lazy_data.shape}")
