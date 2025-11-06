@@ -10,14 +10,11 @@ import inspect
 import json
 import os
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import PyPetaKit5D as ppk
-import tifffile
 
 
 @dataclass(frozen=True)
@@ -26,7 +23,7 @@ class PetaKitContext:
 
     base_data_dir: Path
     processed_dir: Path
-    log_file: Path
+    log_file: Path | None  # <-- THIS IS THE FIX
     base_name: str
     job_log_dir: Path
     ds_output_dir: Path
@@ -61,14 +58,18 @@ def get_petakit_context(
     # 2. Find the opym processing log *inside* the provided path
     log_files = list(processed_dir.glob("*_processing_log.json"))
     if not log_files:
-        raise FileNotFoundError(
-            f"No '*_processing_log.json' file found in {processed_dir}. "
-            "Please ensure this is the correct opym output folder."
-        )
-    log_file = log_files[0]
-
-    # 3. Get the base name from the log file
-    base_name = log_file.stem.replace("_processing_log", "")
+        # Fallback: try to get from a file name
+        first_file = next(processed_dir.glob("*_T000_C0.tif"), None)
+        if not first_file:
+            raise FileNotFoundError(
+                "Could not find a '*_processing_log.json' file or a "
+                "'*_T000_C0.tif' file to determine base_name."
+            )
+        base_name = first_file.name.replace("_T000_C0.tif", "")
+        log_file = None  # This is why we need Optional[Path]
+    else:
+        log_file = log_files[0]
+        base_name = log_file.stem.replace("_processing_log", "")
 
     # 4. Define all output paths
     job_log_dir = base_data_dir / "job_logs"
@@ -254,111 +255,3 @@ def run_petakit_from_config(
         processed_dir_path=processed_dir_path,
         **filtered_params,
     )
-
-
-def tune_single_stack(
-    stack_3d: np.ndarray,
-    base_name: str,
-    *,
-    xy_pixel_size: float,
-    z_step_um: float,
-    sheet_angle_deg: float,
-    interp_method: str = "linear",
-    reverse_z: bool = True,
-    objective_scan: bool = False,
-) -> np.ndarray:
-    """
-    Runs in-memory deskew/rotate on a single 3D (ZYX) stack
-    by saving to a temp directory and calling the wrapper.
-
-    Args:
-        stack_3d: The (ZYX) numpy array to process.
-        base_name: The base name for the file (e.g., 'cell_MMStack_Pos0').
-        xy_pixel_size: Pixel size in XY (microns).
-        z_step_um: Z-step size (microns).
-        sheet_angle_deg: Sheet angle (degrees).
-        interp_method: Interpolation method ('linear', 'cubic', etc.).
-        reverse_z: Z-stack direction (True is standard for OPM).
-        objective_scan: Whether this is an objective-scan dataset (False).
-
-    Returns:
-        The processed 3D (ZYX) numpy array.
-    """
-    with tempfile.TemporaryDirectory() as temp_dir_str:
-        temp_path = Path(temp_dir_str)
-        temp_input_dir = temp_path / "input_tiffs"
-        temp_output_ds_dir = "output_ds"
-        temp_output_dsr_dir = "output_dsr"
-        temp_job_log_dir = temp_path / "job_logs"
-        os.makedirs(temp_input_dir)
-        os.makedirs(temp_job_log_dir)
-
-        file_name = f"{base_name}_T000_C0.tif"
-        input_file_path = temp_input_dir / file_name
-        tifffile.imwrite(
-            input_file_path,
-            stack_3d,
-            imagej=True,
-            metadata={"axes": "ZYX"},
-        )
-
-        try:
-            # Call the full wrapper on our temporary directory
-            ppk.XR_deskew_rotate_data_wrapper(
-                [str(temp_input_dir)],
-                deskew=True,
-                rotate=True,
-                DSRCombined=False,
-                xyPixelSize=xy_pixel_size,
-                dz=z_step_um,
-                skewAngle=sheet_angle_deg,
-                objectiveScan=objective_scan,
-                reverse=reverse_z,
-                channelPatterns=[base_name],
-                DSDirName=temp_output_ds_dir,
-                DSRDirName=temp_output_dsr_dir,
-                jobLogDir=str(temp_job_log_dir),
-                largeFile=False,
-                zarrFile=False,
-                saveZarr=False,
-                save16bit=True,
-                parseCluster=False,
-                masterCompute=True,
-                configFile="",
-                mccMode=True,
-                save3DStack=True,
-                saveMIP=False,
-                interpMethod=interp_method,
-            )
-
-            # PyPetaKit *should* create this file.
-            # It does NOT add a _DSR suffix.
-            result_file_name = f"{base_name}_T000_C0.tif"
-            result_path = temp_path / temp_output_dsr_dir / result_file_name
-
-            if not result_path.exists():
-                # --- THIS IS THE BUG ---
-                # The wrapper must have failed silently.
-                # The file it was *supposed* to create is missing.
-                # We will now raise the error message you saw.
-                raise FileNotFoundError(
-                    f"PyPetaKit did not produce output file: {result_path.name}"
-                )
-
-            # Load the processed stack
-            result_stack = tifffile.imread(result_path)
-            return result_stack
-
-        except Exception as e:
-            print(
-                f"❌ FATAL ERROR during tune_single_stack: {e}",
-                file=sys.stderr,
-            )
-            traceback.print_exc(file=sys.stderr)
-            # --- MODIFICATION ---
-            # Re-raise the exception so the notebook
-            # catches it and doesn't display the old image.
-            raise e
-        finally:
-            # The temporary directory is automatically cleaned up
-            pass
