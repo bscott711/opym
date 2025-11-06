@@ -1,82 +1,123 @@
 # Ruff style: Compliant
-# Description:
-# This module provides the command-line interface for opym.
+"""
+Command-Line Interface (CLI) for OPM Cropper.
+"""
 
+import argparse
+import os
+import shutil
 import sys
 from pathlib import Path
-from tkinter import filedialog
 
-from . import core, metadata
+from .core import process_dataset
+from .metadata import create_processing_log
+from .utils import DerivedPaths, OutputFormat, derive_paths, parse_roi_string
 
 
-def main() -> None:
-    """Main entry point for the opym command-line interface."""
-    # --- Get Input/Output Directories ---
-    input_dir_str = sys.argv[1] if len(sys.argv) > 1 else None
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="OPM OME-TIF Cropper/Splitter for pypetakit5d.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "base_file",
+        type=Path,
+        help="Path to the source .ome.tif file.",
+    )
+    parser.add_argument(
+        "--top-roi",
+        required=True,
+        type=str,
+        help="Top ROI in 'y_start:y_stop,x_start:x_stop' format (e.g., '0:512,0:512').",
+    )
+    parser.add_argument(
+        "--bottom-roi",
+        required=True,
+        type=str,
+        help="Bottom ROI in 'y_start:y_stop,x_start:x_stop' format "
+        "(e.g., '512:1024,0:512').",
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        type=str,
+        default=OutputFormat.TIFF_SERIES.value,
+        choices=[f.value for f in OutputFormat],
+        help="Output format. 'TIFF_SERIES_SPLIT_C' is required for pypetakit5d.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clean (delete) any existing files from the output directory "
+        "before processing.",
+    )
+    args = parser.parse_args()
 
-    if not input_dir_str:
-        print("No input directory specified. Opening file dialog...")
-        input_dir_str = filedialog.askdirectory(title="Select Input Directory")
-        if not input_dir_str:
-            print("No directory selected. Exiting.")
-            return
+    # --- Start Processing ---
+    print("--- Starting OPM Cropper Job ---")
+    try:
+        base_file = args.base_file.resolve()
+        output_format = OutputFormat(args.format)
+        top_roi = parse_roi_string(args.top_roi)
+        bottom_roi = parse_roi_string(args.bottom_roi)
 
-    input_dir = Path(input_dir_str)
-    output_dir_str = sys.argv[2] if len(sys.argv) > 2 else None
+        # 1. Derive all paths
+        paths: DerivedPaths = derive_paths(base_file, output_format)
+        print(f"  Source: {paths.base_file}")
+        print(f"  Metadata: {paths.metadata_file}")
+        print(f"  Output Dir: {paths.output_dir}")
+        print(f"  Format: {output_format.value}")
 
-    if not output_dir_str:
-        output_dir = input_dir / "processed"
-        print(f"No output directory specified. Defaulting to: {output_dir}\n")
-    else:
-        output_dir = Path(output_dir_str)
+        # 2. Validate inputs
+        if not paths.base_file.exists():
+            raise FileNotFoundError(f"Input file not found: {paths.base_file}")
+        if not paths.metadata_file.exists():
+            raise FileNotFoundError(f"Metadata file not found: {paths.metadata_file}")
 
-    output_dir.mkdir(exist_ok=True)
+        # 3. Create output directory
+        paths.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("--- Universal Light Sheet Processing Pipeline ---")
+        # 4. Clean output directory if requested
+        if args.clean:
+            print(f"Cleaning output directory: {paths.output_dir.name}...")
+            if output_format == OutputFormat.TIFF_SERIES:
+                # Delete old TIFFs but keep the directory
+                for f in paths.output_dir.glob(f"{paths.sanitized_name}_T*.tif"):
+                    os.remove(f)
+            elif output_format == OutputFormat.ZARR:
+                zarr_path = paths.output_dir / (
+                    paths.sanitized_name + "_processed.zarr"
+                )
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
 
-    # --- Parse Metadata ---
-    # Find the settings file, whether it's AcqSettings.txt or Settings.txt
-    settings_path = next(input_dir.glob("*ettings.txt"), None)
-    if not settings_path:
-        print(f"Could not find a settings file in {input_dir}. Exiting.")
-        sys.exit(1)
-
-    meta_params = metadata.parse_settings(settings_path)
-    if not meta_params:
-        print(f"Could not parse {settings_path}. Exiting.")
-        sys.exit(1)
-
-    # --- Find Image Files ---
-    prefix = meta_params.get("save_name_prefix")
-    if not prefix:
-        print("Could not find 'save_name_prefix' in metadata. Exiting.")
-        sys.exit(1)
-
-    image_files = sorted(input_dir.glob(f"{prefix}*.tif"))
-    if not image_files:
-        print(f"No TIFF files found with prefix '{prefix}' in {input_dir}. Exiting.")
-        sys.exit(1)
-
-    print(f"Found {len(image_files)} TIFF files to process.")
-
-    # --- Process Each File ---
-    all_successful = True
-    for image_file in image_files:
-        print(f"\nProcessing file: {image_file.name}")
-        success = core.process_file(
-            filepath=image_file,
-            output_dir=output_dir,
-            params=meta_params,
+        # 5. Run main processing
+        print("\nStarting stream processing...")
+        num_timepoints = process_dataset(
+            paths.base_file,
+            paths.output_dir,
+            paths.sanitized_name,
+            top_roi,
+            bottom_roi,
+            output_format,
         )
-        if not success:
-            all_successful = False
-            break
 
-    # --- Final Status Message ---
-    if all_successful:
-        print("\n--- Pipeline finished successfully! ---")
-    else:
-        print("\n--- Pipeline finished with errors. ---")
+        # 6. Create the log file
+        print("\nCreating processing log...")
+        create_processing_log(
+            paths,
+            num_timepoints,
+            top_roi,
+            bottom_roi,
+            output_format,
+        )
+
+        print("\n--- Processing Job Complete ---")
+
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

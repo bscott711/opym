@@ -1,67 +1,108 @@
-# **opym: OPM Processing in Python**
+# OPM Cropping Package (`opym`)
 
-opym (pronounced "opium") is a command-line tool for GPU-accelerated processing of Oblique Plane Microscopy (OPM) data. It provides a streamlined pipeline for de-interlacing, deskewing, and deconvolving raw TIFF stacks.
+`opym` is a Python package for processing 5D (T, Z, C, Y, X) OPM (Oblique Plane Microscopy) datasets. Its primary function is to crop, deskew (via channel alignment), and save out OPM data into analysis-friendly formats like Zarr or TIFF series.
 
-## **Features**
+It provides two main workflows:
 
-* **Automated Discovery:** Point it at a directory, and it automatically finds data based on AcqSettings.txt.  
-* **GPU Acceleration:** Leverages cupy for fast deskewing and pycudadecon for best-in-class deconvolution performance.  
-* **Flexible:** Command-line arguments can override any parameters found in metadata.  
-* **User-Friendly:** Provides a graphical folder-picker if no input directory is specified.
+1. **Interactive Notebook:** A Jupyter notebook to visually inspect data, select ROIs, and test processing on a single file.
+2. **Command-Line Interface (CLI):** A `typer`-based CLI for batch processing entire directories of OPM data using pre-defined ROIs.
 
-## **Installation**
+## Installation
 
-This package is designed to be installed and run using uv and pip. It relies on pycudadecon, which requires a CUDA-enabled NVIDIA GPU and a compatible version of the **NVIDIA CUDA Toolkit**.
+This package is managed with `uv` and `pyproject.toml`.
 
-Because the pip-installable version of pycudadecon does not include the compiled CUDA engine, a one-time manual download and setup of the libcudaDecon.dll file is required.
+1. Clone the repository:
 
-### **1\. Create a Virtual Environment with uv**
+    ```bash
+    git clone [https://github.com/your-username/opym.git](https://github.com/your-username/opym.git)
+    cd opym
+    ```
 
-Navigate to your project directory and create a new virtual environment.
+2. Create and activate a virtual environment:
 
-\# Create the environment  
-uv venv
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate
+    ```
 
-\# Activate the environment  
-.\\.venv\\Scripts\\Activate.ps1
+3. Install the package in editable mode:
 
-### **2\. Manually Install the cudaDecon Library**
+    ```bash
+    uv pip install -e .
+    ```
 
-This is the critical manual step. You need to download the compiled library from the Anaconda distribution channel and place it where your system can find it.
+This will install all required dependencies, including `numpy`, `tifffile`, `zarr`, `scikit-image`, `tqdm`, and `typer`.
 
-1. **Download the Library:**  
-   * Go to the pycudadecon file list on Anaconda: [https://anaconda.org/conda-forge/pycudadecon/files](https://www.google.com/search?q=https://anaconda.org/conda-forge/pycudadecon/files)  
-   * Find a recent version that matches your architecture (e.g., win-64) and CUDA toolkit version.  
-   * Download the .tar.bz2 file.  
-2. **Extract the .dll:**  
-   * Use a tool like 7-Zip to open the downloaded .tar.bz2 archive.  
-   * Navigate inside to the Library/bin/ directory.  
-   * Extract the libcudaDecon.dll file to a known, permanent location on your computer. A good practice is to create a dedicated folder, for example: C:\\tools\\lib.  
-3. **Add to System PATH:**  
-   * You must add the folder containing libcudaDecon.dll to your system's PATH environment variable so that Windows can find it.  
-   * Press the Windows Key, type env, and select "Edit the system environment variables".  
-   * Click "Environment Variables...".  
-   * Under "System variables", select Path and click "Edit...".  
-   * Click "New" and add the path to the folder where you saved the .dll (e.g., C:\\tools\\lib).  
-   * Click OK on all windows to save.  
-   * **You must restart your terminal for this change to take effect.**
+## Workflow 1: Interactive ROI Selection (Jupyter)
 
-### **3\. Install opym and Dependencies**
+This is the recommended starting point for any new dataset. Use the included notebook to find the correct cropping coordinates.
 
-After restarting your terminal and reactivating the uv environment, navigate to the root directory of the opym project and run:
+1. Start Jupyter Lab:
 
-uv pip install \-e .
+    ```bash
+    jupyter lab
+    ```
 
-This will install opym, the Python wrapper for pycudadecon, and all other dependencies into your uv environment. The opym command will now be available in your terminal.
+2. Open the `OPM_Cropping_Refactored.ipynb` notebook.
 
-## **Usage**
+3. **Cell 0 & 1:** Select your base OME-TIF file (e.g., `..._Pos0.ome.tif`) and run the cells to generate a Max Intensity Projection (MIP).
 
-Once installed, you can run the pipeline from your activated uv environment.
+4. **Cell 2:** Run to open the interactive ROI selector.
+    * Draw a box for the **Top ROI (C=0)**.
+    * Click-and-drag near the center of the **Bottom ROI (C=1)**. The box size will be matched automatically.
 
-**Basic Usage (with folder selection dialog):**
+5. **Cell 3 & 4:** Run to trigger the auto-alignment, which fine-tunes the Bottom ROI position based on phase cross-correlation. The final aligned ROIs will be displayed.
 
-opym
+6. **Cell 5:** Saves your selected ROIs to the central `opm_roi_log.json` file in your project directory. This file is used by the CLI for batch processing.
 
-**Recommended Usage (specifying an input directory):**
+7. **Cell 6 (Optional):** Run the full processing job on *just this file* from within the notebook to confirm the results.
 
-opym "C:\\path\\to\\your\\data\_folder"  
+## Workflow 2: CLI Batch Processing
+
+Once you have saved your ROIs to the `opm_roi_log.json` file, you can use the `opym` CLI to process all other files in your dataset (e.g., `..._Pos1.ome.tif`, `..._Pos2.ome.tif`, etc.).
+
+The main command is `opym process`.
+
+### Examples
+
+**Process all files using the log:**
+
+This is the most common use case. The command will find all `*Pos0.ome.tif`, `*Pos1.ome.tif`, etc. files in the input directory and automatically find their matching ROIs from the `opm_roi_log.json` file.
+
+```bash
+opym process \
+    --input-dir /path/to/my/dataset \
+    --output-format ZARR \
+    --roi-from-log opm_roi_log.json
+
+opym process \
+    --input-file /path/to/my/dataset/my_file_Pos0.ome.tif \
+    --output-format TIFF_SERIES_SPLIT_C \
+    --top-roi "431:708, 557:1671" \
+    --bottom-roi "1582:1859, 531:1645"
+```
+
+Cli options:
+
+```bash
+Usage: opym process [OPTIONS]
+────────────────────────────────────────────────────────────────────────────────
+ Process one or more OPM files from a 5D OME-TIF to a processed Zarr or
+ TIFF series.
+
+ You must provide EITHER --input-file OR --input-dir.
+ You must provide ROIs via EITHER --roi-from-log OR (--top-roi and
+ --bottom-roi).
+────────────────────────────────────────────────────────────────────────────────
+Options:
+  --input-file              PATH  A single 5D OME-TIF file to process.
+  --input-dir               PATH  A directory of 5D OME-TIF files to process.
+  --output-format     [ZARR|TIFF_SERIES_SPLIT_C]
+                                The output format.
+                                [default: ZARR]
+  --top-roi                 TEXT  ROI for the top channel (C=0) as
+                                "y_start:y_stop,x_start:x_stop".
+  --bottom-roi              TEXT  ROI for the bottom channel (C=1) as
+                                "y_start:y_stop,x_start:x_stop".
+  --roi-from-log            PATH  Path to a JSON log file containing ROIs.
+  --help                        Show this message and exit.
