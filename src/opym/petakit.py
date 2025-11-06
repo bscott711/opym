@@ -16,7 +16,8 @@ from pathlib import Path
 
 import PyPetaKit5D as ppk
 
-from .utils import OutputFormat
+# No longer need OutputFormat from utils
+# from .utils import OutputFormat
 
 
 @dataclass(frozen=True)
@@ -32,37 +33,31 @@ class PetaKitContext:
     dsr_output_dir: Path
 
 
-def get_petakit_context(base_data_dir: Path) -> PetaKitContext:
+def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
     """
-    Dynamically generates all necessary paths for a PyPetaKit5D job.
-
-    It assumes the 'opym.run_processing_job' has already been run
-    and that the CWD is the base data directory (e.g., '.../cell').
+    Dynamically generates all necessary paths for a PyPetaKit5D job
+    from the user-selected processed directory.
 
     Args:
-        base_data_dir: The path to the base data folder
-                       (e.g., '.../CS_1/cell').
+        processed_dir_path: The path to the processed TIFF directory
+                            (e.g., '.../processed_tiff_series_split').
 
     Returns:
         A PetaKitContext dataclass instance with all paths.
     """
-    if not base_data_dir.exists():
-        raise FileNotFoundError(f"Base data directory not found: {base_data_dir}")
-
-    # 1. Find the processed directory using the name from opym.utils
-    processed_dir_name = OutputFormat.TIFF_SERIES.value
-    processed_dir = base_data_dir / processed_dir_name
+    processed_dir = processed_dir_path.resolve()
     if not processed_dir.exists():
-        raise FileNotFoundError(
-            f"Processed TIFF directory '{processed_dir_name}' not found in "
-            f"{base_data_dir}. Please run 'opym.run_processing_job' first."
-        )
+        raise FileNotFoundError(f"Processed TIFF directory not found: {processed_dir}")
 
-    # 2. Find the opym processing log
+    # 1. The base data dir is one level up
+    base_data_dir = processed_dir.parent
+
+    # 2. Find the opym processing log *inside* the provided path
     log_files = list(processed_dir.glob("*_processing_log.json"))
     if not log_files:
         raise FileNotFoundError(
-            f"No '*_processing_log.json' file found in {processed_dir}"
+            f"No '*_processing_log.json' file found in {processed_dir}. "
+            "Please ensure this is the correct opym output folder."
         )
     log_file = log_files[0]
 
@@ -70,7 +65,9 @@ def get_petakit_context(base_data_dir: Path) -> PetaKitContext:
     base_name = log_file.stem.replace("_processing_log", "")
 
     # 4. Define all output paths
+    # Job logs are stored in the base data dir
     job_log_dir = base_data_dir / "job_logs"
+    # PyPetaKit outputs are stored *inside* the processed dir
     ds_output_dir = processed_dir / "DS"
     dsr_output_dir = processed_dir / "DSR"
 
@@ -86,10 +83,10 @@ def get_petakit_context(base_data_dir: Path) -> PetaKitContext:
 
 
 def run_petakit_processing(
-    base_data_dir: Path,
+    processed_dir_path: Path,
     *,
     # --- Physical Parameters ---
-    xy_pixel_size: float = 0.136,
+    xy_pixel_size: float = 0.108,
     z_step_um: float = 1.0,
     sheet_angle_deg: float = 21.72,
     # --- Reader/Writer Flags ---
@@ -125,12 +122,9 @@ def run_petakit_processing(
     (Base function) Runs the PyPetaKit5D deskew/rotate wrapper on
     an 'opym' processed TIFF series.
 
-    All hardcoded parameters from the original script are now
-    keyword arguments with defaults.
-
     Args:
-        base_data_dir: The path to the base data folder
-                       (e.g., '.../CS_1/cell').
+        processed_dir_path: The path to the processed TIFF directory
+                            (e.g., '.../processed_tiff_series_split').
         **kwargs: See function signature for all processing options.
     """
     if block_size is None:
@@ -142,8 +136,8 @@ def run_petakit_processing(
 
     try:
         # 1. Get all paths
-        print(f"--- Setting up PetaKit5D for: {base_data_dir.name} ---")
-        ctx = get_petakit_context(base_data_dir)
+        print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
+        ctx = get_petakit_context(processed_dir_path)
 
         # 2. Create required directories
         os.makedirs(ctx.job_log_dir, exist_ok=True)
@@ -203,9 +197,8 @@ def run_petakit_processing(
         raise  # Re-raise for the notebook to catch
 
 
-# --- NEW FUNCTION ---
 def run_petakit_from_config(
-    base_data_dir: Path,
+    processed_dir_path: Path,
     config_file: Path,
 ) -> None:
     """
@@ -216,8 +209,8 @@ def run_petakit_from_config(
     in 'run_petakit_processing'.
 
     Args:
-        base_data_dir: The path to the base data folder
-                       (e.g., '.../CS_1/cell').
+        processed_dir_path: The path to the processed TIFF directory
+                            (e.g., '.../processed_tiff_series_split').
         config_file: The path to the .json parameter file.
     """
     print(f"--- Loading parameters from: {config_file.name} ---")
@@ -236,7 +229,6 @@ def run_petakit_from_config(
     valid_keys = {p.name for p in sig.parameters.values()}
 
     # Filter the loaded params to only include valid keyword arguments
-    # This prevents a "TypeError: unexpected keyword argument"
     filtered_params = {}
     for key, value in params.items():
         if key in valid_keys:
@@ -245,9 +237,7 @@ def run_petakit_from_config(
             print(f"  Warning: Ignoring unknown parameter '{key}' in JSON.")
 
     # Call the base function, "splatting" the loaded params.
-    # Any param *not* in the JSON will use its default value
-    # from the base function's signature.
     run_petakit_processing(
-        base_data_dir=base_data_dir,
+        processed_dir_path=processed_dir_path,
         **filtered_params,
     )
