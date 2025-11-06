@@ -289,12 +289,10 @@ def tune_single_stack(
         temp_input_dir = temp_path / "input_tiffs"
         temp_output_ds_dir = "output_ds"
         temp_output_dsr_dir = "output_dsr"
-        temp_job_log_dir = temp_path / "job_logs"  # <-- FIX 1: Define log dir
+        temp_job_log_dir = temp_path / "job_logs"
         os.makedirs(temp_input_dir)
-        os.makedirs(temp_job_log_dir)  # <-- FIX 2: Create log dir
+        os.makedirs(temp_job_log_dir)
 
-        # PyPetaKit wrapper expects a T- and C- formatted file name
-        # We'll just hardcode T=0, C=0 for this single stack
         file_name = f"{base_name}_T000_C0.tif"
         input_file_path = temp_input_dir / file_name
         tifffile.imwrite(
@@ -319,7 +317,7 @@ def tune_single_stack(
                 channelPatterns=[base_name],
                 DSDirName=temp_output_ds_dir,
                 DSRDirName=temp_output_dsr_dir,
-                jobLogDir=str(temp_job_log_dir),  # <-- FIX 3: Pass log dir
+                jobLogDir=str(temp_job_log_dir),
                 largeFile=False,
                 zarrFile=False,
                 saveZarr=False,
@@ -329,15 +327,20 @@ def tune_single_stack(
                 configFile="",
                 mccMode=True,
                 save3DStack=True,
-                saveMIP=False,  # Don't need MIP for this
+                saveMIP=False,
                 interpMethod=interp_method,
             )
 
-            # PyPetaKit adds _DSR to the filename
-            result_file_name = f"{base_name}_T000_C0_DSR.tif"
+            # PyPetaKit *should* create this file.
+            # It does NOT add a _DSR suffix.
+            result_file_name = f"{base_name}_T000_C0.tif"
             result_path = temp_path / temp_output_dsr_dir / result_file_name
 
             if not result_path.exists():
+                # --- THIS IS THE BUG ---
+                # The wrapper must have failed silently.
+                # The file it was *supposed* to create is missing.
+                # We will now raise the error message you saw.
                 raise FileNotFoundError(
                     f"PyPetaKit did not produce output file: {result_path.name}"
                 )
@@ -352,6 +355,9 @@ def tune_single_stack(
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)
+            # --- MODIFICATION ---
+            # Re-raise the exception so the notebook
+            # catches it and doesn't display the old image.
             raise e
         finally:
             # The temporary directory is automatically cleaned up
