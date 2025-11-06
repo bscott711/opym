@@ -27,6 +27,7 @@ dependencies = [
     "tqdm",
     "scikit-image",
     "PyPetaKit5D",
+    "imagecodecs",
 ]
 
 [project.optional-dependencies]
