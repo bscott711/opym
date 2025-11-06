@@ -12,6 +12,7 @@ from .petakit import (
     get_petakit_context,
     run_petakit_from_config,
     run_petakit_processing,
+    tune_single_stack,
 )
 from .utils import (
     DerivedPaths,
@@ -52,4 +53,5 @@ __all__ = [
     "get_petakit_context",
     "run_petakit_processing",
     "run_petakit_from_config",
+    "tune_single_stack",
 ]

@@ -10,11 +10,14 @@ import inspect
 import json
 import os
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import PyPetaKit5D as ppk
+import tifffile
 
 
 @dataclass(frozen=True)
@@ -50,9 +53,7 @@ def get_petakit_context(
     """
     processed_dir = processed_dir_path.resolve()
     if not processed_dir.exists():
-        raise FileNotFoundError(
-            f"Processed TIFF directory not found: {processed_dir}"
-        )
+        raise FileNotFoundError(f"Processed TIFF directory not found: {processed_dir}")
 
     # 1. The base data dir is one level up
     base_data_dir = processed_dir.parent
@@ -136,7 +137,7 @@ def run_petakit_processing(
         dsr_dir_name: The name for the deskewed+rotated output subdirectory.
         **kwargs: See function signature for all processing options.
     """
-    # --- THIS IS THE START OF THE FUNCTION BODY ---
+    # --- START OF FUNCTION BODY (FIXED INDENTATION) ---
     if block_size is None:
         block_size = [256, 256, 256]
     if ff_image_paths is None:
@@ -208,7 +209,7 @@ def run_petakit_processing(
         print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         raise
-    # --- THIS IS THE END OF THE FUNCTION BODY ---
+    # --- END OF FUNCTION BODY ---
 
 
 def run_petakit_from_config(
@@ -255,3 +256,104 @@ def run_petakit_from_config(
         processed_dir_path=processed_dir_path,
         **filtered_params,
     )
+
+
+# --- NEWLY REWRITTEN FUNCTION ---
+def tune_single_stack(
+    stack_3d: np.ndarray,
+    base_name: str,
+    *,
+    xy_pixel_size: float,
+    z_step_um: float,
+    sheet_angle_deg: float,
+    interp_method: str = "linear",
+    reverse_z: bool = True,
+    objective_scan: bool = False,
+) -> np.ndarray:
+    """
+    Runs in-memory deskew/rotate on a single 3D (ZYX) stack
+    by saving to a temp directory and calling the wrapper.
+
+    Args:
+        stack_3d: The (ZYX) numpy array to process.
+        base_name: The base name for the file (e.g., 'cell_MMStack_Pos0').
+        xy_pixel_size: Pixel size in XY (microns).
+        z_step_um: Z-step size (microns).
+        sheet_angle_deg: Sheet angle (degrees).
+        interp_method: Interpolation method ('linear', 'cubic', etc.).
+        reverse_z: Z-stack direction (True is standard for OPM).
+        objective_scan: Whether this is an objective-scan dataset (False).
+
+    Returns:
+        The processed 3D (ZYX) numpy array.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir_str:
+        temp_path = Path(temp_dir_str)
+        temp_input_dir = temp_path / "input_tiffs"
+        temp_output_ds_dir = "output_ds"
+        temp_output_dsr_dir = "output_dsr"
+        os.makedirs(temp_input_dir)
+
+        # PyPetaKit wrapper expects a T- and C- formatted file name
+        # We'll just hardcode T=0, C=0 for this single stack
+        file_name = f"{base_name}_T000_C0.tif"
+        input_file_path = temp_input_dir / file_name
+        tifffile.imwrite(
+            input_file_path,
+            stack_3d,
+            imagej=True,
+            metadata={"axes": "ZYX"},
+        )
+
+        try:
+            # Call the full wrapper on our temporary directory
+            ppk.XR_deskew_rotate_data_wrapper(
+                [str(temp_input_dir)],
+                deskew=True,
+                rotate=True,
+                DSRCombined=False,
+                xyPixelSize=xy_pixel_size,
+                dz=z_step_um,
+                skewAngle=sheet_angle_deg,
+                objectiveScan=objective_scan,
+                reverse=reverse_z,
+                channelPatterns=[base_name],
+                DSDirName=temp_output_ds_dir,
+                DSRDirName=temp_output_dsr_dir,
+                largeFile=False,
+                zarrFile=False,
+                saveZarr=False,
+                save16bit=True,
+                parseCluster=False,
+                masterCompute=True,
+                configFile="",
+                mccMode=True,
+                save3DStack=True,
+                saveMIP=False,  # Don't need MIP for this
+                interpMethod=interp_method,
+            )
+
+            # PyPetaKit adds _DSR to the filename
+            result_file_name = f"{base_name}_T000_C0_DSR.tif"
+            result_path = temp_path / temp_output_dsr_dir / result_file_name
+
+            if not result_path.exists():
+                raise FileNotFoundError(
+                    f"PyPetaKit did not produce output file: {result_path.name}"
+                )
+
+            # Load the processed stack
+            result_stack = tifffile.imread(result_path)
+            return result_stack
+
+        except Exception as e:
+            print(
+                f"❌ FATAL ERROR during tune_single_stack: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            # Return the original stack on failure
+            return stack_3d
+        finally:
+            # The temporary directory is automatically cleaned up
+            pass
