@@ -4,6 +4,7 @@ Core OPM Cropper processing functions.
 Streams from a 5D OME-TIF virtual zarr stack into the specified output format.
 """
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -14,7 +15,8 @@ import tifffile
 import zarr
 from tqdm.auto import tqdm
 
-from .utils import OutputFormat
+from .metadata import create_processing_log
+from .utils import OutputFormat, derive_paths, save_rois_to_log
 
 
 def process_dataset(
@@ -177,3 +179,81 @@ def process_dataset(
     except Exception as e:
         print(f"\n❌ Error processing {base_file.name}: {e}\n", file=sys.stderr)
         sys.exit(1)
+
+
+def run_processing_job(
+    base_file: Path,
+    top_roi: tuple[slice, slice],
+    bottom_roi: tuple[slice, slice],
+    output_format: OutputFormat,
+    cli_log_file: Path = Path("opm_roi_log.json"),
+):
+    """
+    Runs a full processing job for a single file.
+
+    This function is a high-level wrapper that:
+    1. Derives paths.
+    2. Checks for input files.
+    3. Cleans the output directory.
+    4. Runs `process_dataset`.
+    5. Runs `create_processing_log`.
+    6. Saves ROIs to the central CLI log.
+    """
+    print("--- Starting Processing Job ---")
+
+    # --- 1. Derive all paths using the package util ---
+    paths = derive_paths(base_file, output_format)
+
+    # --- 2. Check inputs ---
+    if not paths.base_file.exists():
+        raise FileNotFoundError(f"Input file not found: {paths.base_file}")
+    if not paths.metadata_file.exists():
+        raise FileNotFoundError(f"Metadata file not found: {paths.metadata_file}")
+
+    # Create output dir
+    paths.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- 3. Clear old output ---
+    if output_format == OutputFormat.ZARR:
+        zarr_path = paths.output_dir / (paths.sanitized_name + "_processed.zarr")
+        if zarr_path.exists():
+            print(
+                f"Warning: Output Zarr {zarr_path.name} already exists. Deleting it..."
+            )
+            shutil.rmtree(zarr_path)
+    elif output_format == OutputFormat.TIFF_SERIES:
+        print(f"Cleaning old files from {paths.output_dir.name}...")
+        for f in paths.output_dir.glob(f"{paths.sanitized_name}_T*.tif"):
+            os.remove(f)
+
+    print(f"Format selected: {output_format.value}")
+    print(f"Output Directory: {paths.output_dir.name}")
+
+    # --- 4. Run processing using the package ---
+    print("\nStarting stream processing...")
+
+    num_timepoints = process_dataset(
+        paths.base_file,
+        paths.output_dir,
+        paths.sanitized_name,
+        top_roi,
+        bottom_roi,
+        output_format,
+    )
+
+    print("\nCreating processing log...")
+    create_processing_log(
+        paths,
+        num_timepoints,
+        top_roi,
+        bottom_roi,
+        output_format,
+    )
+
+    # --- 5. Save ROIs to the central log for CLI use ---
+    save_rois_to_log(
+        cli_log_file,
+        paths.base_file,
+        top_roi,
+        bottom_roi,
+    )

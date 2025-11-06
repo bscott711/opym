@@ -4,7 +4,7 @@ opym: OPM Cropper Package
 """
 
 # Expose the main functions for library use (e.g., in notebooks)
-from .core import process_dataset
+from .core import process_dataset, run_processing_job
 from .dataloader import load_tiff_series
 from .metadata import create_processing_log, parse_timestamps
 from .utils import (
@@ -26,6 +26,7 @@ from .viewer import (
 
 __all__ = [
     "process_dataset",
+    "run_processing_job",
     "create_processing_log",
     "parse_timestamps",
     "derive_paths",
