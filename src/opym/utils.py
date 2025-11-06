@@ -11,7 +11,6 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
-import zarr
 from skimage.registration import phase_cross_correlation
 
 
@@ -152,40 +151,45 @@ def load_rois_from_log(
 
 
 def align_rois(
-    lazy_data: zarr.Array,
+    mip_data: np.ndarray,
     top_roi: tuple[slice, slice],
     bottom_roi: tuple[slice, slice],
-    t_index: int,
-    z_index: int | None = None,
 ) -> tuple[slice, slice]:
     """
-    Calculates the pixel shift between two ROIs using phase cross-correlation
-    and returns the adjusted second ROI.
-    ...
-    """
-    if z_index is None:
-        z_index = lazy_data.shape[1] // 2
+    Calculates the pixel shift between two ROIs from a 2D MIP
+    using phase cross-correlation and returns the adjusted second ROI.
 
-    print(f"Aligning ROIs using T={t_index}, Z={z_index}...")
+    Args:
+        mip_data: The 2D (Y, X) Max Intensity Projection array.
+        top_roi: (slice, slice) for the reference ROI (Y, X).
+        bottom_roi: (slice, slice) for the target ROI (Y, X).
+
+    Returns:
+        The adjusted (slice, slice) for the bottom ROI.
+    """
+    print("Aligning ROIs using 2D MIP...")
 
     try:
-        # ... (no change to image fetching) ...
-        top_img = lazy_data[t_index, z_index, 0, top_roi[0], top_roi[1]]
-        bottom_img = lazy_data[t_index, z_index, 1, bottom_roi[0], bottom_roi[1]]
+        # Crop the data from the MIP for registration
+        top_crop = mip_data[top_roi[0], top_roi[1]]
+        bottom_crop_before = mip_data[bottom_roi[0], bottom_roi[1]]
 
-        # Calculate shift
+        # --- 1. Calculate the shift ---
         shift, _, _ = phase_cross_correlation(
-            np.asarray(top_img), np.asarray(bottom_img), upsample_factor=10
+            top_crop, bottom_crop_before, upsample_factor=10
         )
-        dy, dx = shift[0], shift[1]
+        dy, dx = shift
         print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
 
-        # The shift vector (dy, dx) is the amount the crop
-        # window needs to move to follow the content.
-        new_y_start = bottom_roi[0].start + int(round(dy))
-        new_y_end = bottom_roi[0].stop + int(round(dy))
-        new_x_start = bottom_roi[1].start + int(round(dx))
-        new_x_end = bottom_roi[1].stop + int(round(dx))
+        # --- 2. Apply the shift to create the new ROI slice ---
+        old_y_start, old_y_end = bottom_roi[0].start, bottom_roi[0].stop
+        old_x_start, old_x_end = bottom_roi[1].start, bottom_roi[1].stop
+
+        # --- 3. SUBTRACT the shift (as in your original code) ---
+        new_y_start = old_y_start - int(round(dy))
+        new_y_end = old_y_end - int(round(dy))
+        new_x_start = old_x_start - int(round(dx))
+        new_x_end = old_x_end - int(round(dx))
 
         aligned_bottom_roi = (
             slice(new_y_start, new_y_end),
