@@ -352,8 +352,7 @@ def tune_single_stack(
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)
-            # Return the original stack on failure
-            return stack_3d
+            raise e
         finally:
             # The temporary directory is automatically cleaned up
             pass
