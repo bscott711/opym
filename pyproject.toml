@@ -26,6 +26,7 @@ dependencies = [
     "zarr",
     "tqdm",
     "scikit-image",
+    "PyPetaKit5D",
 ]
 
 [project.optional-dependencies]
