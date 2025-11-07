@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from skimage.registration import phase_cross_correlation
@@ -22,6 +23,40 @@ class OutputFormat(str, Enum):
 
     def __str__(self):
         return self.value
+
+
+# --- NEW: Data type detection ---
+MicroscopyDataType = Literal["LLSM", "OPM", "UNKNOWN"]
+
+
+def detect_microscopy_data_type(directory: Path) -> MicroscopyDataType:
+    """
+    Detects the microscopy data type by inspecting filenames.
+
+    Args:
+        directory: The Path object to the data directory.
+
+    Returns:
+        "LLSM", "OPM", or "UNKNOWN".
+    """
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Path is not a directory: {directory}")
+
+    # Check for OPM first, as it's the most specific pattern
+    if next(directory.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None):
+        return "OPM"
+
+    # Check for LLSM
+    if next(
+        directory.glob("*_Cam[AB]_ch[0-9]_stack[0-9][0-9][0-9][0-9]*.tif"),
+        None,
+    ):
+        return "LLSM"
+
+    return "UNKNOWN"
+
+
+# --- END NEW ---
 
 
 @dataclass(frozen=True)

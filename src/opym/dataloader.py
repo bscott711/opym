@@ -12,6 +12,62 @@ import numpy as np
 import tifffile
 
 
+# --- NEW: LLSM-specific preview loader ---
+def load_llsm_preview(
+    directory: Path, preview_channel: int = 0
+) -> tuple[np.ndarray, float, float, str]:
+    """
+    Loads a preview MIP for LLSM data from a specific channel.
+
+    Finds the first timepoint (stack0000) for the specified channel,
+    loads it, and calculates the MIP.
+
+    Args:
+        directory: The Path object to the LLSM data directory.
+        preview_channel: The channel index (e.g., 0, 1, 2) to load.
+
+    Returns:
+        A tuple containing:
+        - mip_original (np.ndarray): The calculated MIP.
+        - vmin_original (float): 1st percentile for contrast.
+        - vmax_original (float): 99.9th percentile for contrast.
+        - preview_file (str): The name of the file used for the preview.
+    """
+    print(f"  Loading LLSM preview for ch{preview_channel}, stack0000...")
+
+    # Find the first stack for the specified channel
+    first_stack_file = next(
+        directory.glob(f"*_Cam[AB]_ch{preview_channel}_stack0000*.tif"),
+        None,
+    )
+
+    if not first_stack_file:
+        # Fallback to *any* stack for that channel if stack0000 is missing
+        first_stack_file = next(
+            directory.glob(f"*_Cam[AB]_ch{preview_channel}_stack*.tif"),
+            None,
+        )
+
+    if not first_stack_file:
+        raise FileNotFoundError(
+            f"Could not find any LLSM stack files for ch{preview_channel} "
+            f"in: {directory}"
+        )
+
+    print(f"  Loading preview from: {first_stack_file.name}")
+    stack_original = tifffile.imread(first_stack_file)
+    mip_original = np.max(stack_original, axis=0)
+
+    vmin_original, vmax_original = np.percentile(mip_original, [1, 99.9])
+    if vmin_original >= vmax_original:
+        vmax_original = np.max(mip_original)
+
+    return mip_original, vmin_original, vmax_original, first_stack_file.name
+
+
+# --- END NEW ---
+
+
 def load_tiff_series(directory: Path):
     """
     Parses a directory of processed TIFFs and returns viewer parameters.

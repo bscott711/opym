@@ -92,6 +92,142 @@ def get_petakit_context(
     )
 
 
+# --- NEW: LLSM-specific processing function ---
+def run_llsm_petakit_processing(
+    source_dir: Path,
+    *,
+    # --- Custom Output Dirs ---
+    ds_dir_name: str = "DS",
+    dsr_dir_name: str = "DSR",
+    # --- Physical Parameters ---
+    xy_pixel_size: float = 0.108,
+    z_step_um: float = 1.0,
+    sheet_angle_deg: float = 21.72,
+    # --- Reader/Writer Flags ---
+    large_file: bool = False,
+    dsr_combined: bool = False,
+    zarr_file: bool = False,
+    save_zarr: bool = False,
+    save_16bit: bool = True,
+    save_3d_stack: bool = True,
+    save_mip: bool = True,
+    # --- MCC Logic Flags ---
+    objective_scan: bool = False,
+    reverse_z: bool = True,
+    # --- Processing ---
+    deskew: bool = True,
+    rotate: bool = True,
+    interp_method: str = "linear",
+    block_size: list[int] | None = None,
+    # --- Cluster & Config ---
+    parse_cluster: bool = False,
+    master_compute: bool = True,
+    config_file: str = "",
+    mcc_mode: bool = True,
+    # --- Redundant/Unused PyPetaKit5D args ---
+    ff_correction: bool = False,
+    lower_limit: float = 0.4,
+    const_offset: float = 1.0,
+    ff_image_paths: list[str] | None = None,
+    background_paths: list[str] | None = None,
+    bk_removal: bool = False,
+) -> None:
+    """
+    Runs the PyPetaKit5D wrapper *directly* on an LLSM dataset.
+    """
+    if block_size is None:
+        block_size = [256, 256, 256]
+    if ff_image_paths is None:
+        ff_image_paths = [""]
+    if background_paths is None:
+        background_paths = [""]
+
+    try:
+        print(f"--- Setting up PetaKit5D for LLSM: {source_dir.name} ---")
+        source_dir = source_dir.resolve()
+        if not source_dir.exists():
+            raise FileNotFoundError(f"Source directory not found: {source_dir}")
+
+        # 1. Determine base name
+        first_file = next(
+            source_dir.glob("*_Cam[AB]_ch[0-9]_stack[0-9][0-9][0-9][0-9]*.tif"),
+            None,
+        )
+        if not first_file:
+            raise FileNotFoundError(f"No LLSM files found in {source_dir}")
+
+        # Base name is everything before "_CamA" or "_CamB"
+        match = re.search(r"^(.*?)_Cam[AB]_", first_file.name)
+        if not match:
+            raise ValueError(f"Could not parse base name from: {first_file.name}")
+        base_name = match.group(1)
+
+        # 2. Define output paths
+        # Outputs are stored *inside* the source dir (matches OPM logic)
+        ds_output_dir = source_dir / ds_dir_name
+        dsr_output_dir = source_dir / dsr_dir_name
+
+        # Create a job log directory one level up
+        job_log_dir = source_dir.parent / "job_logs"
+        os.makedirs(job_log_dir, exist_ok=True)
+
+        print(f"\nRunning job locally for LLSM TIFF series in: {source_dir.name}")
+        print(f"  Base name (channelPattern): {base_name}")
+        print(f"  Job log directory: {job_log_dir.name}")
+        print(f"  Deskew output: {ds_output_dir.name}")
+        print(f"  Rotate output: {dsr_output_dir.name}")
+
+        # 3. Run the PyPetaKit5D wrapper
+        ppk.XR_deskew_rotate_data_wrapper(
+            [str(source_dir)],
+            deskew=deskew,
+            rotate=rotate,
+            DSRCombined=dsr_combined,
+            xyPixelSize=xy_pixel_size,
+            dz=z_step_um,
+            skewAngle=sheet_angle_deg,
+            objectiveScan=objective_scan,
+            reverse=reverse_z,
+            channelPatterns=[base_name],  # Key difference for LLSM
+            # Define separate output directories
+            DSDirName=ds_output_dir.name,
+            DSRDirName=dsr_output_dir.name,
+            # Pass through all other flags
+            FFCorrection=ff_correction,
+            lowerLimit=lower_limit,
+            constOffset=const_offset,
+            FFImagePaths=ff_image_paths,
+            backgroundPaths=background_paths,
+            largeFile=large_file,
+            zarrFile=zarr_file,
+            saveZarr=save_zarr,
+            blockSize=block_size,
+            save16bit=save_16bit,
+            parseCluster=parse_cluster,
+            masterCompute=master_compute,
+            configFile=config_file,
+            mccMode=mcc_mode,
+            BKRemoval=bk_removal,
+            save3DStack=save_3d_stack,
+            saveMIP=save_mip,
+            interpMethod=interp_method,
+        )
+
+        print("--- PyPetaKit5D Processing Complete ---")
+
+    except FileNotFoundError as fnfe:
+        print(f"\n❌ SETUP ERROR: {fnfe}", file=sys.stderr)
+        print("Ensure the input path and files exist.", file=sys.stderr)
+        raise
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        raise
+
+
+# --- END NEW ---
+
+
 def run_petakit_processing(
     processed_dir_path: Path,
     *,
