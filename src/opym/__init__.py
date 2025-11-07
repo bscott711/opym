@@ -6,24 +6,24 @@ opym: OPM Cropper Package
 # Expose the main functions for library use (e.g., in notebooks)
 from .core import process_dataset, run_processing_job
 from .dataloader import (
-    load_llsm_preview,  # <-- ADDED
+    load_llsm_tiff_series,
     load_tiff_series,
 )
 from .metadata import create_processing_log, parse_timestamps
 from .petakit import (
     PetaKitContext,
     get_petakit_context,
-    run_llsm_petakit_processing,  # <-- ADDED
+    run_llsm_petakit_processing,
     run_petakit_from_config,
     run_petakit_processing,
 )
 from .utils import (
     DerivedPaths,
-    MicroscopyDataType,  # <-- ADDED
+    MicroscopyDataType,
     OutputFormat,
     align_rois,
     derive_paths,
-    detect_microscopy_data_type,  # <-- ADDED
+    detect_microscopy_data_type,
     load_rois_from_log,
     parse_roi_string,
     save_rois_to_log,
@@ -50,7 +50,7 @@ __all__ = [
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",
-    "load_llsm_preview",  # <-- ADDED
+    "load_llsm_tiff_series",
     "create_mip",
     "interactive_roi_selector",
     "align_rois",
@@ -58,8 +58,8 @@ __all__ = [
     "PetaKitContext",
     "get_petakit_context",
     "run_petakit_processing",
-    "run_llsm_petakit_processing",  # <-- ADDED
+    "run_llsm_petakit_processing",
     "run_petakit_from_config",
-    "detect_microscopy_data_type",  # <-- ADDED
-    "MicroscopyDataType",  # <-- ADDED
+    "detect_microscopy_data_type",
+    "MicroscopyDataType",
 ]

@@ -12,65 +12,87 @@ import numpy as np
 import tifffile
 
 
-# --- NEW: LLSM-specific preview loader ---
-def load_llsm_preview(
-    directory: Path, preview_channel: int = 0
-) -> tuple[np.ndarray, float, float, str]:
+def load_llsm_tiff_series(directory: Path):
     """
-    Loads a preview MIP for LLSM data from a specific channel.
+    Parses a directory of LLSM TIFFs and returns viewer parameters.
 
-    Finds the first timepoint (stack0000) for the specified channel,
-    loads it, and calculates the MIP.
-
-    Args:
-        directory: The Path object to the LLSM data directory.
-        preview_channel: The channel index (e.g., 0, 1, 2) to load.
-
-    Returns:
-        A tuple containing:
-        - mip_original (np.ndarray): The calculated MIP.
-        - vmin_original (float): 1st percentile for contrast.
-        - vmax_original (float): 99.9th percentile for contrast.
-        - preview_file (str): The name of the file used for the preview.
+    This function finds all files, parses T/C/Z limits, and returns
+    a (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name) tuple.
     """
-    print(f"  Loading LLSM preview for ch{preview_channel}, stack0000...")
+    print("Loading LLSM TIFF series...")
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # Find the first stack for the specified channel
-    first_stack_file = next(
-        directory.glob(f"*_Cam[AB]_ch{preview_channel}_stack0000*.tif"),
-        None,
+    # --- 1. Parse T, C, and Z limits from files ---
+    t_vals = set()
+    c_vals = set()
+    file_map = {}  # Dictionary to map (t, c) -> file_path
+    base_name = None
+    first_file = None
+
+    # Regex for LLSM: (base_name)_Cam(A/B)_ch(c)_stack(t)...tif
+    file_pattern = re.compile(
+        r"^(.*?)_Cam([AB])_ch(\d+)_stack(\d+).*?\.tif$",
+        re.IGNORECASE,
     )
 
-    if not first_stack_file:
-        # Fallback to *any* stack for that channel if stack0000 is missing
-        first_stack_file = next(
-            directory.glob(f"*_Cam[AB]_ch{preview_channel}_stack*.tif"),
-            None,
-        )
+    for f in directory.glob("*_Cam*_ch*_stack*.tif"):
+        match = file_pattern.match(f.name)
+        if match:
+            if base_name is None:
+                base_name = match.group(1)
+                first_file = f  # Store the first file we find
 
-    if not first_stack_file:
+            t = int(match.group(4))
+            c = int(match.group(3))
+
+            t_vals.add(t)
+            c_vals.add(c)
+            file_map[(t, c)] = f
+
+    if not file_map or not first_file or base_name is None:
         raise FileNotFoundError(
-            f"Could not find any LLSM stack files for ch{preview_channel} "
-            f"in: {directory}"
+            "No valid LLSM TIFF files "
+            "(e.g., '*_CamA_ch0_stack0000*.tif') "
+            f"found in {directory}"
         )
 
-    print(f"  Loading preview from: {first_stack_file.name}")
-    stack_original = tifffile.imread(first_stack_file)
-    mip_original = np.max(stack_original, axis=0)
+    print(f"Found base name: {base_name}")
 
-    vmin_original, vmax_original = np.percentile(mip_original, [1, 99.9])
-    if vmin_original >= vmax_original:
-        vmax_original = np.max(mip_original)
+    # --- 2. Get min/max values ---
+    T_min = min(t_vals)
+    T_max = max(t_vals)
+    C_min = min(c_vals)
+    C_max = max(c_vals)
 
-    return mip_original, vmin_original, vmax_original, first_stack_file.name
+    # Use the first_file we already found
+    first_stack = tifffile.imread(first_file)
+    Z_max, Y, X = first_stack.shape
+    Z_max -= 1  # Max index is shape - 1
 
+    print(
+        f"Data shape: T={T_min}-{T_max}, Z={Z_max + 1}, C={C_min}-{C_max}, Y={Y}, X={X}"
+    )
 
-# --- END NEW ---
+    # --- 3. Caching Function (for speed) ---
+    @functools.lru_cache(maxsize=8)
+    def get_stack(t, c):
+        """Loads a 3D ZYX stack for a given T and C."""
+        file_path = file_map.get((t, c))
+        if not file_path or not file_path.exists():
+            print(f"Warning: File not found for T={t}, C={c}")
+            return np.zeros((Z_max + 1, Y, X), dtype=first_stack.dtype)
+        return tifffile.imread(file_path)
+
+    print("✅ LLSM Data loaded.")
+
+    # --- 4. Return all parameters ---
+    return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name
 
 
 def load_tiff_series(directory: Path):
     """
-    Parses a directory of processed TIFFs and returns viewer parameters.
+    Parses a directory of processed OPM TIFFs and returns viewer parameters.
 
     This function finds all files, parses T/C/Z limits, and returns
     a (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name) tuple.
@@ -91,7 +113,7 @@ def load_tiff_series(directory: Path):
         - X (int): The X dimension of the images.
         - base_name (str): The parsed base name of the files.
     """
-    print("Loading TIFF series...")
+    print("Loading OPM TIFF series...")
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
@@ -155,7 +177,7 @@ def load_tiff_series(directory: Path):
             return np.zeros((Z_max + 1, Y, X), dtype=first_stack.dtype)
         return tifffile.imread(file_path)
 
-    print("✅ Data loaded. You can now run the viewer cells below.")
+    print("✅ OPM Data loaded.")
 
     # --- MODIFIED: Return min/max and base_name ---
     return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, BASE_NAME
