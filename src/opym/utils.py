@@ -104,12 +104,12 @@ def parse_roi_string(roi_str: str) -> tuple[slice, slice]:
     e.g., "0:512, 0:512" -> (slice(0, 512), slice(0, 512))
     """
     if not re.match(r"^\d+:\d+,\s*\d+:\d+$", roi_str):
-        print(
-            f"ERROR: Invalid ROI format: '{roi_str}'. "
-            "Expected 'y_start:y_stop,x_start:x_stop'",
-            file=sys.stderr,
+        # --- FIX: Raise ValueError instead of calling sys.exit() ---
+        # This allows the caller (like a notebook or CLI) to handle the error.
+        raise ValueError(
+            f"Invalid ROI format: '{roi_str}'. Expected 'y_start:y_stop,x_start:x_stop'"
         )
-        sys.exit(1)
+        # --- End fix ---
 
     y_str, x_str = roi_str.split(",")
     y_start, y_stop = map(int, y_str.strip().split(":"))

@@ -178,7 +178,9 @@ def process_dataset(
 
     except Exception as e:
         print(f"\n❌ Error processing {base_file.name}: {e}\n", file=sys.stderr)
-        sys.exit(1)
+        # --- FIX: Re-raise the exception for the caller to handle ---
+        raise
+        # --- End fix ---
 
 
 def run_processing_job(
@@ -214,6 +216,7 @@ def run_processing_job(
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- 3. Clear old output ---
+    # This logic is intentionally unconditional to ensure a clean run.
     if output_format == OutputFormat.ZARR:
         zarr_path = paths.output_dir / (paths.sanitized_name + "_processed.zarr")
         if zarr_path.exists():
