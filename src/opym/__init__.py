@@ -28,6 +28,8 @@ from .utils import (
     parse_roi_string,
     save_rois_to_log,
 )
+
+# --- MODIFICATION: Import from the new viewer subpackage ---
 from .viewer import (
     composite_viewer,
     create_mip,
@@ -35,6 +37,8 @@ from .viewer import (
     single_channel_viewer,
     visualize_alignment,
 )
+
+# --- END MODIFICATION ---
 
 __all__ = [
     "process_dataset",
@@ -47,6 +51,7 @@ __all__ = [
     "DerivedPaths",
     "save_rois_to_log",
     "load_rois_from_log",
+    # Viewer functions are still exported from the top level
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",
@@ -55,11 +60,13 @@ __all__ = [
     "interactive_roi_selector",
     "align_rois",
     "visualize_alignment",
+    # PetaKit functions
     "PetaKitContext",
     "get_petakit_context",
     "run_petakit_processing",
     "run_llsm_petakit_processing",
     "run_petakit_from_config",
+    # New Utils
     "detect_microscopy_data_type",
     "MicroscopyDataType",
 ]
