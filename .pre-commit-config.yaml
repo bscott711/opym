@@ -1,0 +1,58 @@
+# .pre-commit-config.yaml
+#
+# To use with uv:
+# 1. uv venv
+# 2. uv pip install pre-commit ruff mypy pytest bandit
+# 3. source .venv/bin/activate
+# 4. pre-commit install
+
+repos:
+  # --- 1. General Git Sanity Checks ---
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict # Prevents committing merge conflict markers
+      - id: check-yaml          # Checks YAML files for syntax errors
+      - id: check-json          # Checks JSON files for syntax errors
+      - id: end-of-file-fixer   # Ensures files end in a newline
+      - id: trailing-whitespace # Removes trailing whitespace
+
+  # --- 2. Ruff (Linting + Formatting) ---
+  # This uses its own isolated environment (fast, as ruff is a binary)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.5
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  # --- 3. Bug Hunting (Using Your UV Environment) ---
+  # These hooks use your locally activated .venv
+  - repo: local
+    hooks:
+      # --- Static Type Checking ---
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system
+        types: [python]
+        # You may need to add args, e.g., --ignore-missing-imports
+        args: []
+
+      # --- Security Analysis ---
+      - id: bandit
+        name: bandit
+        entry: bandit
+        language: system
+        types: [python]
+        # Example: -s B101 (skip 'assert' check)
+        args: ["-s", "B101"]
+
+      # --- Unit Testing ---
+      # (Commented out until tests are added)
+      # - id: pytest
+      #   name: pytest
+      #   entry: pytest
+      #   language: system
+      #   types: [python]
+      #   pass_filenames: false # Run pytest against the whole suite
