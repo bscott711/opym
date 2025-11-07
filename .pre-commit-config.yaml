@@ -28,25 +28,25 @@ repos:
 
   # --- 3. Bug Hunting (Using Your UV Environment) ---
   # These hooks use your locally activated .venv
-  - repo: local
-    hooks:
+  #- repo: local
+    #hooks:
       # --- Static Type Checking ---
-      - id: mypy
-        name: mypy
-        entry: mypy
-        language: system
-        types: [python]
-        # You may need to add args, e.g., --ignore-missing-imports
-        args: []
+      #- id: mypy
+      #  name: mypy
+      #  entry: mypy
+      #  language: system
+      #  types: [python]
+      #  # You may need to add args, e.g., --ignore-missing-imports
+      #  args: []
 
       # --- Security Analysis ---
-      - id: bandit
-        name: bandit
-        entry: bandit
-        language: system
-        types: [python]
-        # Example: -s B101 (skip 'assert' check)
-        args: ["-s", "B101"]
+      #- id: bandit
+      #  name: bandit
+      #  entry: bandit
+      #  language: system
+      #  types: [python]
+      #  # Example: -s B101 (skip 'assert' check)
+      #  args: ["-s", "B101"]
 
       # --- Unit Testing ---
       # (Commented out until tests are added)

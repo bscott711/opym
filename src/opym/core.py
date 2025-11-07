@@ -6,7 +6,6 @@ Streams from a 5D OME-TIF virtual zarr stack into the specified output format.
 
 import os
 import shutil
-import sys
 from pathlib import Path
 from typing import cast
 
@@ -16,7 +15,8 @@ import zarr
 from tqdm.auto import tqdm
 
 from .metadata import create_processing_log
-from .utils import OutputFormat, derive_paths, save_rois_to_log
+from .roi_utils import save_rois_to_log
+from .utils import OutputFormat, derive_paths
 
 
 def process_dataset(
@@ -37,11 +37,10 @@ def process_dataset(
     print(f"--- Processing: {base_file.name} (Format: {output_format.value}) ---")
 
     try:
-        # --- 1. Setup based on input TIFF ---
+        # Setup based on input TIFF
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
             store = series.aszarr()
-            # FIX: Use zarr.open_array to guarantee an Array is returned
             zarr_array: zarr.Array = zarr.open_array(store, mode="r")
 
             T, Z, C, Y, X = series.shape
@@ -62,16 +61,14 @@ def process_dataset(
             if C != 2:
                 print(
                     f"Warning: Expected 2 cameras (C=2), but found C={C}",
-                    file=sys.stderr,
                 )
 
         print(f"Using sanitized base name for output: {sanitized_name}")
 
-        # --- 2. Stream data and write output ---
+        # Stream data and write output
         if output_format == OutputFormat.ZARR:
             output_zarr_path = output_dir / (sanitized_name + "_processed.zarr")
 
-            # Cleanup old Zarr.
             if output_zarr_path.exists():
                 print(
                     f"Warning: Output Zarr {output_zarr_path.name} "
@@ -81,7 +78,6 @@ def process_dataset(
 
             output_shape = (T, Z, C_new, Y_new, X_new)
             chunks = (1, 1, 1, Y_new, X_new)
-            # FIX: 'shape' is the first positional arg. 'store' is a kwarg.
             zarr_out: zarr.Array = zarr.create(
                 output_shape,
                 store=str(output_zarr_path),
@@ -96,15 +92,16 @@ def process_dataset(
                 for t in range(T):
                     for z in range(Z):
                         for c in range(C):
-                            # FIX: Use cast to inform Pylance this is an ndarray
                             plane = cast(np.ndarray, zarr_array[t, z, c])
                             top_crop = plane[top_roi[0], top_roi[1]]
                             bottom_crop = plane[bottom_roi[0], bottom_roi[1]]
 
+                            # Explicitly map C=0 and C=1.
+                            # Any other channels (C=2, etc.) are ignored.
                             if c == 0:
                                 zarr_out[t, z, 0, :, :] = bottom_crop  # C0
                                 zarr_out[t, z, 1, :, :] = top_crop  # C1
-                            else:
+                            elif c == 1:
                                 zarr_out[t, z, 2, :, :] = top_crop  # C2
                                 zarr_out[t, z, 3, :, :] = bottom_crop  # C3
                             pbar.update(1)
@@ -114,7 +111,6 @@ def process_dataset(
         elif output_format == OutputFormat.TIFF_SERIES:
             output_stack_shape_3d = (Z, Y_new, X_new)
 
-            # Loop by Timepoint (this is the outer loop)
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
                 # Create 4 empty 3D arrays for this timepoint
                 ch0_stack = np.zeros(output_stack_shape_3d, dtype=dtype)
@@ -125,20 +121,19 @@ def process_dataset(
                 # Inner loop: iterate over Z and C for *only* this timepoint
                 for z in range(Z):
                     for c in range(C):
-                        # FIX: Use cast to inform Pylance this is an ndarray
                         plane = cast(np.ndarray, zarr_array[t, z, c])
                         top_crop = plane[top_roi[0], top_roi[1]]
                         bottom_crop = plane[bottom_roi[0], bottom_roi[1]]
 
-                        # Apply the C=0 swap logic and fill the arrays
+                        # Apply swap logic. Explicitly check c=0 and c=1.
+                        # Any other channels are ignored.
                         if c == 0:
                             ch0_stack[z, :, :] = bottom_crop  # C0 = Bottom, Cam 1
                             ch1_stack[z, :, :] = top_crop  # C1 = Top, Cam 1
-                        else:
+                        elif c == 1:
                             ch2_stack[z, :, :] = top_crop  # C2 = Top, Cam 2
                             ch3_stack[z, :, :] = bottom_crop  # C3 = Bottom, Cam 2
 
-                # --- FIX: Correct arguments for tifffile.imwrite ---
                 tif_meta = {"axes": "ZYX"}
                 out_name = f"{sanitized_name}_T{t:03d}"
                 tifffile.imwrite(
@@ -165,22 +160,19 @@ def process_dataset(
                     imagej=True,
                     metadata=tif_meta,
                 )
-                # --- End fix ---
 
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
 
         else:
-            # This should be caught by argparse, but good to have
             raise ValueError(f"Unknown output_format: {output_format}")
 
         # Return T so the caller can pass it to the logger
         return T
 
     except Exception as e:
-        print(f"\n❌ Error processing {base_file.name}: {e}\n", file=sys.stderr)
-        # --- FIX: Re-raise the exception for the caller to handle ---
+        print(f"\n❌ Error processing {base_file.name}: {e}\n")
+        # Re-raise the exception for the caller (e.g., CLI) to handle
         raise
-        # --- End fix ---
 
 
 def run_processing_job(
@@ -193,30 +185,26 @@ def run_processing_job(
     """
     Runs a full processing job for a single file.
 
-    This function is a high-level wrapper that:
-    1. Derives paths.
-    2. Checks for input files.
-    3. Cleans the output directory.
-    4. Runs `process_dataset`.
-    5. Runs `create_processing_log`.
-    6. Saves ROIs to the central CLI log.
+    This is the main high-level API function. It handles:
+    1. Deriving paths.
+    2. Validating inputs.
+    3. Cleaning the output directory.
+    4. Running the core `process_dataset` function.
+    5. Creating the metadata log.
+    6. Saving ROIs to the central CLI log.
     """
     print("--- Starting Processing Job ---")
 
-    # --- 1. Derive all paths using the package util ---
     paths = derive_paths(base_file, output_format)
 
-    # --- 2. Check inputs ---
     if not paths.base_file.exists():
         raise FileNotFoundError(f"Input file not found: {paths.base_file}")
     if not paths.metadata_file.exists():
         raise FileNotFoundError(f"Metadata file not found: {paths.metadata_file}")
 
-    # Create output dir
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 3. Clear old output ---
-    # This logic is intentionally unconditional to ensure a clean run.
+    # Clear old output to ensure a clean run
     if output_format == OutputFormat.ZARR:
         zarr_path = paths.output_dir / (paths.sanitized_name + "_processed.zarr")
         if zarr_path.exists():
@@ -232,9 +220,7 @@ def run_processing_job(
     print(f"Format selected: {output_format.value}")
     print(f"Output Directory: {paths.output_dir.name}")
 
-    # --- 4. Run processing using the package ---
     print("\nStarting stream processing...")
-
     num_timepoints = process_dataset(
         paths.base_file,
         paths.output_dir,
@@ -253,7 +239,6 @@ def run_processing_job(
         output_format,
     )
 
-    # --- 5. Save ROIs to the central log for CLI use ---
     save_rois_to_log(
         cli_log_file,
         paths.base_file,
