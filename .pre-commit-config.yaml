@@ -40,13 +40,13 @@ repos:
         args: []
 
       # --- Security Analysis ---
-      #- id: bandit
-      #  name: bandit
-      #  entry: bandit
-      #  language: system
-      #  types: [python]
-      #  # Example: -s B101 (skip 'assert' check)
-      #  args: ["-s", "B101"]
+      - id: bandit
+        name: bandit
+        entry: bandit
+        language: system
+        types: [python]
+        # Example: -s B101 (skip 'assert' check)
+        args: ["-s", "B101"]
 
       # --- Unit Testing ---
       # (Commented out until tests are added)
