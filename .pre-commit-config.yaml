@@ -2,23 +2,25 @@
 #
 # To use with uv:
 # 1. uv venv
-# 2. uv pip install pre-commit ruff mypy pytest bandit
+# 2. uv pip install pre-commit ruff pytest
 # 3. source .venv/bin/activate
 # 4. pre-commit install
+#
+# NOTE: mypy and bandit are no longer needed in your main venv
+# for pre-commit to work. They will be managed automatically.
 
 repos:
   # --- 1. General Git Sanity Checks ---
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-      - id: check-merge-conflict # Prevents committing merge conflict markers
-      - id: check-yaml          # Checks YAML files for syntax errors
-      - id: check-json          # Checks JSON files for syntax errors
-      - id: end-of-file-fixer   # Ensures files end in a newline
-      - id: trailing-whitespace # Removes trailing whitespace
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
 
   # --- 2. Ruff (Linting + Formatting) ---
-  # This uses its own isolated environment (fast, as ruff is a binary)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.5.5
     hooks:
@@ -26,33 +28,48 @@ repos:
         args: ["--fix"]
       - id: ruff-format
 
-  # --- 3. Bug Hunting (Using Your UV Environment) ---
-  # These hooks use your locally activated .venv
-  - repo: local
+  # --- 3. Static Type Checking (Managed by pre-commit) ---
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 'v1.11.0'
     hooks:
-      # --- Static Type Checking ---
       - id: mypy
-        name: mypy
-        entry: mypy
-        language: system
-        types: [python]
-        # You may need to add args, e.g., --ignore-missing-imports
+        # All project dependencies must be listed here for mypy
+        # to find and check them in its isolated environment.
+        additional_dependencies: [
+            # [project.dependencies]
+            "numpy",
+            "tifffile",
+            "zarr",
+            "tqdm",
+            "scikit-image",
+            "PyPetaKit5D",
+            "imagecodecs",
+            # [project.optional-dependencies.viewer]
+            "ipywidgets",
+            "matplotlib",
+            "ipyfilechooser",
+            "ipython",
+            # [project.optional-dependencies.dev]
+            "pytest", # For checking test files
+        ]
         args: []
 
-      # --- Security Analysis ---
+  # --- 4. Security Analysis (Managed by pre-commit) ---
+  - repo: https://github.com/PyCQA/bandit
+    rev: '1.7.9'
+    hooks:
       - id: bandit
-        name: bandit
-        entry: bandit
-        language: system
-        types: [python]
-        # Example: -s B101 (skip 'assert' check)
+        # We keep your original setting to skip the 'assert' check
         args: ["-s", "B101"]
 
-      # --- Unit Testing ---
-      # (Commented out until tests are added)
-      # - id: pytest
-      #   name: pytest
-      #   entry: pytest
-      #   language: system
-      #   types: [python]
-      #   pass_filenames: false # Run pytest against the whole suite
+  # --- 5. Unit Testing (Using Your Local Environment) ---
+  # 'pytest' must use 'language: system' so it can find
+  # and install your local 'opym' package to run tests against it.
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest
+        language: system
+        types: [python]
+        pass_filenames: false # Run pytest against the whole suite
