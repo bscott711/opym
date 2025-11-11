@@ -43,6 +43,11 @@ def main():
         choices=[f.value for f in OutputFormat],
         help="Output format. 'TIFF_SERIES_SPLIT_C' is required for pypetakit5d.",
     )
+    parser.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Rotate the cropped ROIs by 90 degrees counter-clockwise before saving.",
+    )
     args = parser.parse_args()
 
     print("--- Starting OPM Cropper Job ---")

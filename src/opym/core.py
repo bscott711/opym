@@ -26,6 +26,7 @@ def process_dataset(
     top_roi: tuple[slice, slice],
     bottom_roi: tuple[slice, slice],
     output_format: OutputFormat,
+    rotate_90: bool = False,  # <-- ADDED
 ) -> int:
     """
     Main processing function. Streams data to either a single OME-TIF file
@@ -35,6 +36,8 @@ def process_dataset(
         int: The number of timepoints processed (T).
     """
     print(f"--- Processing: {base_file.name} (Format: {output_format.value}) ---")
+    if rotate_90:
+        print("    90-degree rotation: ENABLED")
 
     try:
         # Setup based on input TIFF
@@ -63,6 +66,13 @@ def process_dataset(
                     f"Warning: Expected 2 cameras (C=2), but found C={C}",
                 )
 
+        # --- MODIFIED: Adjust output shape if rotating ---
+        if rotate_90:
+            Y_out, X_out = X_new, Y_new  # Shape becomes (X, Y)
+        else:
+            Y_out, X_out = Y_new, X_new  # Shape remains (Y, X)
+        # --- END MODIFICATION ---
+
         print(f"Using sanitized base name for output: {sanitized_name}")
 
         # Stream data and write output
@@ -76,8 +86,10 @@ def process_dataset(
                 )
                 shutil.rmtree(output_zarr_path)
 
-            output_shape = (T, Z, C_new, Y_new, X_new)
-            chunks = (1, 1, 1, Y_new, X_new)
+            # --- MODIFIED: Use Y_out, X_out for shape ---
+            output_shape = (T, Z, C_new, Y_out, X_out)
+            chunks = (1, 1, 1, Y_out, X_out)
+            # --- END MODIFICATION ---
             zarr_out: zarr.Array = zarr.create(
                 output_shape,
                 store=str(output_zarr_path),
@@ -96,6 +108,12 @@ def process_dataset(
                             top_crop = plane[top_roi[0], top_roi[1]]
                             bottom_crop = plane[bottom_roi[0], bottom_roi[1]]
 
+                            # --- MODIFIED: Apply rotation ---
+                            if rotate_90:
+                                top_crop = np.rot90(top_crop, k=1)
+                                bottom_crop = np.rot90(bottom_crop, k=1)
+                            # --- END MODIFICATION ---
+
                             # Explicitly map C=0 and C=1.
                             # Any other channels (C=2, etc.) are ignored.
                             if c == 0:
@@ -109,7 +127,9 @@ def process_dataset(
             print(f"✅ Saved processed series to {output_zarr_path.name}")
 
         elif output_format == OutputFormat.TIFF_SERIES:
-            output_stack_shape_3d = (Z, Y_new, X_new)
+            # --- MODIFIED: Use Y_out, X_out for shape ---
+            output_stack_shape_3d = (Z, Y_out, X_out)
+            # --- END MODIFICATION ---
 
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
                 # Create 4 empty 3D arrays for this timepoint
@@ -125,6 +145,12 @@ def process_dataset(
                         top_crop = plane[top_roi[0], top_roi[1]]
                         bottom_crop = plane[bottom_roi[0], bottom_roi[1]]
 
+                        # --- MODIFIED: Apply rotation ---
+                        if rotate_90:
+                            top_crop = np.rot90(top_crop, k=1)
+                            bottom_crop = np.rot90(bottom_crop, k=1)
+                        # --- END MODIFICATION ---
+
                         # Apply swap logic. Explicitly check c=0 and c=1.
                         # Any other channels are ignored.
                         if c == 0:
@@ -134,7 +160,17 @@ def process_dataset(
                             ch2_stack[z, :, :] = top_crop  # C2 = Top, Cam 2
                             ch3_stack[z, :, :] = bottom_crop  # C3 = Bottom, Cam 2
 
-                tif_meta = {"axes": "ZYX"}
+                # --- MODIFIED: Update axes metadata if rotated ---
+                if rotate_90:
+                    # After rotation, the original Y is now X, and X is Y.
+                    # Since ImageJ/Fiji metadata is ZYX, we don't change 'ZYX'.
+                    # The dimensions in the file header are (Z, X_new, Y_new)
+                    # which is correct.
+                    tif_meta = {"axes": "ZYX"}
+                else:
+                    tif_meta = {"axes": "ZYX"}
+                # --- END MODIFICATION ---
+
                 out_name = f"{sanitized_name}_T{t:03d}"
                 tifffile.imwrite(
                     output_dir / f"{out_name}_C0.tif",
@@ -181,6 +217,7 @@ def run_processing_job(
     bottom_roi: tuple[slice, slice],
     output_format: OutputFormat,
     cli_log_file: Path = Path("opm_roi_log.json"),
+    rotate_90: bool = False,  # <-- ADDED
 ):
     """
     Runs a full processing job for a single file.
@@ -228,6 +265,7 @@ def run_processing_job(
         top_roi,
         bottom_roi,
         output_format,
+        rotate_90=rotate_90,  # <-- PASS
     )
 
     print("\nCreating processing log...")
@@ -237,6 +275,7 @@ def run_processing_job(
         top_roi,
         bottom_roi,
         output_format,
+        rotate_90=rotate_90,  # <-- PASS
     )
 
     save_rois_to_log(
