@@ -28,6 +28,9 @@ def single_channel_viewer(
         fig_height = base_width * aspect
 
         fig, ax = plt.subplots(1, 1, figsize=(base_width, fig_height))
+        # --- MODIFIED: Set initial aspect ratio ---
+        ax.set_aspect(aspect)
+        # ---
         fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         ax.set_axis_off()
 
@@ -78,6 +81,14 @@ def single_channel_viewer(
             indent=False,
             layout=widgets.Layout(width="120px"),
         )
+        # --- ADDED: Rotate Checkbox ---
+        rotate_checkbox = widgets.Checkbox(
+            value=False,
+            description="Rotate 90° CCW",
+            indent=False,
+            layout=widgets.Layout(width="140px"),
+        )
+        # ---
         title_label = widgets.Label(value=f"T=0, Z={Z_max // 2}, C={c_initial}")
 
         # --- 3. Define Update Callbacks ---
@@ -90,8 +101,9 @@ def single_channel_viewer(
             c = c_slider.value
             z = z_slider.value
             contrast = contrast_slider.value
-
             is_locked = lock_contrast_checkbox.value
+            is_rotated = rotate_checkbox.value  # <-- GET ROTATION STATE
+
             slider_changed = "owner" in change and (
                 change["owner"] is t_slider or change["owner"] is c_slider
             )
@@ -111,6 +123,18 @@ def single_channel_viewer(
             stack = get_stack(t, c)
             plane = stack[z, :, :]
 
+            # --- MODIFIED: Handle rotation and aspect ratio ---
+            if is_rotated:
+                plane = np.rot90(plane, k=1)
+                new_aspect = X / Y  # New H/W is X/Y
+            else:
+                new_aspect = Y / X  # Original H/W is Y/X
+
+            new_fig_height = base_width * new_aspect
+            fig.set_figheight(new_fig_height)
+            ax.set_aspect(new_aspect)
+            # ---
+
             img.set_data(plane)
             img.set_clim(vmin=contrast[0], vmax=contrast[1])
             title_label.value = f"T={t}, Z={z}, C={c}"
@@ -120,13 +144,18 @@ def single_channel_viewer(
         c_slider.observe(update_plot, "value")
         z_slider.observe(update_plot, "value")
         contrast_slider.observe(update_plot, "value")
+        rotate_checkbox.observe(update_plot, "value")  # <-- LINK ROTATE
 
         # --- 4. Display the UI ---
         ui = widgets.VBox(
             [
                 widgets.HBox([t_slider, c_slider, title_label]),
                 z_slider,
-                widgets.HBox([contrast_slider, lock_contrast_checkbox]),
+                # --- MODIFIED: Add rotate_checkbox ---
+                widgets.HBox(
+                    [contrast_slider, lock_contrast_checkbox, rotate_checkbox]
+                ),
+                # ---
                 fig.canvas,
             ]
         )
@@ -154,6 +183,9 @@ def composite_viewer(
         fig_height = base_width * aspect
 
         fig_comp, ax_comp = plt.subplots(1, 1, figsize=(base_width, fig_height))
+        # --- MODIFIED: Set initial aspect ratio ---
+        ax_comp.set_aspect(aspect)
+        # ---
         fig_comp.subplots_adjust(left=0, right=1, top=1, bottom=0)
         ax_comp.set_axis_off()
         ax_comp.set_facecolor("black")
@@ -188,6 +220,14 @@ def composite_viewer(
         refresh_button = widgets.Button(
             description="Refresh Contrast", layout=widgets.Layout(width="140px")
         )
+        # --- ADDED: Rotate Checkbox ---
+        rotate_checkbox_comp = widgets.Checkbox(
+            value=False,
+            description="Rotate 90° CCW",
+            indent=False,
+            layout=widgets.Layout(width="140px"),
+        )
+        # ---
         title_label_comp = widgets.Label(value=f"T=0, Z={Z_max // 2}")
 
         # --- 4. Create Per-Channel Widgets (DYNAMICALLY) ---
@@ -273,8 +313,20 @@ def composite_viewer(
         def update_composite_plot(change=None):
             t = t_slider_comp.value
             z = z_slider_comp.value
+            is_rotated = rotate_checkbox_comp.value  # <-- GET ROTATION STATE
 
-            final_image = np.zeros((Y, X, 3), dtype=float)
+            # --- MODIFIED: Handle rotation, aspect ratio, and image shape ---
+            if is_rotated:
+                new_aspect = X / Y
+                final_image = np.zeros((X, Y, 3), dtype=float)
+            else:
+                new_aspect = Y / X
+                final_image = np.zeros((Y, X, 3), dtype=float)
+
+            new_fig_height = base_width * new_aspect
+            fig_comp.set_figheight(new_fig_height)
+            ax_comp.set_aspect(new_aspect)
+            # ---
 
             # This loop now works dynamically with any number of channels
             for i, (checkbox, cmap_widget, contrast_widget) in enumerate(
@@ -286,6 +338,12 @@ def composite_viewer(
                         plane = stack[z, :, :]
                         vmin, vmax = contrast_widget.value
                         norm_plane = normalize_plane(plane, vmin, vmax)
+
+                        # --- MODIFIED: Rotate normalized plane if needed ---
+                        if is_rotated:
+                            norm_plane = np.rot90(norm_plane, k=1)
+                        # ---
+
                         color_vector = color_map_options[cmap_widget.value]
                         final_image += norm_plane[..., np.newaxis] * color_vector
                     except Exception as e:
@@ -330,6 +388,9 @@ def composite_viewer(
         t_slider_comp.observe(update_composite_plot, "value")
         z_slider_comp.observe(update_composite_plot, "value")
         refresh_button.on_click(on_refresh_button_clicked)
+        # --- LINK ROTATE ---
+        rotate_checkbox_comp.observe(update_composite_plot, "value")
+        # ---
 
         # This loop links all dynamically created controls
         for checkbox, cmap_widget, contrast_widget in channel_controls:
@@ -337,14 +398,17 @@ def composite_viewer(
             cmap_widget.observe(update_composite_plot, "value")
             contrast_widget.observe(update_composite_plot, "value")
 
+        # --- MODIFIED: Add rotate_checkbox_comp ---
         master_controls = widgets.HBox(
             [
                 t_slider_comp,
                 z_slider_comp,
                 refresh_button,
+                rotate_checkbox_comp,
                 title_label_comp,
             ]
         )
+        # ---
 
         # --- FIX: Dynamically build the VBox ---
         ui = widgets.VBox([master_controls, *channel_ui_elements, fig_comp.canvas])
