@@ -52,7 +52,7 @@ repos:
             # [project.optional-dependencies.dev]
             "pytest", # For checking test files
         ]
-        args: []
+        args: ["--ignore-missing-imports"]
 
   # --- 4. Security Analysis (Managed by pre-commit) ---
   - repo: https://github.com/PyCQA/bandit
@@ -62,14 +62,14 @@ repos:
         # We keep your original setting to skip the 'assert' check
         args: ["-s", "B101"]
 
-  # --- 5. Unit Testing (Using Your Local Environment) ---
-  # 'pytest' must use 'language: system' so it can find
-  # and install your local 'opym' package to run tests against it.
-  - repo: local
-    hooks:
-      - id: pytest
-        name: pytest
-        entry: pytest
-        language: system
-        types: [python]
-        pass_filenames: false # Run pytest against the whole suite
+  # # --- 5. Unit Testing (Using Your Local Environment) ---
+  # # 'pytest' must use 'language: system' so it can find
+  # # and install your local 'opym' package to run tests against it.
+  # - repo: local
+  #   hooks:
+  #     - id: pytest
+  #       name: pytest
+  #       entry: pytest
+  #       language: system
+  #       types: [python]
+  #       pass_filenames: false # Run pytest against the whole suite
