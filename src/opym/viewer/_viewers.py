@@ -135,9 +135,11 @@ def single_channel_viewer(
             ax.set_aspect(new_aspect)
 
             img.set_data(plane)
-            # --- ADDED: Autoscale axes to fit new data shape ---
-            ax.autoscale(enable=True, tight=True)
-            # ---
+
+            # --- MODIFICATION: Only autoscale if the rotation state changed ---
+            if "owner" in change and change["owner"] is rotate_checkbox:
+                ax.autoscale(enable=True, tight=True)
+            # --- END MODIFICATION ---
 
             img.set_clim(vmin=contrast[0], vmax=contrast[1])
             title_label.value = f"T={t}, Z={z}, C={c}"
@@ -357,9 +359,10 @@ def composite_viewer(
             final_image = np.clip(final_image, 0.0, 1.0)
             img_comp.set_data(final_image)
 
-            # --- ADDED: Autoscale axes to fit new data shape ---
-            ax_comp.autoscale(enable=True, tight=True)
-            # ---
+            # --- MODIFICATION: Only autoscale if the rotation state changed ---
+            if change and "owner" in change and change["owner"] is rotate_checkbox_comp:
+                ax_comp.autoscale(enable=True, tight=True)
+            # --- END MODIFICATION ---
 
             title_label_comp.value = f"T={t}, Z={z}"
             fig_comp.canvas.draw_idle()
