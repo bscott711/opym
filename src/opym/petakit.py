@@ -117,9 +117,9 @@ def _run_petakit_base(
     block_size: list[int] | None = None,
     # Cluster & Config
     parse_cluster: bool = False,
-    master_compute: bool = True,
+    master_compute: bool = False,  # <-- CHANGED from True
     config_file: str = "",
-    mcc_mode: bool = True,
+    mcc_mode: bool = False,  # <-- CHANGED from True
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
