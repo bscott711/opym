@@ -22,6 +22,7 @@ from .petakit import (
 from .roi_utils import (
     align_rois,
     load_rois_from_log,
+    process_rois_from_selector,  # <-- ADDED
     save_rois_to_log,
 )
 from .utils import (
@@ -54,6 +55,7 @@ __all__ = [
     "save_rois_to_log",
     "load_rois_from_log",
     "align_rois",
+    "process_rois_from_selector",  # <-- ADDED
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",

@@ -96,8 +96,7 @@ def parse_roi_string(roi_str: str) -> tuple[slice, slice]:
     """
     if not re.match(r"^\d+:\d+,\s*\d+:\d+$", roi_str):
         raise ValueError(
-            f"Invalid ROI format: '{roi_str}'. "
-            "Expected 'y_start:y_stop,x_start:x_stop'"
+            f"Invalid ROI format: '{roi_str}'. Expected 'y_start:y_stop,x_start:x_stop'"
         )
 
     y_str, x_str = roi_str.split(",")

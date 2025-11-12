@@ -6,13 +6,26 @@ Utilities for handling, logging, and aligning Regions of Interest (ROIs).
 import json
 import sys
 from pathlib import Path
+from typing import overload
 
 import numpy as np
 from skimage.registration import phase_cross_correlation
 
 
-def _roi_to_tuple(roi: tuple[slice, slice]) -> tuple[int, int, int, int]:
-    """Converts (slice(y1, y2), slice(x1, x2)) to (y1, y2, x1, x2)"""
+@overload
+def _roi_to_tuple(roi: tuple[slice, slice]) -> tuple[int, int, int, int]: ...
+
+
+@overload
+def _roi_to_tuple(roi: None) -> None: ...
+
+
+def _roi_to_tuple(
+    roi: tuple[slice, slice] | None,
+) -> tuple[int, int, int, int] | None:
+    """Converts (slice(y1, y2), slice(x1, x2)) to (y1, y2, x1, x2) or None."""
+    if roi is None:
+        return None
     y_start = roi[0].start if roi[0].start is not None else 0
     y_stop = roi[0].stop if roi[0].stop is not None else -1
     x_start = roi[1].start if roi[1].start is not None else 0
@@ -33,8 +46,8 @@ def _tuple_to_cli_string(tpl: tuple[int, int, int, int]) -> str:
 def save_rois_to_log(
     log_file: Path,
     base_file: Path,
-    top_roi: tuple[slice, slice],
-    bottom_roi: tuple[slice, slice],
+    top_roi: tuple[slice, slice] | None,
+    bottom_roi: tuple[slice, slice] | None,
 ):
     """Appends the ROIs for a given file to a central JSON log."""
     data = {}
@@ -62,13 +75,16 @@ def save_rois_to_log(
 
 def load_rois_from_log(
     log_file: Path,
-) -> dict[str, dict[str, tuple[int, int, int, int]]]:
-    """Loads the ROI log. Returns an empty dict if not found."""
+) -> dict[str, dict[str, tuple[int, int, int, int] | None]]:
+    """
+    Loads the ROI log. Returns an empty dict if not found.
+    Values for ROIs can be tuples or None.
+    """
     if not log_file.exists():
         return {}
     try:
         with log_file.open("r") as f:
-            data = json.load(f)
+            data: dict[str, dict[str, tuple[int, int, int, int] | None]] = json.load(f)
         return data
     except Exception as e:
         print(f"Error loading ROI log: {e}", file=sys.stderr)
@@ -124,3 +140,71 @@ def align_rois(
         print(f"❌ ERROR during alignment: {e}")
         print("Returning original bottom ROI.")
         return bottom_roi
+
+
+def process_rois_from_selector(
+    mip_data: np.ndarray,
+    unaligned_rois: list[tuple[slice, slice]],
+    valid_threshold: float = 1.0,
+) -> tuple[tuple[slice, slice] | None, tuple[slice, slice] | None]:
+    """
+    Validates ROIs from the selector, aligns if both are valid, and returns them.
+
+    Args:
+        mip_data: The 2D MIP data used for validation.
+        unaligned_rois: The list of two ROIs from selector.get_rois().
+        valid_threshold: The mean pixel value above which an ROI is "valid".
+
+    Returns:
+        A tuple of (final_top_roi, final_bottom_roi), where either can be None.
+    """
+    if len(unaligned_rois) != 2:
+        print("❌ ERROR: Expected 2 ROIs from selector.")
+        return None, None
+
+    top_roi_unaligned = unaligned_rois[0]
+    bottom_roi_unaligned = unaligned_rois[1]
+
+    # Check if ROIs are valid by sampling the MIP
+    top_mean = np.mean(mip_data[top_roi_unaligned[0], top_roi_unaligned[1]])
+    bottom_mean = np.mean(mip_data[bottom_roi_unaligned[0], bottom_roi_unaligned[1]])
+
+    top_roi_valid = top_mean > valid_threshold
+    bottom_roi_valid = bottom_mean > valid_threshold
+
+    print(f"  Top ROI mean: {top_mean:.2f} (Valid: {top_roi_valid})")
+    print(f"  Bottom ROI mean: {bottom_mean:.2f} (Valid: {bottom_roi_valid})")
+
+    final_top_roi: tuple[slice, slice] | None = None
+    final_bottom_roi: tuple[slice, slice] | None = None
+
+    if top_roi_valid and bottom_roi_valid:
+        # --- Run alignment only if both ROIs are valid ---
+        print("\n--- Auto-Aligning ROIs ---")
+        final_bottom_roi = align_rois(
+            mip_data,
+            top_roi_unaligned,
+            bottom_roi_unaligned,
+        )
+        final_top_roi = top_roi_unaligned
+        print("\n✅ Both ROIs valid. Alignment complete.")
+
+    elif top_roi_valid:
+        # --- Only top ROI is valid ---
+        print("\nℹ️ Bottom ROI is empty. Skipping alignment.")
+        final_top_roi = top_roi_unaligned
+        final_bottom_roi = None
+
+    elif bottom_roi_valid:
+        # --- Only bottom ROI is valid ---
+        print("\nℹ️ Top ROI is empty. Skipping alignment.")
+        final_top_roi = None
+        final_bottom_roi = bottom_roi_unaligned
+
+    else:
+        # --- Neither ROI is valid ---
+        print("\n❌ ERROR: Both ROIs appear to be empty. No ROIs will be saved.")
+        final_top_roi = None
+        final_bottom_roi = None
+
+    return final_top_roi, final_bottom_roi
