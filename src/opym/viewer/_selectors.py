@@ -17,26 +17,67 @@ class ROISelector:
     An interactive (blocking) ROI selector for Jupyter notebooks.
 
     Usage:
-        selector = ROISelector(mip_data, vmin, vmax)
-        # The plot will display. Draw two ROIs.
-        rois = selector.get_rois() # This blocks until 2 ROIs are drawn
+        selector = ROISelector(
+            mip_data,
+            vmin,
+            vmax,
+            require_top=True,
+            require_bottom=True,
+        )
+        # The plot will display.
+        rois = selector.get_rois() # Blocks until required ROIs are drawn
     """
 
-    def __init__(self, mip_data: np.ndarray, vmin: float, vmax: float):
+    def __init__(
+        self,
+        mip_data: np.ndarray,
+        vmin: float,
+        vmax: float,
+        require_top: bool = True,
+        require_bottom: bool = True,
+    ):
         self.mip_data = mip_data
         self.vmin = vmin
         self.vmax = vmax
+        self.require_top = require_top
+        self.require_bottom = require_bottom
         self.roi_slices: list[tuple[slice, slice]] = []
         self.first_roi_dims: tuple[int, int] | None = None
+
+        # Determine total expected ROIs
+        self.expected_count = 0
+        if self.require_top:
+            self.expected_count += 1
+        if self.require_bottom:
+            self.expected_count += 1
+
+        if self.expected_count == 0:
+            print("⚠️ No ROIs required based on channel selection.")
+            return
+
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
-        self.fig.suptitle("Select TOP ROI, then BOTTOM ROI")
+
+        # Dynamic instructions
+        title_parts = []
+        if self.require_top:
+            title_parts.append("Select TOP (cyan)")
+        if self.require_bottom:
+            title_parts.append("Select BOTTOM (lime)")
+
+        self.fig.suptitle(" -> ".join(title_parts))
+
         print("--- 📝 INSTRUCTIONS ---")
-        print("1. Click and drag to draw a box around the TOP (cyan) ROI.")
-        print(
-            "2. Click and drag near the center of the BOTTOM (lime) ROI."
-            " The box size will be matched automatically."
-        )
-        print("3. When finished, call the .get_rois() method on this object.")
+        if self.require_top:
+            print("1. Click and drag to draw a box around the TOP (cyan) ROI.")
+            if self.require_bottom:
+                print(
+                    "2. Click and drag near the center of the BOTTOM (lime) ROI."
+                    " The box size will be matched automatically."
+                )
+        elif self.require_bottom:
+            print("1. Click and drag to draw a box around the BOTTOM (lime) ROI.")
+
+        print("When finished, call the .get_rois() method on this object.")
 
         self.ax.imshow(self.mip_data, cmap="gray", vmin=self.vmin, vmax=self.vmax)
         self.ax.set_axis_off()
@@ -55,15 +96,21 @@ class ROISelector:
 
     def on_select(self, eclick, erelease):
         """Callback for rectangle selector."""
-        if len(self.roi_slices) >= 2:
-            print("ℹ️ Two ROIs already selected. Re-run cell to start over.")
+        if len(self.roi_slices) >= self.expected_count:
+            print("ℹ️ Required ROIs already selected. Re-run cell to start over.")
             return
 
         x_start_drawn, y_start_drawn = int(eclick.xdata), int(eclick.ydata)
         x_end_drawn, y_end_drawn = int(erelease.xdata), int(erelease.ydata)
 
-        if len(self.roi_slices) == 0:
-            # --- This is the FIRST (TOP) ROI ---
+        # Determine if this is the Top or Bottom selection
+        is_top_selection = False
+
+        if self.require_top and len(self.roi_slices) == 0:
+            is_top_selection = True
+
+        if is_top_selection:
+            # --- Defining TOP ROI ---
             y_start, y_end = (
                 min(y_start_drawn, y_end_drawn),
                 max(y_start_drawn, y_end_drawn),
@@ -85,47 +132,66 @@ class ROISelector:
                 facecolor="none",
             )
             self.ax.add_patch(rect)
-            print(f"✅ ROI #1 (TOP) selected. Size: ({height}h, {width}w)")
-            print("  Draw the SECOND (BOTTOM) ROI. Its size will be constrained.")
+            print(f"✅ ROI (TOP) selected. Size: ({height}h, {width}w)")
+
+            if self.require_bottom:
+                print("  Draw the SECOND (BOTTOM) ROI. Its size will be constrained.")
 
         else:
-            # --- This is the SECOND (BOTTOM) ROI ---
-            roi_height, roi_width = cast(tuple[int, int], self.first_roi_dims)
-            y_center = y_start_drawn + (y_end_drawn - y_start_drawn) / 2
-            x_center = x_start_drawn + (x_end_drawn - x_start_drawn) / 2
+            # --- Defining BOTTOM ROI ---
+            # Use constrained size if we already defined a top ROI
+            if self.first_roi_dims:
+                roi_height, roi_width = cast(tuple[int, int], self.first_roi_dims)
+                y_center = y_start_drawn + (y_end_drawn - y_start_drawn) / 2
+                x_center = x_start_drawn + (x_end_drawn - x_start_drawn) / 2
 
-            y_start = int(y_center - roi_height / 2)
-            y_end = y_start + roi_height
-            x_start = int(x_center - roi_width / 2)
-            x_end = x_start + roi_width
+                y_start = int(y_center - roi_height / 2)
+                y_end = y_start + roi_height
+                x_start = int(x_center - roi_width / 2)
+                x_end = x_start + roi_width
+                print(
+                    f"✅ ROI (BOTTOM) selected. "
+                    f"Size snapped to ({roi_height}h, {roi_width}w)."
+                )
+            else:
+                # This happens if require_top=False. User draws bottom freely.
+                y_start, y_end = (
+                    min(y_start_drawn, y_end_drawn),
+                    max(y_start_drawn, y_end_drawn),
+                )
+                x_start, x_end = (
+                    min(x_start_drawn, x_end_drawn),
+                    max(x_start_drawn, x_end_drawn),
+                )
+                height = y_end - y_start
+                width = x_end - x_start
+                print(f"✅ ROI (BOTTOM) selected. Size: ({height}h, {width}w)")
 
             rect = patches.Rectangle(
                 (x_start, y_start),
-                roi_width,
-                roi_height,
+                x_end - x_start,
+                y_end - y_start,
                 linewidth=2,
                 edgecolor="lime",
                 facecolor="none",
             )
             self.ax.add_patch(rect)
-            print(
-                f"✅ ROI #2 (BOTTOM) selected. "
-                f"Size snapped to ({roi_height}h, {roi_width}w)."
-            )
-            print("\n🎉 Both ROIs selected! You can now call .get_rois()")
 
         y_slice = slice(y_start, y_end)
         x_slice = slice(x_start, x_end)
         self.roi_slices.append((y_slice, x_slice))
         print(f"  Slice: (slice({y_start}, {y_end}), slice({x_start}, {x_end}))")
 
-        if len(self.roi_slices) == 2:
+        if len(self.roi_slices) == self.expected_count:
             self.selector.set_active(False)
-            self.fig.suptitle("ROIs selected. Call .get_rois() to continue.")
+            self.fig.suptitle(
+                "All required ROIs selected. Call .get_rois() to continue."
+            )
+            print("\n🎉 Selection complete! You can now call .get_rois()")
 
     def get_rois(self) -> list[tuple[slice, slice]]:
-        """Returns the selected ROIs. Blocks if 2 ROIs are not yet selected."""
-        while len(self.roi_slices) < 2:
+        """Returns the selected ROIs. Blocks if required ROIs are not yet selected."""
+        while len(self.roi_slices) < self.expected_count:
             plt.pause(0.1)  # Wait for user interaction
         return self.roi_slices
 
@@ -176,22 +242,25 @@ def visualize_alignment(
 
 
 def interactive_roi_selector(
-    mip_data: np.ndarray, vmin: float, vmax: float
+    mip_data: np.ndarray,
+    vmin: float,
+    vmax: float,
+    require_top: bool = True,
+    require_bottom: bool = True,
 ) -> ROISelector:
     """
     Creates and displays an interactive ROISelector instance.
-
-    This is a helper function that instantiates the ROISelector class,
-    which triggers the interactive matplotlib widget.
 
     Args:
         mip_data: The 2D (Y, X) MIP array to display.
         vmin: The minimum display value for contrast.
         vmax: The maximum display value for contrast.
+        require_top: Whether the user must select a Top ROI.
+        require_bottom: Whether the user must select a Bottom ROI.
 
     Returns:
         An instance of the ROISelector class. Call .get_rois() on
         this object to retrieve the selected ROIs.
     """
     # This will initialize the class, which in turn creates the plot
-    return ROISelector(mip_data, vmin, vmax)
+    return ROISelector(mip_data, vmin, vmax, require_top, require_bottom)

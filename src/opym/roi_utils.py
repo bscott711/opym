@@ -146,65 +146,88 @@ def process_rois_from_selector(
     mip_data: np.ndarray,
     unaligned_rois: list[tuple[slice, slice]],
     valid_threshold: float = 1.0,
+    require_top: bool = True,
+    require_bottom: bool = True,
 ) -> tuple[tuple[slice, slice] | None, tuple[slice, slice] | None]:
     """
     Validates ROIs from the selector, aligns if both are valid, and returns them.
 
     Args:
-        mip_data: The 2D MIP data used for validation.
-        unaligned_rois: The list of two ROIs from selector.get_rois().
+        mip_data: The 2D MIP data used for validation/alignment.
+        unaligned_rois: The list of ROIs from selector.get_rois().
         valid_threshold: The mean pixel value above which an ROI is "valid".
+        require_top: Whether a top ROI was expected.
+        require_bottom: Whether a bottom ROI was expected.
 
     Returns:
         A tuple of (final_top_roi, final_bottom_roi), where either can be None.
     """
-    if len(unaligned_rois) != 2:
-        print("❌ ERROR: Expected 2 ROIs from selector.")
-        return None, None
-
-    top_roi_unaligned = unaligned_rois[0]
-    bottom_roi_unaligned = unaligned_rois[1]
-
-    # Check if ROIs are valid by sampling the MIP
-    top_mean = np.mean(mip_data[top_roi_unaligned[0], top_roi_unaligned[1]])
-    bottom_mean = np.mean(mip_data[bottom_roi_unaligned[0], bottom_roi_unaligned[1]])
-
-    top_roi_valid = top_mean > valid_threshold
-    bottom_roi_valid = bottom_mean > valid_threshold
-
-    print(f"  Top ROI mean: {top_mean:.2f} (Valid: {top_roi_valid})")
-    print(f"  Bottom ROI mean: {bottom_mean:.2f} (Valid: {bottom_roi_valid})")
-
     final_top_roi: tuple[slice, slice] | None = None
     final_bottom_roi: tuple[slice, slice] | None = None
 
-    if top_roi_valid and bottom_roi_valid:
-        # --- Run alignment only if both ROIs are valid ---
-        print("\n--- Auto-Aligning ROIs ---")
-        final_bottom_roi = align_rois(
-            mip_data,
-            top_roi_unaligned,
-            bottom_roi_unaligned,
-        )
-        final_top_roi = top_roi_unaligned
-        print("\n✅ Both ROIs valid. Alignment complete.")
+    # --- Case 1: Both ROIs required ---
+    if require_top and require_bottom:
+        if len(unaligned_rois) != 2:
+            print("❌ ERROR: Expected 2 ROIs, but got different amount.")
+            return None, None
 
-    elif top_roi_valid:
-        # --- Only top ROI is valid ---
-        print("\nℹ️ Bottom ROI is empty. Skipping alignment.")
-        final_top_roi = top_roi_unaligned
-        final_bottom_roi = None
+        top_roi_unaligned = unaligned_rois[0]
+        bottom_roi_unaligned = unaligned_rois[1]
 
-    elif bottom_roi_valid:
-        # --- Only bottom ROI is valid ---
-        print("\nℹ️ Top ROI is empty. Skipping alignment.")
-        final_top_roi = None
-        final_bottom_roi = bottom_roi_unaligned
+        # Validate contents
+        top_mean = np.mean(mip_data[top_roi_unaligned[0], top_roi_unaligned[1]])
+        bot_mean = np.mean(mip_data[bottom_roi_unaligned[0], bottom_roi_unaligned[1]])
 
-    else:
-        # --- Neither ROI is valid ---
-        print("\n❌ ERROR: Both ROIs appear to be empty. No ROIs will be saved.")
-        final_top_roi = None
-        final_bottom_roi = None
+        top_valid = top_mean > valid_threshold
+        bot_valid = bot_mean > valid_threshold
+
+        print(f"  Top ROI mean: {top_mean:.2f} (Valid: {top_valid})")
+        print(f"  Bottom ROI mean: {bot_mean:.2f} (Valid: {bot_valid})")
+
+        if top_valid and bot_valid:
+            print("\n--- Auto-Aligning ROIs ---")
+            final_bottom_roi = align_rois(
+                mip_data, top_roi_unaligned, bottom_roi_unaligned
+            )
+            final_top_roi = top_roi_unaligned
+            print("\n✅ Both ROIs valid. Alignment complete.")
+        elif top_valid:
+            print("\nℹ️ Bottom ROI is empty. Using Top only.")
+            final_top_roi = top_roi_unaligned
+        elif bot_valid:
+            print("\nℹ️ Top ROI is empty. Using Bottom only.")
+            final_bottom_roi = bottom_roi_unaligned
+        else:
+            print("\n❌ ERROR: Both ROIs appear empty.")
+
+    # --- Case 2: Top Only ---
+    elif require_top and not require_bottom:
+        if len(unaligned_rois) != 1:
+            print("❌ ERROR: Expected 1 ROI (Top).")
+            return None, None
+
+        top_roi_unaligned = unaligned_rois[0]
+        top_mean = np.mean(mip_data[top_roi_unaligned[0], top_roi_unaligned[1]])
+
+        if top_mean > valid_threshold:
+            print(f"✅ Top ROI valid (mean={top_mean:.2f}). Skipping alignment.")
+            final_top_roi = top_roi_unaligned
+        else:
+            print(f"❌ Top ROI empty (mean={top_mean:.2f}).")
+
+    # --- Case 3: Bottom Only ---
+    elif require_bottom and not require_top:
+        if len(unaligned_rois) != 1:
+            print("❌ ERROR: Expected 1 ROI (Bottom).")
+            return None, None
+
+        bottom_roi_unaligned = unaligned_rois[0]
+        bot_mean = np.mean(mip_data[bottom_roi_unaligned[0], bottom_roi_unaligned[1]])
+
+        if bot_mean > valid_threshold:
+            print(f"✅ Bottom ROI valid (mean={bot_mean:.2f}). Skipping alignment.")
+            final_bottom_roi = bottom_roi_unaligned
+        else:
+            print(f"❌ Bottom ROI empty (mean={bot_mean:.2f}).")
 
     return final_top_roi, final_bottom_roi
