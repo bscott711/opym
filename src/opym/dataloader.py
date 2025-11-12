@@ -112,15 +112,15 @@ def load_tiff_series(directory: Path):
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # Find any file matching the pattern to determine the base name
-    first_file = next(directory.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None)
+    # --- MODIFICATION: Find file with new C..._T... format ---
+    first_file = next(directory.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
     if not first_file:
         raise FileNotFoundError(
-            f"No processed TIFF files (e.g., '*_T000_C0.tif') found in {directory}"
+            f"No processed TIFF files (e.g., '*_C0_T000.tif') found in {directory}"
         )
 
-    # Use regex to parse the base name
-    file_pattern_re = re.compile(r"^(.*?)_T\d{3}_C\d\.tif$")
+    # --- MODIFICATION: Use regex to parse base name from new format ---
+    file_pattern_re = re.compile(r"^(.*?)_C\d_T\d{3}\.tif$")
     match = file_pattern_re.match(first_file.name)
     if not match:
         raise ValueError(f"Could not parse base name from file: {first_file.name}")
@@ -131,13 +131,15 @@ def load_tiff_series(directory: Path):
     # Parse T, C, and Z limits from files
     t_vals = set()
     c_vals = set()
-    file_pattern = re.compile(f"{re.escape(BASE_NAME)}_T(\\d+)_C(\\d+).tif")
+    # --- MODIFICATION: Use regex for new C..._T... format ---
+    file_pattern = re.compile(f"{re.escape(BASE_NAME)}_C(\\d+)_T(\\d+).tif")
 
-    for f in directory.glob(f"{BASE_NAME}_T*_C*.tif"):
+    for f in directory.glob(f"{BASE_NAME}_C*_T*.tif"):
         match = file_pattern.match(f.name)
         if match:
-            t_vals.add(int(match.group(1)))
-            c_vals.add(int(match.group(2)))
+            # --- MODIFICATION: Group 1 is C, Group 2 is T ---
+            c_vals.add(int(match.group(1)))
+            t_vals.add(int(match.group(2)))
 
     if not t_vals or not c_vals:
         raise FileNotFoundError("Could not parse T or C values from filenames.")
@@ -159,7 +161,8 @@ def load_tiff_series(directory: Path):
     @functools.lru_cache(maxsize=8)
     def get_stack(t, c):
         """Loads a 3D ZYX stack for a given T and C."""
-        file_path = directory / f"{BASE_NAME}_T{t:03d}_C{c:d}.tif"
+        # --- MODIFICATION: Use new file naming format ---
+        file_path = directory / f"{BASE_NAME}_C{c:d}_T{t:03d}.tif"
         if not file_path.exists():
             print(f"Warning: File not found {file_path.name}")
             return np.zeros((Z_max + 1, Y, X), dtype=first_stack.dtype)

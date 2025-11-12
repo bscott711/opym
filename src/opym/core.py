@@ -171,31 +171,37 @@ def process_dataset(
                     tif_meta = {"axes": "ZYX"}
                 # --- END MODIFICATION ---
 
-                out_name = f"{sanitized_name}_T{t:03d}"
+                # --- MODIFICATION: Use new file naming schema ---
+                out_name_c0 = f"{sanitized_name}_C0_T{t:03d}.tif"
+                out_name_c1 = f"{sanitized_name}_C1_T{t:03d}.tif"
+                out_name_c2 = f"{sanitized_name}_C2_T{t:03d}.tif"
+                out_name_c3 = f"{sanitized_name}_C3_T{t:03d}.tif"
+
                 tifffile.imwrite(
-                    output_dir / f"{out_name}_C0.tif",
+                    output_dir / out_name_c0,
                     ch0_stack,
                     imagej=True,
                     metadata=tif_meta,
                 )
                 tifffile.imwrite(
-                    output_dir / f"{out_name}_C1.tif",
+                    output_dir / out_name_c1,
                     ch1_stack,
                     imagej=True,
                     metadata=tif_meta,
                 )
                 tifffile.imwrite(
-                    output_dir / f"{out_name}_C2.tif",
+                    output_dir / out_name_c2,
                     ch2_stack,
                     imagej=True,
                     metadata=tif_meta,
                 )
                 tifffile.imwrite(
-                    output_dir / f"{out_name}_C3.tif",
+                    output_dir / out_name_c3,
                     ch3_stack,
                     imagej=True,
                     metadata=tif_meta,
                 )
+                # --- END MODIFICATION ---
 
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
 
@@ -251,7 +257,8 @@ def run_processing_job(
             shutil.rmtree(zarr_path)
     elif output_format == OutputFormat.TIFF_SERIES:
         print(f"Cleaning old files from {paths.output_dir.name}...")
-        for f in paths.output_dir.glob(f"{paths.sanitized_name}_T*.tif"):
+        # --- MODIFICATION: Update glob pattern to match new schema ---
+        for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
 
     print(f"Format selected: {output_format.value}")

@@ -6,8 +6,7 @@ build-backend = "hatchling.build"
 # --- Core Project Metadata ---
 [project]
 name = "opym"
-# Note: Change "dev0" to a final version (e.g., "0.2.1") before publishing
-version = "0.2.1-dev0"
+version = "0.2.1-dev1"
 description = "A pre-processor for OPM data to crop and split channels for pypetakit5d."
 readme = "README.md"
 license = { file = "LICENSE" }

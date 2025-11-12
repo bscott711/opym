@@ -36,8 +36,8 @@ def detect_microscopy_data_type(directory: Path) -> MicroscopyDataType:
     if not directory.is_dir():
         raise NotADirectoryError(f"Path is not a directory: {directory}")
 
-    # Check for OPM first, as it's the most specific pattern
-    if next(directory.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None):
+    # --- MODIFICATION: Check for OPM using the new C..._T... format ---
+    if next(directory.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None):
         return "OPM"
 
     # Check for LLSM

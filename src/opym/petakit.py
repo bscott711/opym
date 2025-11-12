@@ -59,13 +59,15 @@ def get_petakit_context(
         base_name = log_file.stem.replace("_processing_log", "")
     else:
         # Fallback: find the first data file and parse its name
-        first_file = next(processed_dir.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None)
+        # --- MODIFICATION: Update glob pattern to new format ---
+        first_file = next(processed_dir.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
         if not first_file:
             raise FileNotFoundError(
                 "Could not find a '*_processing_log.json' file or any "
-                "'*_T..._C..tif' file to determine base_name."
+                "'*_C..._T..tif' file to determine base_name."
             )
-        match = re.search(r"^(.*?)_T\d{3}_C\d\.tif$", first_file.name)
+        # --- MODIFICATION: Update regex to new format ---
+        match = re.search(r"^(.*?)_C\d_T\d{3}\.tif$", first_file.name)
         if not match:
             raise ValueError(f"Could not parse base name from file: {first_file.name}")
         base_name = match.group(1)
