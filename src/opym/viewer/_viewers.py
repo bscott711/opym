@@ -133,9 +133,12 @@ def single_channel_viewer(
             new_fig_height = base_width * new_aspect
             fig.set_figheight(new_fig_height)
             ax.set_aspect(new_aspect)
-            # ---
 
             img.set_data(plane)
+            # --- ADDED: Autoscale axes to fit new data shape ---
+            ax.autoscale(enable=True, tight=True)
+            # ---
+
             img.set_clim(vmin=contrast[0], vmax=contrast[1])
             title_label.value = f"T={t}, Z={z}, C={c}"
             fig.canvas.draw_idle()
@@ -353,8 +356,12 @@ def composite_viewer(
 
             final_image = np.clip(final_image, 0.0, 1.0)
             img_comp.set_data(final_image)
-            title_label_comp.value = f"T={t}, Z={z}"
 
+            # --- ADDED: Autoscale axes to fit new data shape ---
+            ax_comp.autoscale(enable=True, tight=True)
+            # ---
+
+            title_label_comp.value = f"T={t}, Z={z}"
             fig_comp.canvas.draw_idle()
 
         def on_refresh_button_clicked(b):
