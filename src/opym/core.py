@@ -72,10 +72,22 @@ def process_dataset(
     need_top = (1 in channels_to_output) or (2 in channels_to_output)
     need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
-    if need_top and top_roi is None:
-        raise ValueError("Channels 1 or 2 selected, but top_roi is None.")
-    if need_bottom and bottom_roi is None:
-        raise ValueError("Channels 0 or 3 selected, but bottom_roi is None.")
+    def is_roi_valid(roi: tuple[slice, slice] | None) -> bool:
+        """Checks if an ROI is not None and both its slices are not None."""
+        if roi is None:
+            return False
+        # Check that the tuple contains two slice objects, not None
+        return roi[0] is not None and roi[1] is not None
+
+    if need_top and not is_roi_valid(top_roi):
+        raise ValueError(
+            f"Channels 1 or 2 selected, but top_roi is invalid or incomplete: {top_roi}"
+        )
+    if need_bottom and not is_roi_valid(bottom_roi):
+        raise ValueError(
+            f"Channels 0 or 3 selected, but bottom_roi is invalid or "
+            f"incomplete: {bottom_roi}"
+        )
 
     try:
         # Setup based on input TIFF
