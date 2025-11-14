@@ -44,6 +44,7 @@ def process_dataset(
     or a series of 3D (ZYX) TIFF files.
 
     Processes only the channels specified in `channels_to_output`.
+    Handles both 4D (squeezed T) and 5D OME-TIF files.
 
     Returns:
         int: The number of timepoints processed (T).
@@ -74,9 +75,29 @@ def process_dataset(
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
             store = series.aszarr()
-            zarr_array: zarr.Array = zarr.open_array(store, mode="r")
+            # Open the base array
+            base_zarr_array: zarr.Array = zarr.open_array(store, mode="r")
 
-            T, Z, C, Y, X = series.shape
+            # --- START FIX: Handle 4D (squeezed T) vs 5D arrays ---
+            shape = base_zarr_array.shape
+            zarr_array: zarr.Array  # Define type for Pylance
+
+            if base_zarr_array.ndim == 5:
+                T, Z, C, Y, X = shape
+                zarr_array = base_zarr_array  # It's already 5D
+                print(f"Detected 5D array. Shape: {(T, Z, C, Y, X)}")
+            elif base_zarr_array.ndim == 4:
+                Z, C, Y, X = shape
+                T = 1  # This is a 4D file, so it has 1 timepoint
+                zarr_array = cast(zarr.Array, base_zarr_array[None, ...])  # type: ignore
+
+                print(f"Detected 4D array. Reshaping to: {zarr_array.shape}")
+            else:
+                raise ValueError(
+                    f"Incompatible data shape: {shape}. Expected 4D or 5D array."
+                )
+            # --- END FIX ---
+
             dtype = series.dtype
 
             if C != 2:
@@ -99,7 +120,7 @@ def process_dataset(
         if rotate_90:
             Y_out, X_out = X_new, Y_new
         else:
-            Y_out, X_out = Y_new, X_new
+            Y_out, X_out = Y_new, Y_new
 
         print(f"Using sanitized base name for output: {sanitized_name}")
 
@@ -126,11 +147,14 @@ def process_dataset(
                 f"Created new {C_new}-channel OME-Zarr store: {output_zarr_path.name}"
             )
 
+            # NOTE: The zarr_array is now guaranteed to be 5D, so no logic
+            # change is needed in the loops below.
             with tqdm(
                 total=T * Z * C, desc=" ├ Processing Planes", unit="plane"
             ) as pbar:
                 for t in range(T):
                     for z in range(Z):
+                        # These 5D indexes will work even if T=1
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
@@ -180,7 +204,7 @@ def process_dataset(
                             )
                         if 1 in channels_to_output:
                             zarr_out[t, z, channel_map[1], :, :] = cast(
-                                np.ndarray, top_crop_c0
+                                np.ndarray, top_crop_c1
                             )
                         if 2 in channels_to_output:
                             zarr_out[t, z, channel_map[2], :, :] = cast(
@@ -199,6 +223,8 @@ def process_dataset(
             output_stack_shape_3d = (Z, Y_out, X_out)
             tif_meta = {"axes": "ZYX"}
 
+            # NOTE: The zarr_array is now guaranteed to be 5D, so no logic
+            # change is needed in the loops below.
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
                 # Create empty stacks only for the channels we need
                 stacks_to_write = {
@@ -207,6 +233,7 @@ def process_dataset(
                 }
 
                 for z in range(Z):
+                    # These 5D indexes will work even if T=1
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
