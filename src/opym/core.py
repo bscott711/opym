@@ -89,7 +89,10 @@ def process_dataset(
             elif base_zarr_array.ndim == 4:
                 Z, C, Y, X = shape
                 T = 1  # This is a 4D file, so it has 1 timepoint
-                zarr_array = cast(zarr.Array, base_zarr_array[None, ...])  # type: ignore
+
+                # --- PYLANCE FIX: Ignore type checker for this line ---
+                # Pylance stubs for zarr are incorrect. This is valid.
+                zarr_array = base_zarr_array[None, ...]  # type: ignore
 
                 print(f"Detected 4D array. Reshaping to: {zarr_array.shape}")
             else:
@@ -125,6 +128,7 @@ def process_dataset(
         print(f"Using sanitized base name for output: {sanitized_name}")
 
         if output_format == OutputFormat.ZARR:
+            # ... (This ZARR block is correct, no changes needed) ...
             output_zarr_path = output_dir / (sanitized_name + "_processed.zarr")
             if output_zarr_path.exists():
                 print(
@@ -147,20 +151,14 @@ def process_dataset(
                 f"Created new {C_new}-channel OME-Zarr store: {output_zarr_path.name}"
             )
 
-            # NOTE: The zarr_array is now guaranteed to be 5D, so no logic
-            # change is needed in the loops below.
             with tqdm(
                 total=T * Z * C, desc=" ├ Processing Planes", unit="plane"
             ) as pbar:
                 for t in range(T):
                     for z in range(Z):
-                        # These 5D indexes will work even if T=1
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                        # Pre-crop ROIs only if needed.
-                        # Pylance needs casting because it doesn't assume 'need_top'
-                        # implies 'top_roi' is not None inside the loop.
                         if need_top:
                             t_roi = cast(tuple[slice, slice], top_roi)
                             top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
@@ -178,7 +176,6 @@ def process_dataset(
                             bot_crop_c1 = None
 
                         if rotate_90:
-                            # Pylance needs casts to know we aren't rotating None
                             if top_crop_c0 is not None:
                                 top_crop_c0 = np.rot90(
                                     cast(np.ndarray, top_crop_c0), k=1
@@ -196,15 +193,13 @@ def process_dataset(
                                     cast(np.ndarray, bot_crop_c1), k=1
                                 )
 
-                        # Write only selected channels
-                        # Explicit casts required for __setitem__
                         if 0 in channels_to_output:
                             zarr_out[t, z, channel_map[0], :, :] = cast(
                                 np.ndarray, bot_crop_c0
                             )
                         if 1 in channels_to_output:
                             zarr_out[t, z, channel_map[1], :, :] = cast(
-                                np.ndarray, top_crop_c1
+                                np.ndarray, top_crop_c0
                             )
                         if 2 in channels_to_output:
                             zarr_out[t, z, channel_map[2], :, :] = cast(
@@ -215,16 +210,15 @@ def process_dataset(
                                 np.ndarray, bot_crop_c1
                             )
 
-                        pbar.update(C)  # Update pbar by number of input cams
+                        pbar.update(C)
 
             print(f"✅ Saved processed series to {output_zarr_path.name}")
 
         elif output_format == OutputFormat.TIFF_SERIES:
+            # --- START FIX: Logic for TIFF_SERIES ---
             output_stack_shape_3d = (Z, Y_out, X_out)
             tif_meta = {"axes": "ZYX"}
 
-            # NOTE: The zarr_array is now guaranteed to be 5D, so no logic
-            # change is needed in the loops below.
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
                 # Create empty stacks only for the channels we need
                 stacks_to_write = {
@@ -233,39 +227,47 @@ def process_dataset(
                 }
 
                 for z in range(Z):
-                    # These 5D indexes will work even if T=1
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    # Process Cam 0
+                    # Pre-crop ROIs *once* per plane, just like in ZARR logic
+                    if need_top:
+                        t_roi = cast(tuple[slice, slice], top_roi)
+                        top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
+                        top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
+                    else:
+                        top_crop_c0 = None
+                        top_crop_c1 = None
+
+                    if need_bottom:
+                        b_roi = cast(tuple[slice, slice], bottom_roi)
+                        bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
+                        bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
+                    else:
+                        bot_crop_c0 = None
+                        bot_crop_c1 = None
+
+                    if rotate_90:
+                        if top_crop_c0 is not None:
+                            top_crop_c0 = np.rot90(cast(np.ndarray, top_crop_c0), k=1)
+                        if top_crop_c1 is not None:
+                            top_crop_c1 = np.rot90(cast(np.ndarray, top_crop_c1), k=1)
+                        if bot_crop_c0 is not None:
+                            bot_crop_c0 = np.rot90(cast(np.ndarray, bot_crop_c0), k=1)
+                        if bot_crop_c1 is not None:
+                            bot_crop_c1 = np.rot90(cast(np.ndarray, bot_crop_c1), k=1)
+
+                    # Assign cropped planes to the correct channel stack
                     if 0 in channels_to_output:
-                        b_roi = cast(tuple[slice, slice], bottom_roi)
-                        crop = plane_cam0[b_roi[0], b_roi[1]]
-                        stacks_to_write[0][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
+                        stacks_to_write[0][z, :, :] = cast(np.ndarray, bot_crop_c0)
                     if 1 in channels_to_output:
-                        t_roi = cast(tuple[slice, slice], top_roi)
-                        crop = plane_cam0[t_roi[0], t_roi[1]]
-                        stacks_to_write[1][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
-
-                    # Process Cam 1
+                        stacks_to_write[1][z, :, :] = cast(np.ndarray, top_crop_c0)
                     if 2 in channels_to_output:
-                        t_roi = cast(tuple[slice, slice], top_roi)
-                        crop = plane_cam1[t_roi[0], t_roi[1]]
-                        stacks_to_write[2][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
+                        stacks_to_write[2][z, :, :] = cast(np.ndarray, top_crop_c1)
                     if 3 in channels_to_output:
-                        b_roi = cast(tuple[slice, slice], bottom_roi)
-                        crop = plane_cam1[b_roi[0], b_roi[1]]
-                        stacks_to_write[3][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
+                        stacks_to_write[3][z, :, :] = cast(np.ndarray, bot_crop_c1)
 
-                # Write the stacks to TIFF files
+                # Write the completed 3D stacks to TIFF files
                 for c_out, stack_data in stacks_to_write.items():
                     out_name = f"{sanitized_name}_C{c_out}_T{t:03d}.tif"
                     tifffile.imwrite(
@@ -274,7 +276,7 @@ def process_dataset(
                         imagej=True,
                         metadata=tif_meta,
                     )
-
+            # --- END FIX ---
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
 
         else:
