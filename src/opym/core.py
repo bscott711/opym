@@ -26,7 +26,14 @@ def _get_crop_shape(
     """Helper to get shape from a potentially None ROI."""
     if roi is None:
         return None
-    return dummy_plane[roi[0], roi[1]].shape
+
+    # --- START FIX: Validate that ROI slices are not None ---
+    y_slice, x_slice = roi
+    if y_slice is None or x_slice is None:
+        raise ValueError(f"Invalid ROI: Contains 'None' slices: {roi}")
+    # --- END FIX ---
+
+    return dummy_plane[y_slice, x_slice].shape
 
 
 def process_dataset(
