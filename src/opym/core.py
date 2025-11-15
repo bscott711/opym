@@ -72,6 +72,7 @@ def process_dataset(
     need_top = (1 in channels_to_output) or (2 in channels_to_output)
     need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
+    # --- START FIX: More robust ROI validation ---
     def is_roi_valid(roi: tuple[slice, slice] | None) -> bool:
         """Checks if an ROI is not None and both its slices are not None."""
         if roi is None:
@@ -81,13 +82,15 @@ def process_dataset(
 
     if need_top and not is_roi_valid(top_roi):
         raise ValueError(
-            f"Channels 1 or 2 selected, but top_roi is invalid or incomplete: {top_roi}"
+            f"Channels 1 or 2 selected, but top_roi is invalid "
+            f"or incomplete: {top_roi}"
         )
     if need_bottom and not is_roi_valid(bottom_roi):
         raise ValueError(
-            f"Channels 0 or 3 selected, but bottom_roi is invalid or "
-            f"incomplete: {bottom_roi}"
+            f"Channels 0 or 3 selected, but bottom_roi is invalid "
+            f"or incomplete: {bottom_roi}"
         )
+    # --- END FIX ---
 
     try:
         # Setup based on input TIFF
@@ -134,8 +137,21 @@ def process_dataset(
         if top_shape and bottom_shape and (top_shape != bottom_shape):
             raise ValueError(f"ROI shapes do not match: {top_shape} vs {bottom_shape}")
 
-        # Determine output shape from the first available ROI
-        Y_new, X_new = top_shape or bottom_shape or (0, 0)
+        # --- START FIX: Corrected shape logic ---
+        # We check if the *shape* (which is tuple[int, int] | None) is not None.
+        if top_shape is not None:
+            Y_new, X_new = top_shape
+        elif bottom_shape is not None:
+            Y_new, X_new = bottom_shape
+        else:
+            # Fallback if no valid ROIs were provided
+            Y_new, X_new = (0, 0)
+            if need_top or need_bottom:
+                # This should be caught by validation, but as a fallback:
+                print(
+                    "Warning: No valid ROI shapes found despite channels being selected"
+                )
+        # --- END FIX ---
 
         C_new = len(channels_to_output)
 
@@ -249,8 +265,8 @@ def process_dataset(
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    # Pre-crop ROIs *once* per plane, just like in ZARR logic
-                    if need_top:
+                    # --- FINAL REDUNDANT FIX: Check ROIs *inside* the loop ---
+                    if need_top and is_roi_valid(top_roi):
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
@@ -258,13 +274,14 @@ def process_dataset(
                         top_crop_c0 = None
                         top_crop_c1 = None
 
-                    if need_bottom:
+                    if need_bottom and is_roi_valid(bottom_roi):
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
                         bot_crop_c0 = None
                         bot_crop_c1 = None
+                    # --- END REDUNDANT FIX ---
 
                     if rotate_90:
                         if top_crop_c0 is not None:
