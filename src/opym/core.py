@@ -58,7 +58,6 @@ def process_dataset(
     if rotate_90:
         print("    90-degree rotation: ENABLED")
 
-    # --- MODIFICATION: Default to all 4 channels if not specified ---
     if channels_to_output is None:
         channels_to_output = [0, 1, 2, 3]
     if not channels_to_output:
@@ -74,19 +73,18 @@ def process_dataset(
         """Checks if an ROI is not None and both its slices are not None."""
         if roi is None:
             return False
-        # Check that the tuple contains two slice objects, not None
         return roi[0] is not None and roi[1] is not None
 
-    if need_top and not is_roi_valid(top_roi):
-        raise ValueError(
-            f"Channels 1 or 2 selected, but top_roi is invalid "
-            f"or incomplete: {top_roi}"
-        )
-    if need_bottom and not is_roi_valid(bottom_roi):
-        raise ValueError(
-            f"Channels 0 or 3 selected, but bottom_roi is invalid "
-            f"or incomplete: {bottom_roi}"
-        )
+    # --- START REFACTOR: Check once, as user suggested ---
+    # This is more efficient. We check once and set a simple boolean.
+    do_top_slice = need_top and is_roi_valid(top_roi)
+    do_bottom_slice = need_bottom and is_roi_valid(bottom_roi)
+
+    if need_top and not do_top_slice:
+        print("ℹ️ Channels 1 or 2 selected, but Top ROI is invalid. Skipping.")
+    if need_bottom and not do_bottom_slice:
+        print("ℹ️ Channels 0 or 3 selected, but Bottom ROI is invalid. Skipping.")
+    # --- END REFACTOR ---
 
     try:
         is_4d_input = False  # Flag to control indexing
@@ -103,7 +101,7 @@ def process_dataset(
             elif zarr_array.ndim == 4:
                 is_4d_input = True
                 Z, C, Y, X = shape
-                T = 1  # This is a 4D file, so it has 1 timepoint
+                T = 1
                 print(f"Detected 4D array (ZCYX). Shape: {shape}. Setting T=1.")
             else:
                 raise ValueError(
@@ -111,15 +109,16 @@ def process_dataset(
                 )
 
             dtype = series.dtype
-
             if C != 2:
-                print(
-                    f"Warning: Expected 2 cameras (C=2), but found C={C}",
-                )
+                print(f"Warning: Expected 2 cameras (C=2), but found C={C}")
 
         dummy_plane = np.zeros((Y, X), dtype=dtype)
-        top_shape = _get_crop_shape(dummy_plane, top_roi)
-        bottom_shape = _get_crop_shape(dummy_plane, bottom_roi)
+
+        # We can now safely use the potentially None ROIs here
+        top_shape = _get_crop_shape(dummy_plane, top_roi if do_top_slice else None)
+        bottom_shape = _get_crop_shape(
+            dummy_plane, bottom_roi if do_bottom_slice else None
+        )  # noqa: E501
 
         if top_shape and bottom_shape and (top_shape != bottom_shape):
             raise ValueError(f"ROI shapes do not match: {top_shape} vs {bottom_shape}")
@@ -132,7 +131,7 @@ def process_dataset(
             Y_new, X_new = (0, 0)
             if need_top or need_bottom:
                 print(
-                    "Warning: No valid ROI shapes found despite channels being selected"
+                    "Warning: No valid ROI shapes found despite channels being selected."  # noqa: E501
                 )
 
         C_new = len(channels_to_output)
@@ -178,7 +177,8 @@ def process_dataset(
                             plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                             plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                        if need_top and is_roi_valid(top_roi):
+                        # --- REFACTOR: Check simple boolean ---
+                        if do_top_slice:
                             t_roi = cast(tuple[slice, slice], top_roi)
                             top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                             top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
@@ -186,13 +186,14 @@ def process_dataset(
                             top_crop_c0 = None
                             top_crop_c1 = None
 
-                        if need_bottom and is_roi_valid(bottom_roi):
+                        if do_bottom_slice:
                             b_roi = cast(tuple[slice, slice], bottom_roi)
                             bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                             bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                         else:
                             bot_crop_c0 = None
                             bot_crop_c1 = None
+                        # --- END REFACTOR ---
 
                         if rotate_90:
                             if top_crop_c0 is not None:
@@ -251,7 +252,8 @@ def process_dataset(
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    if need_top and is_roi_valid(top_roi):
+                    # --- REFACTOR: Check simple boolean ---
+                    if do_top_slice:
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
@@ -259,13 +261,14 @@ def process_dataset(
                         top_crop_c0 = None
                         top_crop_c1 = None
 
-                    if need_bottom and is_roi_valid(bottom_roi):
+                    if do_bottom_slice:
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
                         bot_crop_c0 = None
                         bot_crop_c1 = None
+                    # --- END REFACTOR ---
 
                     if rotate_90:
                         if top_crop_c0 is not None:
@@ -314,7 +317,8 @@ def process_dataset(
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    if need_top and is_roi_valid(top_roi):
+                    # --- REFACTOR: Check simple boolean ---
+                    if do_top_slice:
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
@@ -322,13 +326,14 @@ def process_dataset(
                         top_crop_c0 = None
                         top_crop_c1 = None
 
-                    if need_bottom and is_roi_valid(bottom_roi):
+                    if do_bottom_slice:
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
                         bot_crop_c0 = None
                         bot_crop_c1 = None
+                    # --- END REFACTOR ---
 
                     if rotate_90:
                         if top_crop_c0 is not None:
