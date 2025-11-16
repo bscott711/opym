@@ -75,10 +75,16 @@ def process_dataset(
     # --- START FIX: More robust ROI validation ---
     def is_roi_valid(roi: tuple[slice, slice] | None) -> bool:
         """Checks if an ROI is not None and both its slices are not None."""
+        # --- DEBUG PRINT ---
+        print(f"--- DEBUG: is_roi_valid checking: {roi}")
         if roi is None:
+            print("--- DEBUG: ROI is None, returning False")
             return False
         # Check that the tuple contains two slice objects, not None
-        return roi[0] is not None and roi[1] is not None
+        is_valid = roi[0] is not None and roi[1] is not None
+        print(f"--- DEBUG: Slices valid? {is_valid}")
+        return is_valid
+        # --- END DEBUG ---
 
     if need_top and not is_roi_valid(top_roi):
         raise ValueError(
@@ -194,20 +200,34 @@ def process_dataset(
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
+                        # --- START DEBUG BLOCK ---
+                        print(f"\n--- DEBUG (t={t}, z={z}) ---")
+                        print(f"  need_top: {need_top}")
+                        print(f"  top_roi: {top_roi}")
+                        print(f"  need_bottom: {need_bottom}")
+                        print(f"  bottom_roi: {bottom_roi}")
+                        print("  Checking top_roi...")
+                        # --- END DEBUG BLOCK ---
+
                         # --- START FIX: Add is_roi_valid check to ZARR block ---
                         if need_top and is_roi_valid(top_roi):
+                            print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                             t_roi = cast(tuple[slice, slice], top_roi)
                             top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                             top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                         else:
+                            print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                             top_crop_c0 = None
                             top_crop_c1 = None
 
+                        print("  Checking bottom_roi...")  # <-- ADDED
                         if need_bottom and is_roi_valid(bottom_roi):
+                            print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                             b_roi = cast(tuple[slice, slice], bottom_roi)
                             bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                             bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                         else:
+                            print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                             bot_crop_c0 = None
                             bot_crop_c1 = None
                         # --- END FIX ---
@@ -267,20 +287,34 @@ def process_dataset(
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
+                    # --- START DEBUG BLOCK ---
+                    print(f"\n--- DEBUG (t={t}, z={z}) ---")
+                    print(f"  need_top: {need_top}")
+                    print(f"  top_roi: {top_roi}")
+                    print(f"  need_bottom: {need_bottom}")
+                    print(f"  bottom_roi: {bottom_roi}")
+                    print("  Checking top_roi...")
+                    # --- END DEBUG BLOCK ---
+
                     # --- This block already has the correct is_roi_valid fix ---
                     if need_top and is_roi_valid(top_roi):
+                        print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                     else:
+                        print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                         top_crop_c0 = None
                         top_crop_c1 = None
 
+                    print("  Checking bottom_roi...")  # <-- ADDED
                     if need_bottom and is_roi_valid(bottom_roi):
+                        print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
+                        print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                         bot_crop_c0 = None
                         bot_crop_c1 = None
                     # --- END REDUNDANT FIX ---
@@ -335,20 +369,34 @@ def process_dataset(
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
+                    # --- START DEBUG BLOCK ---
+                    print(f"\n--- DEBUG (t={t}, z={z}) ---")
+                    print(f"  need_top: {need_top}")
+                    print(f"  top_roi: {top_roi}")
+                    print(f"  need_bottom: {need_bottom}")
+                    print(f"  bottom_roi: {bottom_roi}")
+                    print("  Checking top_roi...")
+                    # --- END DEBUG BLOCK ---
+
                     # --- This block has the correct is_roi_valid fix ---
                     if need_top and is_roi_valid(top_roi):
+                        print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                     else:
+                        print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                         top_crop_c0 = None
                         top_crop_c1 = None
 
+                    print("  Checking bottom_roi...")  # <-- ADDED
                     if need_bottom and is_roi_valid(bottom_roi):
+                        print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
+                        print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                         bot_crop_c0 = None
                         bot_crop_c1 = None
                     # --- End fix ---
@@ -443,7 +491,7 @@ def run_processing_job(
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
     # --- START: ADDED BLOCK TO CLEANUP TIFF_SERIES_SPLIT_C ---
-    elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
+    elif output_format == OutputFormat.TIFF_SERIES_SPLIT_T:
         print(f"Cleaning old files from {paths.output_dir.name}...")
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
