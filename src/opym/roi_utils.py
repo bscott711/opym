@@ -121,8 +121,20 @@ def align_rois(
         dy, dx = shift
         print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
 
-        old_y_start, old_y_end = bottom_roi[0].start, bottom_roi[0].stop
-        old_x_start, old_x_end = bottom_roi[1].start, bottom_roi[1].stop
+        # --- START FIX: Handle None in slice.start/stop ---
+        # Provide a default of 0 if the slice starts at the edge (None)
+        old_y_start = bottom_roi[0].start if bottom_roi[0].start is not None else 0
+        old_y_end = bottom_roi[0].stop
+        old_x_start = bottom_roi[1].start if bottom_roi[1].start is not None else 0
+        old_x_end = bottom_roi[1].stop
+
+        # Check for None in the .stop attribute (which is the error)
+        if old_y_end is None or old_x_end is None:
+            print("❌ ERROR: ROI slices must have a defined end (stop).")
+            print("   This can happen if you draw an ROI to the edge of the image.")
+            print("   Please re-draw your ROIs, avoiding the image border.")
+            raise ValueError("ROI slice .stop attribute is None")
+        # --- END FIX ---
 
         new_y_start = old_y_start - int(round(dy))
         new_y_end = old_y_end - int(round(dy))
