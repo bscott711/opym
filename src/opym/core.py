@@ -24,28 +24,14 @@ def _get_crop_shape(
     roi: tuple[slice, slice] | None,
 ) -> tuple[int, int] | None:
     """Helper to get shape from a potentially None ROI."""
-
-    # --- START DEBUG BLOCK ---
-    print(f"\n--- DEBUG [_get_crop_shape]: Called with ROI: {roi}")
     if roi is None:
-        print("--- DEBUG [_get_crop_shape]: ROI is None. Returning None.")
         return None
 
     y_slice, x_slice = roi
-    print(f"--- DEBUG [_get_crop_shape]: y_slice is: {y_slice}")
-    print(f"--- DEBUG [_get_crop_shape]: x_slice is: {x_slice}")
-    # --- END DEBUG BLOCK ---
-
     if y_slice is None or x_slice is None:
-        print(
-            "--- DEBUG [_get_crop_shape]: ERROR - a slice is None. Raising ValueError."
-        )
         raise ValueError(f"Invalid ROI: Contains 'None' slices: {roi}")
 
-    print("--- DEBUG [_get_crop_shape]: Slicing dummy plane.")
-    shape = dummy_plane[y_slice, x_slice].shape
-    print(f"--- DEBUG [_get_crop_shape]: Got shape {shape}. Returning.")
-    return shape
+    return dummy_plane[y_slice, x_slice].shape
 
 
 def process_dataset(
@@ -84,19 +70,12 @@ def process_dataset(
     need_top = (1 in channels_to_output) or (2 in channels_to_output)
     need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
-    # --- START FIX: More robust ROI validation ---
     def is_roi_valid(roi: tuple[slice, slice] | None) -> bool:
         """Checks if an ROI is not None and both its slices are not None."""
-        # --- DEBUG PRINT ---
-        print(f"--- DEBUG [is_roi_valid]: checking: {roi}")
         if roi is None:
-            print("--- DEBUG [is_roi_valid]: ROI is None, returning False")
             return False
         # Check that the tuple contains two slice objects, not None
-        is_valid = roi[0] is not None and roi[1] is not None
-        print(f"--- DEBUG [is_roi_valid]: Slices valid? {is_valid}")
-        return is_valid
-        # --- END DEBUG ---
+        return roi[0] is not None and roi[1] is not None
 
     if need_top and not is_roi_valid(top_roi):
         raise ValueError(
@@ -108,38 +87,28 @@ def process_dataset(
             f"Channels 0 or 3 selected, but bottom_roi is invalid "
             f"or incomplete: {bottom_roi}"
         )
-    # --- END FIX ---
 
     try:
-        # Setup based on input TIFF
+        is_4d_input = False  # Flag to control indexing
+
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
             store = series.aszarr()
-            # Open the base array
-            base_zarr_array: zarr.Array = zarr.open_array(store, mode="r")
+            zarr_array: zarr.Array = zarr.open_array(store, mode="r")
+            shape = zarr_array.shape
 
-            # --- START FIX: Handle 4D (squeezed T) vs 5D arrays ---
-            shape = base_zarr_array.shape
-            zarr_array: zarr.Array  # Define type for Pylance
-
-            if base_zarr_array.ndim == 5:
+            if zarr_array.ndim == 5:
                 T, Z, C, Y, X = shape
-                zarr_array = base_zarr_array  # It's already 5D
-                print(f"Detected 5D array. Shape: {(T, Z, C, Y, X)}")
-            elif base_zarr_array.ndim == 4:
+                print(f"Detected 5D array (TZCYX). Shape: {shape}")
+            elif zarr_array.ndim == 4:
+                is_4d_input = True
                 Z, C, Y, X = shape
                 T = 1  # This is a 4D file, so it has 1 timepoint
-
-                # --- PYLANCE FIX: Ignore type checker for this line ---
-                # Pylance stubs for zarr are incorrect. This is valid.
-                zarr_array = base_zarr_array[None, ...]  # type: ignore
-
-                print(f"Detected 4D array. Reshaping to: {zarr_array.shape}")
+                print(f"Detected 4D array (ZCYX). Shape: {shape}. Setting T=1.")
             else:
                 raise ValueError(
                     f"Incompatible data shape: {shape}. Expected 4D or 5D array."
                 )
-            # --- END FIX ---
 
             dtype = series.dtype
 
@@ -149,30 +118,22 @@ def process_dataset(
                 )
 
         dummy_plane = np.zeros((Y, X), dtype=dtype)
-        print("\n--- DEBUG: Calling _get_crop_shape for top_roi... ---")
         top_shape = _get_crop_shape(dummy_plane, top_roi)
-        print("\n--- DEBUG: Calling _get_crop_shape for bottom_roi... ---")
         bottom_shape = _get_crop_shape(dummy_plane, bottom_roi)
-        print("\n--- DEBUG: Returned from _get_crop_shape calls ---")
 
         if top_shape and bottom_shape and (top_shape != bottom_shape):
             raise ValueError(f"ROI shapes do not match: {top_shape} vs {bottom_shape}")
 
-        # --- START FIX: Corrected shape logic ---
-        # We check if the *shape* (which is tuple[int, int] | None) is not None.
         if top_shape is not None:
             Y_new, X_new = top_shape
         elif bottom_shape is not None:
             Y_new, X_new = bottom_shape
         else:
-            # Fallback if no valid ROIs were provided
             Y_new, X_new = (0, 0)
             if need_top or need_bottom:
-                # This should be caught by validation, but as a fallback:
                 print(
                     "Warning: No valid ROI shapes found despite channels being selected"
                 )
-        # --- END FIX ---
 
         C_new = len(channels_to_output)
 
@@ -184,7 +145,6 @@ def process_dataset(
         print(f"Using sanitized base name for output: {sanitized_name}")
 
         if output_format == OutputFormat.ZARR:
-            # ... (This ZARR block is correct, no changes needed) ...
             output_zarr_path = output_dir / (sanitized_name + "_processed.zarr")
             if output_zarr_path.exists():
                 print(
@@ -201,7 +161,6 @@ def process_dataset(
                 dtype=dtype,
                 chunks=chunks,
             )
-            # Map output channel index (0, 1, ...) to its file name (0, 2, ...)
             channel_map = {c_out: i for i, c_out in enumerate(channels_to_output)}
             print(
                 f"Created new {C_new}-channel OME-Zarr store: {output_zarr_path.name}"
@@ -212,40 +171,28 @@ def process_dataset(
             ) as pbar:
                 for t in range(T):
                     for z in range(Z):
-                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                        if is_4d_input:
+                            plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
+                            plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
+                        else:
+                            plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                            plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                        # --- START DEBUG BLOCK ---
-                        print(f"\n--- DEBUG (t={t}, z={z}) ---")
-                        print(f"  need_top: {need_top}")
-                        print(f"  top_roi: {top_roi}")
-                        print(f"  need_bottom: {need_bottom}")
-                        print(f"  bottom_roi: {bottom_roi}")
-                        print("  Checking top_roi...")
-                        # --- END DEBUG BLOCK ---
-
-                        # --- START FIX: Add is_roi_valid check to ZARR block ---
                         if need_top and is_roi_valid(top_roi):
-                            print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                             t_roi = cast(tuple[slice, slice], top_roi)
                             top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                             top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                         else:
-                            print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                             top_crop_c0 = None
                             top_crop_c1 = None
 
-                        print("  Checking bottom_roi...")  # <-- ADDED
                         if need_bottom and is_roi_valid(bottom_roi):
-                            print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                             b_roi = cast(tuple[slice, slice], bottom_roi)
                             bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                             bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                         else:
-                            print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                             bot_crop_c0 = None
                             bot_crop_c1 = None
-                        # --- END FIX ---
 
                         if rotate_90:
                             if top_crop_c0 is not None:
@@ -287,52 +234,38 @@ def process_dataset(
             print(f"✅ Saved processed series to {output_zarr_path.name}")
 
         elif output_format == OutputFormat.TIFF_SERIES:
-            # --- START FIX: Logic for TIFF_SERIES ---
             output_stack_shape_3d = (Z, Y_out, X_out)
             tif_meta = {"axes": "ZYX"}
 
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
-                # Create empty stacks only for the channels we need
                 stacks_to_write = {
                     c_out: np.zeros(output_stack_shape_3d, dtype=dtype)
                     for c_out in channels_to_output
                 }
 
                 for z in range(Z):
-                    plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                    plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                    if is_4d_input:
+                        plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
+                    else:
+                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    # --- START DEBUG BLOCK ---
-                    print(f"\n--- DEBUG (t={t}, z={z}) ---")
-                    print(f"  need_top: {need_top}")
-                    print(f"  top_roi: {top_roi}")
-                    print(f"  need_bottom: {need_bottom}")
-                    print(f"  bottom_roi: {bottom_roi}")
-                    print("  Checking top_roi...")
-                    # --- END DEBUG BLOCK ---
-
-                    # --- This block already has the correct is_roi_valid fix ---
                     if need_top and is_roi_valid(top_roi):
-                        print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                     else:
-                        print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                         top_crop_c0 = None
                         top_crop_c1 = None
 
-                    print("  Checking bottom_roi...")  # <-- ADDED
                     if need_bottom and is_roi_valid(bottom_roi):
-                        print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
-                        print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                         bot_crop_c0 = None
                         bot_crop_c1 = None
-                    # --- END REDUNDANT FIX ---
 
                     if rotate_90:
                         if top_crop_c0 is not None:
@@ -344,7 +277,6 @@ def process_dataset(
                         if bot_crop_c1 is not None:
                             bot_crop_c1 = np.rot90(cast(np.ndarray, bot_crop_c1), k=1)
 
-                    # Assign cropped planes to the correct channel stack
                     if 0 in channels_to_output:
                         stacks_to_write[0][z, :, :] = cast(np.ndarray, bot_crop_c0)
                     if 1 in channels_to_output:
@@ -354,7 +286,6 @@ def process_dataset(
                     if 3 in channels_to_output:
                         stacks_to_write[3][z, :, :] = cast(np.ndarray, bot_crop_c1)
 
-                # Write the completed 3D stacks to TIFF files
                 for c_out, stack_data in stacks_to_write.items():
                     out_name = f"{sanitized_name}_C{c_out}_T{t:03d}.tif"
                     tifffile.imwrite(
@@ -363,58 +294,41 @@ def process_dataset(
                         imagej=True,
                         metadata=tif_meta,
                     )
-            # --- END FIX ---
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
 
-        # --- START: ADDED BLOCK TO FIX THE ERROR ---
         elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
-            # This logic is identical to TIFF_SERIES and contains the
-            # is_roi_valid() fix to prevent the NoneType error.
             output_stack_shape_3d = (Z, Y_out, X_out)
             tif_meta = {"axes": "ZYX"}
 
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
-                # Create empty stacks only for the channels we need
                 stacks_to_write = {
                     c_out: np.zeros(output_stack_shape_3d, dtype=dtype)
                     for c_out in channels_to_output
                 }
 
                 for z in range(Z):
-                    plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                    plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                    if is_4d_input:
+                        plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
+                    else:
+                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    # --- START DEBUG BLOCK ---
-                    print(f"\n--- DEBUG (t={t}, z={z}) ---")
-                    print(f"  need_top: {need_top}")
-                    print(f"  top_roi: {top_roi}")
-                    print(f"  need_bottom: {need_bottom}")
-                    print(f"  bottom_roi: {bottom_roi}")
-                    print("  Checking top_roi...")
-                    # --- END DEBUG BLOCK ---
-
-                    # --- This block has the correct is_roi_valid fix ---
                     if need_top and is_roi_valid(top_roi):
-                        print("  DEBUG: Slicing with top_roi")  # <-- ADDED
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                         top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
                     else:
-                        print("  DEBUG: Skipping top_roi slicing")  # <-- ADDED
                         top_crop_c0 = None
                         top_crop_c1 = None
 
-                    print("  Checking bottom_roi...")  # <-- ADDED
                     if need_bottom and is_roi_valid(bottom_roi):
-                        print("  DEBUG: Slicing with bottom_roi")  # <-- ADDED
                         b_roi = cast(tuple[slice, slice], bottom_roi)
                         bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                         bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                     else:
-                        print("  DEBUG: Skipping bottom_roi slicing")  # <-- ADDED
                         bot_crop_c0 = None
                         bot_crop_c1 = None
-                    # --- End fix ---
 
                     if rotate_90:
                         if top_crop_c0 is not None:
@@ -426,7 +340,6 @@ def process_dataset(
                         if bot_crop_c1 is not None:
                             bot_crop_c1 = np.rot90(cast(np.ndarray, bot_crop_c1), k=1)
 
-                    # Assign cropped planes to the correct channel stack
                     if 0 in channels_to_output:
                         stacks_to_write[0][z, :, :] = cast(np.ndarray, bot_crop_c0)
                     if 1 in channels_to_output:
@@ -436,7 +349,6 @@ def process_dataset(
                     if 3 in channels_to_output:
                         stacks_to_write[3][z, :, :] = cast(np.ndarray, bot_crop_c1)
 
-                # Write the completed 3D stacks to TIFF files
                 for c_out, stack_data in stacks_to_write.items():
                     out_name = f"{sanitized_name}_C{c_out}_T{t:03d}.tif"
                     tifffile.imwrite(
@@ -446,7 +358,6 @@ def process_dataset(
                         metadata=tif_meta,
                     )
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
-        # --- END: ADDED BLOCK ---
 
         else:
             raise ValueError(f"Unknown output_format: {output_format}")
@@ -505,12 +416,10 @@ def run_processing_job(
         print(f"Cleaning old files from {paths.output_dir.name}...")
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
-    # --- START: ADDED BLOCK TO CLEANUP TIFF_SERIES_SPLIT_C ---
     elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
         print(f"Cleaning old files from {paths.output_dir.name}...")
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
-    # --- END: ADDED BLOCK ---
 
     print(f"Format selected: {output_format.value}")
     print(f"Output Directory: {paths.output_dir.name}")
