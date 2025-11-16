@@ -24,16 +24,28 @@ def _get_crop_shape(
     roi: tuple[slice, slice] | None,
 ) -> tuple[int, int] | None:
     """Helper to get shape from a potentially None ROI."""
+
+    # --- START DEBUG BLOCK ---
+    print(f"\n--- DEBUG [_get_crop_shape]: Called with ROI: {roi}")
     if roi is None:
+        print("--- DEBUG [_get_crop_shape]: ROI is None. Returning None.")
         return None
 
-    # --- START FIX: Validate that ROI slices are not None ---
     y_slice, x_slice = roi
-    if y_slice is None or x_slice is None:
-        raise ValueError(f"Invalid ROI: Contains 'None' slices: {roi}")
-    # --- END FIX ---
+    print(f"--- DEBUG [_get_crop_shape]: y_slice is: {y_slice}")
+    print(f"--- DEBUG [_get_crop_shape]: x_slice is: {x_slice}")
+    # --- END DEBUG BLOCK ---
 
-    return dummy_plane[y_slice, x_slice].shape
+    if y_slice is None or x_slice is None:
+        print(
+            "--- DEBUG [_get_crop_shape]: ERROR - a slice is None. Raising ValueError."
+        )
+        raise ValueError(f"Invalid ROI: Contains 'None' slices: {roi}")
+
+    print("--- DEBUG [_get_crop_shape]: Slicing dummy plane.")
+    shape = dummy_plane[y_slice, x_slice].shape
+    print(f"--- DEBUG [_get_crop_shape]: Got shape {shape}. Returning.")
+    return shape
 
 
 def process_dataset(
@@ -76,13 +88,13 @@ def process_dataset(
     def is_roi_valid(roi: tuple[slice, slice] | None) -> bool:
         """Checks if an ROI is not None and both its slices are not None."""
         # --- DEBUG PRINT ---
-        print(f"--- DEBUG: is_roi_valid checking: {roi}")
+        print(f"--- DEBUG [is_roi_valid]: checking: {roi}")
         if roi is None:
-            print("--- DEBUG: ROI is None, returning False")
+            print("--- DEBUG [is_roi_valid]: ROI is None, returning False")
             return False
         # Check that the tuple contains two slice objects, not None
         is_valid = roi[0] is not None and roi[1] is not None
-        print(f"--- DEBUG: Slices valid? {is_valid}")
+        print(f"--- DEBUG [is_roi_valid]: Slices valid? {is_valid}")
         return is_valid
         # --- END DEBUG ---
 
@@ -137,8 +149,11 @@ def process_dataset(
                 )
 
         dummy_plane = np.zeros((Y, X), dtype=dtype)
+        print("\n--- DEBUG: Calling _get_crop_shape for top_roi... ---")
         top_shape = _get_crop_shape(dummy_plane, top_roi)
+        print("\n--- DEBUG: Calling _get_crop_shape for bottom_roi... ---")
         bottom_shape = _get_crop_shape(dummy_plane, bottom_roi)
+        print("\n--- DEBUG: Returned from _get_crop_shape calls ---")
 
         if top_shape and bottom_shape and (top_shape != bottom_shape):
             raise ValueError(f"ROI shapes do not match: {top_shape} vs {bottom_shape}")
@@ -491,7 +506,7 @@ def run_processing_job(
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
     # --- START: ADDED BLOCK TO CLEANUP TIFF_SERIES_SPLIT_C ---
-    elif output_format == OutputFormat.TIFF_SERIES_SPLIT_T:
+    elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
         print(f"Cleaning old files from {paths.output_dir.name}...")
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
