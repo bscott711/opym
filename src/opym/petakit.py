@@ -189,6 +189,9 @@ def run_llsm_petakit_processing(
         dsr_dir_name: Name for the deskewed+rotated output subdirectory.
         **kwargs: All other processing parameters for PyPetaKit5D.
     """
+    # These need to be defined *before* the try block for the check
+    ds_output_dir = source_dir / ds_dir_name
+    dsr_output_dir = source_dir / dsr_dir_name
     try:
         print(f"--- Setting up PetaKit5D for LLSM: {source_dir.name} ---")
         source_dir = source_dir.resolve()
@@ -210,8 +213,6 @@ def run_llsm_petakit_processing(
         base_name = match.group(1)
 
         # 2. Define output paths
-        ds_output_dir = source_dir / ds_dir_name
-        dsr_output_dir = source_dir / dsr_dir_name
         job_log_dir = source_dir.parent / "job_logs"
         os.makedirs(job_log_dir, exist_ok=True)
 
@@ -229,6 +230,25 @@ def run_llsm_petakit_processing(
             base_name=base_name,
             **kwargs,
         )
+
+        # --- FIX: Verify that the output directory was actually created ---
+        # This check is crucial because PyPetaKit5D may fail without
+        # raising a Python exception.
+        if not dsr_output_dir.is_dir():
+            # Check if the DS (deskew-only) dir was made, for a more specific error
+            if ds_output_dir.is_dir():
+                print(
+                    f"  ⚠️ Warning: Deskew dir '{ds_output_dir.name}' was created, "
+                    f"but rotated dir '{dsr_output_dir.name}' was NOT."
+                )
+                print("   This might indicate an error during the 'rotate' step.")
+
+            raise RuntimeError(
+                f"PyPetaKit5D completed but FAILED to create the output directory: "
+                f"{dsr_output_dir.name}. "
+                "The underlying process likely failed silently."
+            )
+        # --- END FIX ---
 
         print("--- PyPetaKit5D Processing Complete ---")
 
@@ -258,6 +278,7 @@ def run_petakit_processing(
         dsr_dir_name: The name for the deskewed+rotated output subdirectory.
         **kwargs: All other processing parameters for PyPetaKit5D.
     """
+    ctx = None  # Define ctx outside try for broader scope
     try:
         # 1. Get all paths
         print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
@@ -285,6 +306,25 @@ def run_petakit_processing(
             **kwargs,
         )
 
+        # --- FIX: Verify that the output directory was actually created ---
+        # This check is crucial because PyPetaKit5D may fail without
+        # raising a Python exception.
+        if not ctx.dsr_output_dir.is_dir():
+            # Check if the DS (deskew-only) dir was made, for a more specific error
+            if ctx.ds_output_dir.is_dir():
+                print(
+                    f"  ⚠️ Warning: Deskew dir '{ctx.ds_output_dir.name}' was created, "
+                    f"but rotated dir '{ctx.dsr_output_dir.name}' was NOT."
+                )
+                print("   This might indicate an error during the 'rotate' step.")
+
+            raise RuntimeError(
+                f"PyPetaKit5D completed but FAILED to create the output directory: "
+                f"{ctx.dsr_output_dir.name}. "
+                "The underlying process likely failed silently."
+            )
+        # --- END FIX ---
+
         print("--- PyPetaKit5D Processing Complete ---")
 
     except FileNotFoundError as fnfe:
@@ -293,6 +333,9 @@ def run_petakit_processing(
         raise
     except Exception as e:
         print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}")
+        # Add context if we have it
+        if ctx:
+            print(f"  Context: Checking for output in {ctx.dsr_output_dir}")
         raise
 
 
