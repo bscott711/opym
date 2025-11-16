@@ -139,7 +139,7 @@ def process_dataset(
         if rotate_90:
             Y_out, X_out = X_new, Y_new
         else:
-            Y_out, X_out = Y_new, Y_new
+            Y_out, X_out = Y_new, X_new
 
         print(f"Using sanitized base name for output: {sanitized_name}")
 
