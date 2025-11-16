@@ -267,7 +267,7 @@ def process_dataset(
                     plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                     plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                    # --- FINAL REDUNDANT FIX: Check ROIs *inside* the loop ---
+                    # --- This block already has the correct is_roi_valid fix ---
                     if need_top and is_roi_valid(top_roi):
                         t_roi = cast(tuple[slice, slice], top_roi)
                         top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
@@ -316,6 +316,74 @@ def process_dataset(
                     )
             # --- END FIX ---
             print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
+
+        # --- START: ADDED BLOCK TO FIX THE ERROR ---
+        elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
+            # This logic is identical to TIFF_SERIES and contains the
+            # is_roi_valid() fix to prevent the NoneType error.
+            output_stack_shape_3d = (Z, Y_out, X_out)
+            tif_meta = {"axes": "ZYX"}
+
+            for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
+                # Create empty stacks only for the channels we need
+                stacks_to_write = {
+                    c_out: np.zeros(output_stack_shape_3d, dtype=dtype)
+                    for c_out in channels_to_output
+                }
+
+                for z in range(Z):
+                    plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                    plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+
+                    # --- This block has the correct is_roi_valid fix ---
+                    if need_top and is_roi_valid(top_roi):
+                        t_roi = cast(tuple[slice, slice], top_roi)
+                        top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
+                        top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
+                    else:
+                        top_crop_c0 = None
+                        top_crop_c1 = None
+
+                    if need_bottom and is_roi_valid(bottom_roi):
+                        b_roi = cast(tuple[slice, slice], bottom_roi)
+                        bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
+                        bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
+                    else:
+                        bot_crop_c0 = None
+                        bot_crop_c1 = None
+                    # --- End fix ---
+
+                    if rotate_90:
+                        if top_crop_c0 is not None:
+                            top_crop_c0 = np.rot90(cast(np.ndarray, top_crop_c0), k=1)
+                        if top_crop_c1 is not None:
+                            top_crop_c1 = np.rot90(cast(np.ndarray, top_crop_c1), k=1)
+                        if bot_crop_c0 is not None:
+                            bot_crop_c0 = np.rot90(cast(np.ndarray, bot_crop_c0), k=1)
+                        if bot_crop_c1 is not None:
+                            bot_crop_c1 = np.rot90(cast(np.ndarray, bot_crop_c1), k=1)
+
+                    # Assign cropped planes to the correct channel stack
+                    if 0 in channels_to_output:
+                        stacks_to_write[0][z, :, :] = cast(np.ndarray, bot_crop_c0)
+                    if 1 in channels_to_output:
+                        stacks_to_write[1][z, :, :] = cast(np.ndarray, top_crop_c0)
+                    if 2 in channels_to_output:
+                        stacks_to_write[2][z, :, :] = cast(np.ndarray, top_crop_c1)
+                    if 3 in channels_to_output:
+                        stacks_to_write[3][z, :, :] = cast(np.ndarray, bot_crop_c1)
+
+                # Write the completed 3D stacks to TIFF files
+                for c_out, stack_data in stacks_to_write.items():
+                    out_name = f"{sanitized_name}_C{c_out}_T{t:03d}.tif"
+                    tifffile.imwrite(
+                        output_dir / out_name,
+                        stack_data,
+                        imagej=True,
+                        metadata=tif_meta,
+                    )
+            print(f"✅ Saved {T * C_new} TIFF files to {output_dir.name}")
+        # --- END: ADDED BLOCK ---
 
         else:
             raise ValueError(f"Unknown output_format: {output_format}")
@@ -374,6 +442,12 @@ def run_processing_job(
         print(f"Cleaning old files from {paths.output_dir.name}...")
         for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
             os.remove(f)
+    # --- START: ADDED BLOCK TO CLEANUP TIFF_SERIES_SPLIT_C ---
+    elif output_format == OutputFormat.TIFF_SERIES_SPLIT_C:
+        print(f"Cleaning old files from {paths.output_dir.name}...")
+        for f in paths.output_dir.glob(f"{paths.sanitized_name}_C*_T*.tif"):
+            os.remove(f)
+    # --- END: ADDED BLOCK ---
 
     print(f"Format selected: {output_format.value}")
     print(f"Output Directory: {paths.output_dir.name}")
