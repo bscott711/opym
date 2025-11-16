@@ -32,7 +32,7 @@ def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
             spim_settings = json.loads(spim_settings_str)
             backup_interval_sec = spim_settings.get("timepointInterval", 6.0)
         except Exception:
-            pass  # Keep default
+            pass  # nosec B110
 
         for t in range(num_timepoints):
             # Key is "FrameKey-T-Z-C". We want the start of each
@@ -75,6 +75,7 @@ def create_processing_log(
     top_roi: tuple[slice, slice],
     bottom_roi: tuple[slice, slice],
     output_format: OutputFormat,
+    rotate_90: bool = False,
 ):
     """Writes a JSON log file with all processing parameters."""
 
@@ -83,6 +84,7 @@ def create_processing_log(
     log_data = {
         "processing_version": f"3.0-format-{output_format.value}",
         "processing_date": datetime.now().isoformat(),
+        "rotate_90_degrees": rotate_90,
         "source_base_file": str(paths.base_file),
         "source_metadata_file": str(paths.metadata_file),
         "rois": {

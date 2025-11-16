@@ -10,8 +10,6 @@ import inspect
 import json
 import os
 import re
-import sys
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,29 +51,28 @@ def get_petakit_context(
     if not processed_dir.exists():
         raise FileNotFoundError(f"Processed TIFF directory not found: {processed_dir}")
 
-    # 1. The base data dir is one level up
     base_data_dir = processed_dir.parent
 
-    # 2. Find the opym processing log *inside* the provided path
+    # Find the opym processing log *inside* the provided path
     log_file = next(processed_dir.glob("*_processing_log.json"), None)
     if log_file:
         base_name = log_file.stem.replace("_processing_log", "")
     else:
-        # --- START OF FIX: Robust base_name finding ---
-        first_file = next(processed_dir.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None)
+        # Fallback: find the first data file and parse its name
+        # --- MODIFICATION: Update glob pattern to new format ---
+        first_file = next(processed_dir.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
         if not first_file:
             raise FileNotFoundError(
                 "Could not find a '*_processing_log.json' file or any "
-                "'*_T..._C..tif' file to determine base_name."
+                "'*_C..._T..tif' file to determine base_name."
             )
-        # Use regex to parse the base name
-        match = re.search(r"^(.*?)_T\d{3}_C\d\.tif$", first_file.name)
+        # --- MODIFICATION: Update regex to new format ---
+        match = re.search(r"^(.*?)_C\d_T\d{3}\.tif$", first_file.name)
         if not match:
             raise ValueError(f"Could not parse base name from file: {first_file.name}")
         base_name = match.group(1)
-        # --- END OF FIX ---
 
-    # 4. Define all output paths
+    # Define all output paths
     job_log_dir = base_data_dir / "job_logs"
     # PyPetaKit outputs are stored *inside* the processed dir
     ds_output_dir = processed_dir / ds_dir_name
@@ -92,18 +89,17 @@ def get_petakit_context(
     )
 
 
-# --- NEW: LLSM-specific processing function ---
-def run_llsm_petakit_processing(
-    source_dir: Path,
+def _run_petakit_base(
+    input_dir: Path,
+    output_ds_dir: Path,
+    output_dsr_dir: Path,
+    base_name: str,
     *,
-    # --- Custom Output Dirs ---
-    ds_dir_name: str = "DS",
-    dsr_dir_name: str = "DSR",
-    # --- Physical Parameters ---
+    # Physical Parameters
     xy_pixel_size: float = 0.108,
     z_step_um: float = 1.0,
     sheet_angle_deg: float = 21.72,
-    # --- Reader/Writer Flags ---
+    # Reader/Writer Flags
     large_file: bool = False,
     dsr_combined: bool = False,
     zarr_file: bool = False,
@@ -111,20 +107,20 @@ def run_llsm_petakit_processing(
     save_16bit: bool = True,
     save_3d_stack: bool = True,
     save_mip: bool = True,
-    # --- MCC Logic Flags ---
+    # MCC Logic Flags
     objective_scan: bool = False,
     reverse_z: bool = True,
-    # --- Processing ---
+    # Processing
     deskew: bool = True,
     rotate: bool = True,
     interp_method: str = "linear",
     block_size: list[int] | None = None,
-    # --- Cluster & Config ---
+    # Cluster & Config
     parse_cluster: bool = False,
-    master_compute: bool = True,
+    master_compute: bool = False,  # <-- CHANGED from True
     config_file: str = "",
-    mcc_mode: bool = True,
-    # --- Redundant/Unused PyPetaKit5D args ---
+    mcc_mode: bool = False,  # <-- CHANGED from True
+    # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
     const_offset: float = 1.0,
@@ -132,9 +128,7 @@ def run_llsm_petakit_processing(
     background_paths: list[str] | None = None,
     bk_removal: bool = False,
 ) -> None:
-    """
-    Runs the PyPetaKit5D wrapper *directly* on an LLSM dataset.
-    """
+    """Internal base function that runs the PyPetaKit5D wrapper."""
     if block_size is None:
         block_size = [256, 256, 256]
     if ff_image_paths is None:
@@ -142,6 +136,59 @@ def run_llsm_petakit_processing(
     if background_paths is None:
         background_paths = [""]
 
+    # Run the PyPetaKit5D wrapper
+    ppk.XR_deskew_rotate_data_wrapper(
+        [str(input_dir)],
+        deskew=deskew,
+        rotate=rotate,
+        DSRCombined=dsr_combined,
+        xyPixelSize=xy_pixel_size,
+        dz=z_step_um,
+        skewAngle=sheet_angle_deg,
+        objectiveScan=objective_scan,
+        reverse=reverse_z,
+        channelPatterns=[base_name],
+        # Define separate output directories
+        DSDirName=output_ds_dir.name,
+        DSRDirName=output_dsr_dir.name,
+        # Pass through all other flags
+        FFCorrection=ff_correction,
+        lowerLimit=lower_limit,
+        constOffset=const_offset,
+        FFImagePaths=ff_image_paths,
+        backgroundPaths=background_paths,
+        largeFile=large_file,
+        zarrFile=zarr_file,
+        saveZarr=save_zarr,
+        blockSize=block_size,
+        save16bit=save_16bit,
+        parseCluster=parse_cluster,
+        masterCompute=master_compute,
+        configFile=config_file,
+        mccMode=mcc_mode,
+        BKRemoval=bk_removal,
+        save3DStack=save_3d_stack,
+        saveMIP=save_mip,
+        interpMethod=interp_method,
+    )
+
+
+def run_llsm_petakit_processing(
+    source_dir: Path,
+    *,
+    ds_dir_name: str = "DS",
+    dsr_dir_name: str = "DSR",
+    **kwargs,
+) -> None:
+    """
+    Runs the PyPetaKit5D wrapper *directly* on an LLSM dataset.
+
+    Args:
+        source_dir: Path to the raw LLSM TIFF directory.
+        ds_dir_name: Name for the deskewed output subdirectory.
+        dsr_dir_name: Name for the deskewed+rotated output subdirectory.
+        **kwargs: All other processing parameters for PyPetaKit5D.
+    """
     try:
         print(f"--- Setting up PetaKit5D for LLSM: {source_dir.name} ---")
         source_dir = source_dir.resolve()
@@ -163,11 +210,8 @@ def run_llsm_petakit_processing(
         base_name = match.group(1)
 
         # 2. Define output paths
-        # Outputs are stored *inside* the source dir (matches OPM logic)
         ds_output_dir = source_dir / ds_dir_name
         dsr_output_dir = source_dir / dsr_dir_name
-
-        # Create a job log directory one level up
         job_log_dir = source_dir.parent / "job_logs"
         os.makedirs(job_log_dir, exist_ok=True)
 
@@ -177,114 +221,43 @@ def run_llsm_petakit_processing(
         print(f"  Deskew output: {ds_output_dir.name}")
         print(f"  Rotate output: {dsr_output_dir.name}")
 
-        # 3. Run the PyPetaKit5D wrapper
-        ppk.XR_deskew_rotate_data_wrapper(
-            [str(source_dir)],
-            deskew=deskew,
-            rotate=rotate,
-            DSRCombined=dsr_combined,
-            xyPixelSize=xy_pixel_size,
-            dz=z_step_um,
-            skewAngle=sheet_angle_deg,
-            objectiveScan=objective_scan,
-            reverse=reverse_z,
-            channelPatterns=[base_name],  # Key difference for LLSM
-            # Define separate output directories
-            DSDirName=ds_output_dir.name,
-            DSRDirName=dsr_output_dir.name,
-            # Pass through all other flags
-            FFCorrection=ff_correction,
-            lowerLimit=lower_limit,
-            constOffset=const_offset,
-            FFImagePaths=ff_image_paths,
-            backgroundPaths=background_paths,
-            largeFile=large_file,
-            zarrFile=zarr_file,
-            saveZarr=save_zarr,
-            blockSize=block_size,
-            save16bit=save_16bit,
-            parseCluster=parse_cluster,
-            masterCompute=master_compute,
-            configFile=config_file,
-            mccMode=mcc_mode,
-            BKRemoval=bk_removal,
-            save3DStack=save_3d_stack,
-            saveMIP=save_mip,
-            interpMethod=interp_method,
+        # 3. Run the base processor
+        _run_petakit_base(
+            input_dir=source_dir,
+            output_ds_dir=ds_output_dir,
+            output_dsr_dir=dsr_output_dir,
+            base_name=base_name,
+            **kwargs,
         )
 
         print("--- PyPetaKit5D Processing Complete ---")
 
     except FileNotFoundError as fnfe:
-        print(f"\n❌ SETUP ERROR: {fnfe}", file=sys.stderr)
-        print("Ensure the input path and files exist.", file=sys.stderr)
+        print(f"\n❌ SETUP ERROR: {fnfe}")
+        print("Ensure the input path and files exist.")
         raise
     except Exception as e:
-        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}")
         raise
-
-
-# --- END NEW ---
 
 
 def run_petakit_processing(
     processed_dir_path: Path,
     *,
-    # --- Custom Output Dirs ---
     ds_dir_name: str = "DS",
     dsr_dir_name: str = "DSR",
-    # --- Physical Parameters ---
-    xy_pixel_size: float = 0.108,
-    z_step_um: float = 1.0,
-    sheet_angle_deg: float = 21.72,
-    # --- Reader/Writer Flags ---
-    large_file: bool = False,
-    dsr_combined: bool = False,
-    zarr_file: bool = False,
-    save_zarr: bool = False,
-    save_16bit: bool = True,
-    save_3d_stack: bool = True,
-    save_mip: bool = True,
-    # --- MCC Logic Flags ---
-    objective_scan: bool = False,
-    reverse_z: bool = True,
-    # --- Processing ---
-    deskew: bool = True,
-    rotate: bool = True,
-    interp_method: str = "linear",
-    block_size: list[int] | None = None,
-    # --- Cluster & Config ---
-    parse_cluster: bool = False,
-    master_compute: bool = True,
-    config_file: str = "",
-    mcc_mode: bool = True,
-    # --- Redundant/Unused PyPetaKit5D args ---
-    ff_correction: bool = False,
-    lower_limit: float = 0.4,
-    const_offset: float = 1.0,
-    ff_image_paths: list[str] | None = None,
-    background_paths: list[str] | None = None,
-    bk_removal: bool = False,
+    **kwargs,
 ) -> None:
     """
-    (Base function) Runs the PyPetaKit5D deskew/rotate wrapper on
-    an 'opym' processed TIFF series.
+    Runs the PyPetaKit5D wrapper on an 'opym' processed OPM TIFF series.
 
     Args:
         processed_dir_path: The path to the processed TIFF directory
                             (e.g., '.../processed_tiff_series_split').
         ds_dir_name: The name for the deskewed output subdirectory.
         dsr_dir_name: The name for the deskewed+rotated output subdirectory.
-        **kwargs: See function signature for all processing options.
+        **kwargs: All other processing parameters for PyPetaKit5D.
     """
-    if block_size is None:
-        block_size = [256, 256, 256]
-    if ff_image_paths is None:
-        ff_image_paths = [""]
-    if background_paths is None:
-        background_paths = [""]
-
     try:
         # 1. Get all paths
         print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
@@ -303,51 +276,23 @@ def run_petakit_processing(
         print(f"  Deskew output: {ctx.ds_output_dir.name}")
         print(f"  Rotate output: {ctx.dsr_output_dir.name}")
 
-        # 3. Run the PyPetaKit5D wrapper
-        ppk.XR_deskew_rotate_data_wrapper(
-            [str(ctx.processed_dir)],
-            deskew=deskew,
-            rotate=rotate,
-            DSRCombined=dsr_combined,
-            xyPixelSize=xy_pixel_size,
-            dz=z_step_um,
-            skewAngle=sheet_angle_deg,
-            objectiveScan=objective_scan,
-            reverse=reverse_z,
-            channelPatterns=[ctx.base_name],
-            # Define separate output directories
-            DSDirName=ctx.ds_output_dir.name,
-            DSRDirName=ctx.dsr_output_dir.name,
-            # Pass through all other flags
-            FFCorrection=ff_correction,
-            lowerLimit=lower_limit,
-            constOffset=const_offset,
-            FFImagePaths=ff_image_paths,
-            backgroundPaths=background_paths,
-            largeFile=large_file,
-            zarrFile=zarr_file,
-            saveZarr=save_zarr,
-            blockSize=block_size,
-            save16bit=save_16bit,
-            parseCluster=parse_cluster,
-            masterCompute=master_compute,
-            configFile=config_file,
-            mccMode=mcc_mode,
-            BKRemoval=bk_removal,
-            save3DStack=save_3d_stack,
-            saveMIP=save_mip,
-            interpMethod=interp_method,
+        # 3. Run the base processor
+        _run_petakit_base(
+            input_dir=ctx.processed_dir,
+            output_ds_dir=ctx.ds_output_dir,
+            output_dsr_dir=ctx.dsr_output_dir,
+            base_name=ctx.base_name,
+            **kwargs,
         )
 
         print("--- PyPetaKit5D Processing Complete ---")
 
     except FileNotFoundError as fnfe:
-        print(f"\n❌ SETUP ERROR: {fnfe}", file=sys.stderr)
-        print("Ensure the input path and files exist.", file=sys.stderr)
+        print(f"\n❌ SETUP ERROR: {fnfe}")
+        print("Ensure the input path and files exist.")
         raise
     except Exception as e:
-        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}")
         raise
 
 
@@ -378,7 +323,8 @@ def run_petakit_from_config(
         print(f"❌ ERROR: Could not parse JSON config file: {e}")
         raise
 
-    # Get all valid argument names from the base function
+    # Get all valid argument names from the base function's signature
+    # (The signature of the wrapper is what matters here)
     sig = inspect.signature(run_petakit_processing)
     valid_keys = {p.name for p in sig.parameters.values()}
 

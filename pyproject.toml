@@ -6,10 +6,11 @@ build-backend = "hatchling.build"
 # --- Core Project Metadata ---
 [project]
 name = "opym"
-version = "0.2.0"
+version = "0.2.1-dev1"
 description = "A pre-processor for OPM data to crop and split channels for pypetakit5d."
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }
+
 requires-python = ">=3.10"
 authors = [
     { name = "Brandon Scott", email = "brandon.scott@sdsmt.edu" },
@@ -20,6 +21,19 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
+
+# Keywords for discoverability on PyPI
+keywords = [
+    "microscopy",
+    "opm",
+    "llsm",
+    "bioimaging",
+    "image-processing",
+    "tiff",
+    "zarr",
+    "pypetakit",
+]
+
 dependencies = [
     "numpy",
     "tifffile",
@@ -31,20 +45,33 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Development dependencies, installed with `uv pip install -e .[dev]`
-dev = ["ruff"]
+# Install with `uv pip install -e .[dev]`
+dev = [
+    "bandit",
+    "mypy",
+    "pre-commit",
+    "pytest",
+    "ruff",
+]
 
-# --- NEW: Dependencies for the optional Jupyter viewers ---
+# Dependencies for the optional Jupyter viewers
+# Install with `uv pip install -e .[viewer]`
 viewer = [
     "ipywidgets",
     "matplotlib",
     "ipyfilechooser",
-    "ipython"
+    "ipython",
 ]
 
 # --- Entry Points & URLs ---
 [project.scripts]
 opym = "opym.cli:main"
+
+# URLs for the PyPI sidebar
+[project.urls]
+Homepage = "https://github.com/bscott711/opym" # Example URL
+Repository = "https://github.com/bscott711/opym" # Example URL
+Bug-Tracker = "https://github.com/bscott711/opym/issues" # Example URL
 
 # --- Tool Configuration ---
 [tool.hatch.build.targets.wheel]

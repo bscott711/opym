@@ -16,14 +16,14 @@ def load_llsm_tiff_series(directory: Path):
     """
     Parses a directory of LLSM TIFFs and returns viewer parameters.
 
-    This function finds all files, parses T/C/Z limits, and returns
-    a (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name) tuple.
+    Returns a tuple of:
+    (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name)
     """
     print("Loading LLSM TIFF series...")
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # --- 1. Parse T, C, and Z limits from files ---
+    # Parse T, C, and Z limits from files
     t_vals = set()
     c_vals = set()
     file_map = {}  # Dictionary to map (t, c) -> file_path
@@ -59,7 +59,7 @@ def load_llsm_tiff_series(directory: Path):
 
     print(f"Found base name: {base_name}")
 
-    # --- 2. Get min/max values ---
+    # Get min/max values
     T_min = min(t_vals)
     T_max = max(t_vals)
     C_min = min(c_vals)
@@ -74,7 +74,6 @@ def load_llsm_tiff_series(directory: Path):
         f"Data shape: T={T_min}-{T_max}, Z={Z_max + 1}, C={C_min}-{C_max}, Y={Y}, X={X}"
     )
 
-    # --- 3. Caching Function (for speed) ---
     @functools.lru_cache(maxsize=8)
     def get_stack(t, c):
         """Loads a 3D ZYX stack for a given T and C."""
@@ -86,16 +85,12 @@ def load_llsm_tiff_series(directory: Path):
 
     print("✅ LLSM Data loaded.")
 
-    # --- 4. Return all parameters ---
     return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name
 
 
 def load_tiff_series(directory: Path):
     """
     Parses a directory of processed OPM TIFFs and returns viewer parameters.
-
-    This function finds all files, parses T/C/Z limits, and returns
-    a (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name) tuple.
 
     Args:
         directory: The Path object pointing to the processed_tiff_series_split
@@ -117,48 +112,44 @@ def load_tiff_series(directory: Path):
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # --- START OF FIX: Robust base_name finding ---
-    # Find any file matching the pattern, not just T0/C0
-    first_file = next(directory.glob("*_T[0-9][0-9][0-9]_C[0-9].tif"), None)
+    # --- MODIFICATION: Find file with new C..._T... format ---
+    first_file = next(directory.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
     if not first_file:
         raise FileNotFoundError(
-            f"No processed TIFF files (e.g., '*_T000_C0.tif') found in {directory}"
+            f"No processed TIFF files (e.g., '*_C0_T000.tif') found in {directory}"
         )
 
-    # Use regex to parse the base name
-    file_pattern_re = re.compile(r"^(.*?)_T\d{3}_C\d\.tif$")
+    # --- MODIFICATION: Use regex to parse base name from new format ---
+    file_pattern_re = re.compile(r"^(.*?)_C\d_T\d{3}\.tif$")
     match = file_pattern_re.match(first_file.name)
     if not match:
         raise ValueError(f"Could not parse base name from file: {first_file.name}")
 
     BASE_NAME = match.group(1)
-    # --- END OF FIX ---
-
     print(f"Found base name: {BASE_NAME}")
 
-    # --- 2. Parse T, C, and Z limits from files ---
+    # Parse T, C, and Z limits from files
     t_vals = set()
     c_vals = set()
-    # Use the parsed BASE_NAME for the pattern
-    file_pattern = re.compile(f"{re.escape(BASE_NAME)}_T(\\d+)_C(\\d+).tif")
+    # --- MODIFICATION: Use regex for new C..._T... format ---
+    file_pattern = re.compile(f"{re.escape(BASE_NAME)}_C(\\d+)_T(\\d+).tif")
 
-    for f in directory.glob(f"{BASE_NAME}_T*_C*.tif"):
+    for f in directory.glob(f"{BASE_NAME}_C*_T*.tif"):
         match = file_pattern.match(f.name)
         if match:
-            t_vals.add(int(match.group(1)))
-            c_vals.add(int(match.group(2)))
+            # --- MODIFICATION: Group 1 is C, Group 2 is T ---
+            c_vals.add(int(match.group(1)))
+            t_vals.add(int(match.group(2)))
 
     if not t_vals or not c_vals:
-        raise Exception("Could not parse T or C values from filenames.")
+        raise FileNotFoundError("Could not parse T or C values from filenames.")
 
-    # --- MODIFIED: Get min and max ---
     T_min = min(t_vals)
     T_max = max(t_vals)
     C_min = min(c_vals)
     C_max = max(c_vals)
-    # --- END MODIFICATION ---
 
-    # Use the first_file we already found
+    # Use the first_file we already found to get shape
     first_stack = tifffile.imread(first_file)
     Z_max, Y, X = first_stack.shape
     Z_max -= 1  # Max index is shape - 1
@@ -167,11 +158,11 @@ def load_tiff_series(directory: Path):
         f"Data shape: T={T_min}-{T_max}, Z={Z_max + 1}, C={C_min}-{C_max}, Y={Y}, X={X}"
     )
 
-    # --- 3. Caching Function (for speed) ---
     @functools.lru_cache(maxsize=8)
     def get_stack(t, c):
         """Loads a 3D ZYX stack for a given T and C."""
-        file_path = directory / f"{BASE_NAME}_T{t:03d}_C{c:d}.tif"
+        # --- MODIFICATION: Use new file naming format ---
+        file_path = directory / f"{BASE_NAME}_C{c:d}_T{t:03d}.tif"
         if not file_path.exists():
             print(f"Warning: File not found {file_path.name}")
             return np.zeros((Z_max + 1, Y, X), dtype=first_stack.dtype)
@@ -179,5 +170,4 @@ def load_tiff_series(directory: Path):
 
     print("✅ OPM Data loaded.")
 
-    # --- MODIFIED: Return min/max and base_name ---
     return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, BASE_NAME

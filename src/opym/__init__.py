@@ -17,17 +17,23 @@ from .petakit import (
     run_petakit_from_config,
     run_petakit_processing,
 )
+
+# --- MODIFIED: Import from new roi_utils module ---
+from .roi_utils import (
+    align_rois,
+    load_rois_from_log,
+    save_rois_to_log,
+)
 from .utils import (
     DerivedPaths,
     MicroscopyDataType,
     OutputFormat,
-    align_rois,
     derive_paths,
     detect_microscopy_data_type,
-    load_rois_from_log,
     parse_roi_string,
-    save_rois_to_log,
 )
+
+# --- END MODIFICATION ---
 from .viewer import (
     composite_viewer,
     create_mip,
@@ -47,13 +53,13 @@ __all__ = [
     "DerivedPaths",
     "save_rois_to_log",
     "load_rois_from_log",
+    "align_rois",
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",
     "load_llsm_tiff_series",
     "create_mip",
     "interactive_roi_selector",
-    "align_rois",
     "visualize_alignment",
     "PetaKitContext",
     "get_petakit_context",
