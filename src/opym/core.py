@@ -194,7 +194,8 @@ def process_dataset(
                         plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
                         plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
 
-                        if need_top:
+                        # --- START FIX: Add is_roi_valid check to ZARR block ---
+                        if need_top and is_roi_valid(top_roi):
                             t_roi = cast(tuple[slice, slice], top_roi)
                             top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
                             top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
@@ -202,13 +203,14 @@ def process_dataset(
                             top_crop_c0 = None
                             top_crop_c1 = None
 
-                        if need_bottom:
+                        if need_bottom and is_roi_valid(bottom_roi):
                             b_roi = cast(tuple[slice, slice], bottom_roi)
                             bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
                             bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
                         else:
                             bot_crop_c0 = None
                             bot_crop_c1 = None
+                        # --- END FIX ---
 
                         if rotate_90:
                             if top_crop_c0 is not None:
