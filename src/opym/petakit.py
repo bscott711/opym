@@ -271,7 +271,9 @@ def _run_petakit_base(
 
     # 3. Build arguments
     # Add the first positional argument (input dir)
-    cmd.append(f"{{'{str(input_dir)}'}}")
+    cmd.append(_to_matlab_str([str(input_dir)]))
+    if mcc_mode:
+        master_compute = True
 
     # Collect all other parameters
     matlab_params = {
