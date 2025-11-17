@@ -28,39 +28,27 @@ def create_mip(
         - mip_data (np.ndarray): The 2D (Y, X) MIP array.
         - vmin (float): 1st percentile for contrast.
         - vmax (float): 99.9th percentile for contrast.
-        - lazy_data (zarr.Array): The opened 5D zarr array.
+        - lazy_data (zarr.Array): The opened zarr array (4D or 5D).
         - t_max (int): The maximum T index.
     """
     file_path = Path(file_path)
     print(f"Opening {file_path.name} as lazy Zarr array...")
 
     try:
-        # --- NEW: Handle 4D (single timepoint) vs 5D data ---
+        # --- NEW: Handle 4D (single timepoint) vs 5D data (STREAM-SAFE) ---
         store = tifffile.TiffFile(file_path).series[0].aszarr()
-        # --- PYLANCE FIX: Use open_array to guarantee an Array type ---
-        zarr_reader: zarr.Array = zarr.open_array(store, mode="r")
+        lazy_data: zarr.Array = zarr.open_array(store, mode="r")
 
-        shape = zarr_reader.shape
-        ndim = zarr_reader.ndim
+        shape = lazy_data.shape
+        ndim = lazy_data.ndim
 
         if ndim == 4:  # ZCYX
             print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
-            print("  Loading 4D data into memory to add T dimension...")
-
-            # Load the 4D data into memory
-            numpy_4d_data = cast(np.ndarray, zarr_reader[:])
-
-            # Reshape to 5D (add singleton T dimension)
-            new_shape = (1, *shape)
-            numpy_5d_data = numpy_4d_data.reshape(new_shape)
-
-            # Create a new, in-memory Zarr array
-            lazy_data: zarr.Array = zarr.array(numpy_5d_data)
-            print(f"  In-memory 5D array shape: {lazy_data.shape}")
-
+            T = 1
+            Z, C, Y, X = shape
         elif ndim == 5:  # TZCXY
-            # Use the 5D file-backed Zarr array directly
-            lazy_data = zarr_reader
+            print(f"  Info: 5D data detected (shape {shape}).")
+            T, Z, C, Y, X = shape
         else:
             # Raise error for 3D or 6D+ data
             raise ValueError(
@@ -73,8 +61,7 @@ def create_mip(
         print(f"  Details: {e}")
         raise
 
-    # Get the (now guaranteed 5D) shape
-    T, Z, C, Y, X = lazy_data.shape
+    # This print statement will now show the *true* shape (4D or 5D)
     print(f"Full data shape: {lazy_data.shape}")
 
     if t_index >= T:
@@ -83,13 +70,19 @@ def create_mip(
 
     print(f"Selecting data for Max Projection: (T={t_index})")
 
-    # Use cast to inform Pylance of the type
-    stack_to_project = cast(zarr.Array, lazy_data[t_index, :, :, :, :])
+    # --- NEW: Select correct indexing based on dimensions ---
+    # In both cases, stack_to_project becomes a 4D (Z, C, Y, X) array
+    if ndim == 5:
+        stack_to_project = cast(zarr.Array, lazy_data[t_index, :, :, :, :])
+    else:  # ndim == 4
+        # T is 1, so t_index is 0. The array is already (Z, C, Y, X)
+        stack_to_project = lazy_data
+    # --- END NEW ---
 
     total_planes = Z * C
     print(f"Calculating Max Projection from {total_planes} (Z*C) planes...")
 
-    # Use np.asarray() to explicitly convert slice to ndarray
+    # Indexing [0, 0, :, :] works on the 4D stack_to_project
     plane_0: np.ndarray = np.asarray(stack_to_project[0, 0, :, :])
     z_mip = np.copy(plane_0)
 
@@ -99,7 +92,7 @@ def create_mip(
                 if z == 0 and c == 0:
                     pbar.update(1)
                     continue
-
+                # Indexing [z, c, :, :] also works on the 4D stack_to_project
                 plane: np.ndarray = np.asarray(stack_to_project[z, c, :, :])
                 np.maximum(z_mip, plane, out=z_mip)
                 pbar.update(1)
@@ -114,4 +107,5 @@ def create_mip(
         vmin, vmax = 0, 1
 
     print(f"  MIP display range (vmin, vmax): ({vmin:.0f}, {vmax:.0f})")
+    # Return the original 4D or 5D array, T-1 is the max index
     return z_mip, float(vmin), float(vmax), lazy_data, T - 1
