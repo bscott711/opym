@@ -310,7 +310,7 @@ def _run_petakit_base(
 
     # Add all key-value pairs to the command
     for key, val in matlab_params.items():
-        cmd.append(f"'{key}'")
+        cmd.append(key)  # <-- FIX: Remove the f"'{key}'" quotes
         cmd.append(_to_matlab_str(val))
 
     # 4. Set the environment for the subprocess
