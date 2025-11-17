@@ -10,6 +10,8 @@ import inspect
 import json
 import os
 import re
+import subprocess  # nosec B404
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,6 +135,25 @@ def get_petakit_context(
     )
 
 
+# --- NEW: Helper function to convert Python types to MATLAB CLI strings ---
+def _to_matlab_str(val: object) -> str:
+    """Converts a Python type to its MATLAB string representation."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, int | float):
+        return str(val)
+    if isinstance(val, str | Path):
+        return f"'{val}'"
+    if isinstance(val, list):
+        if not val:
+            return "''"  # Use empty string for empty lists
+        # Convert list to MATLAB cell array string
+        return "{" + ",".join([_to_matlab_str(v) for v in val]) + "}"
+    if val is None:
+        return "''"  # Use empty string for None
+    return str(val)  # Fallback
+
+
 def _run_petakit_base(
     input_dir: Path,
     output_ds_dir: Path,
@@ -161,9 +182,9 @@ def _run_petakit_base(
     block_size: list[int] | None = None,
     # Cluster & Config
     parse_cluster: bool = False,
-    master_compute: bool = False,  # <-- CHANGED from True
+    master_compute: bool = False,
     config_file: str = "",
-    mcc_mode: bool = False,  # <-- CHANGED from True
+    mcc_mode: bool = False,
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
@@ -172,7 +193,14 @@ def _run_petakit_base(
     background_paths: list[str] | None = None,
     bk_removal: bool = False,
 ) -> None:
-    """Internal base function that runs the PyPetaKit5D wrapper."""
+    """
+    Internal base function that runs the PyPetaKit5D wrapper.
+
+    --- MODIFIED ---
+    If mcc_mode is True, this function bypasses the buggy
+    ppk.XR_deskew_rotate_data_wrapper and calls the mccMaster
+    script directly using subprocess, with the correct environment.
+    """
     if block_size is None:
         block_size = [256, 256, 256]
     if ff_image_paths is None:
@@ -180,41 +208,137 @@ def _run_petakit_base(
     if background_paths is None:
         background_paths = [""]
 
-    # Run the PyPetaKit5D wrapper
-    ppk.XR_deskew_rotate_data_wrapper(
-        [str(input_dir)],
-        deskew=deskew,
-        rotate=rotate,
-        DSRCombined=dsr_combined,
-        xyPixelSize=xy_pixel_size,
-        dz=z_step_um,
-        skewAngle=sheet_angle_deg,
-        objectiveScan=objective_scan,
-        reverse=reverse_z,
-        channelPatterns=[base_name],
-        # Define separate output directories
-        DSDirName=output_ds_dir.name,
-        DSRDirName=output_dsr_dir.name,
-        # Pass through all other flags
-        FFCorrection=ff_correction,
-        lowerLimit=lower_limit,
-        constOffset=const_offset,
-        FFImagePaths=ff_image_paths,
-        backgroundPaths=background_paths,
-        largeFile=large_file,
-        zarrFile=zarr_file,
-        saveZarr=save_zarr,
-        blockSize=block_size,
-        save16bit=save_16bit,
-        parseCluster=parse_cluster,
-        masterCompute=master_compute,
-        configFile=config_file,
-        mccMode=mcc_mode,
-        BKRemoval=bk_removal,
-        save3DStack=save_3d_stack,
-        saveMIP=save_mip,
-        interpMethod=interp_method,
-    )
+    # --- NEW: MCC/HPC BYPASS LOGIC ---
+    if not mcc_mode or not config_file:
+        print("--- [opym.petakit] Running in standard (non-MCC) Python mode. ---")
+        # Fallback to the old, buggy way (for local, non-mcc runs)
+        ppk.XR_deskew_rotate_data_wrapper(
+            [str(input_dir)],
+            deskew=deskew,
+            rotate=rotate,
+            DSRCombined=dsr_combined,
+            xyPixelSize=xy_pixel_size,
+            dz=z_step_um,
+            skewAngle=sheet_angle_deg,
+            objectiveScan=objective_scan,
+            reverse=reverse_z,
+            channelPatterns=[base_name],
+            DSDirName=output_ds_dir.name,
+            DSRDirName=output_dsr_dir.name,
+            FFCorrection=ff_correction,
+            lowerLimit=lower_limit,
+            constOffset=const_offset,
+            FFImagePaths=ff_image_paths,
+            backgroundPaths=background_paths,
+            largeFile=large_file,
+            zarrFile=zarr_file,
+            saveZarr=save_zarr,
+            blockSize=block_size,
+            save16bit=save_16bit,
+            parseCluster=parse_cluster,
+            masterCompute=master_compute,
+            configFile=config_file,
+            mccMode=mcc_mode,
+            BKRemoval=bk_removal,
+            save3DStack=save_3d_stack,
+            saveMIP=save_mip,
+            interpMethod=interp_method,
+        )
+        return
+
+    # --- [opym.petakit] Running in HPC/MCC Bypass Mode. ---
+    print("--- [opym.petakit] Running in HPC/MCC Bypass Mode. ---")
+
+    # 1. Load config file
+    config_path = Path(config_file)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with config_path.open("r") as f:
+        config_data = json.load(f)
+
+    mcc_script = config_data.get("MCCMasterStr")
+    mcr_path = config_data.get("MCRParam")
+
+    if not mcc_script or not mcr_path:
+        raise ValueError("MCCMasterStr or MCRParam missing from config file.")
+
+    # 2. Build the command
+    cmd = [
+        mcc_script,  # Path to run_mccMaster.sh
+        mcr_path,  # Path to MATLAB Runtime
+        "XR_deskew_rotate_data_wrapper",  # Function to call
+    ]
+
+    # 3. Build arguments
+    # Add the first positional argument (input dir)
+    cmd.append(f"{{'{str(input_dir)}'}}")
+
+    # Collect all other parameters
+    matlab_params = {
+        "deskew": deskew,
+        "rotate": rotate,
+        "DSRCombined": dsr_combined,
+        "xyPixelSize": xy_pixel_size,
+        "dz": z_step_um,
+        "skewAngle": sheet_angle_deg,
+        "objectiveScan": objective_scan,
+        "reverse": reverse_z,
+        "channelPatterns": [base_name],
+        "DSDirName": output_ds_dir.name,
+        "DSRDirName": output_dsr_dir.name,
+        "FFCorrection": ff_correction,
+        "lowerLimit": lower_limit,
+        "constOffset": const_offset,
+        "FFImagePaths": ff_image_paths,
+        "backgroundPaths": background_paths,
+        "largeFile": large_file,
+        "zarrFile": zarr_file,
+        "saveZarr": save_zarr,
+        "blockSize": block_size,
+        "save16bit": save_16bit,
+        "parseCluster": parse_cluster,
+        "masterCompute": master_compute,
+        "configFile": config_file,
+        "mccMode": mcc_mode,
+        "BKRemoval": bk_removal,
+        "save3DStack": save_3d_stack,
+        "saveMIP": save_mip,
+        "interpMethod": interp_method,
+    }
+
+    # Add all key-value pairs to the command
+    for key, val in matlab_params.items():
+        cmd.append(f"'{key}'")
+        cmd.append(_to_matlab_str(val))
+
+    # 4. Set the environment for the subprocess
+    env = os.environ.copy()
+    matlab_root = mcr_path
+    mcr_paths = [
+        f"{matlab_root}/runtime/glnxa64",
+        f"{matlab_root}/bin/glnxa64",
+        f"{matlab_root}/sys/os/glnxa64",
+        f"{matlab_root}/sys/opengl/lib/glnxa64",
+    ]
+    current_ld_path = env.get("LD_LIBRARY_PATH", "")
+    all_paths = mcr_paths + [current_ld_path]
+    env["LD_LIBRARY_PATH"] = ":".join(filter(None, all_paths))
+    env["MW_MCR_ROOT"] = matlab_root
+
+    print(f"--- [opym.petakit] Calling: {mcc_script} ... ---")
+    print(f"--- [opym.petakit] With MCR: {mcr_path} ---")
+
+    # 5. Run the command
+    try:
+        subprocess.run(cmd, check=True, env=env)  # nosec B404, B603
+        print("--- [opym.petakit] Subprocess finished. ---")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FATAL ERROR in mccMaster subprocess: {e}", file=sys.stderr)
+        raise
+    except FileNotFoundError as e:
+        print(f"❌ FATAL ERROR: Could not find {mcc_script}: {e}", file=sys.stderr)
+        print("   Please check the 'MCCMasterStr' path in your config JSON.")
+        raise
 
 
 def _autodetect_hpc_config(kwargs: dict) -> dict:

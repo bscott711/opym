@@ -52,7 +52,7 @@ def create_mip(
         else:
             # Raise error for 3D or 6D+ data
             raise ValueError(
-                f"Unsupported data shape: {shape}. " "Expected 4D (ZCYX) or 5D (TZCXY)."
+                f"Unsupported data shape: {shape}. Expected 4D (ZCYX) or 5D (TZCXY)."
             )
         # --- END NEW ---
 
