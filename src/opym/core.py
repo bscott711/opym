@@ -70,19 +70,51 @@ def process_dataset(
         raise ValueError("Channels 0 or 3 selected, but bottom_roi is None.")
 
     try:
-        # Setup based on input TIFF
+        # --- NEW: Handle 4D (single timepoint) vs 5D data ---
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
+            # series.aszarr() returns a store, which we open
             store = series.aszarr()
-            zarr_array: zarr.Array = zarr.open_array(store, mode="r")
+            zarr_reader: zarr.Array = zarr.open_array(store, mode="r")
 
-            T, Z, C, Y, X = series.shape
+            shape = zarr_reader.shape
+            ndim = zarr_reader.ndim
             dtype = series.dtype
 
-            if C != 2:
-                print(
-                    f"Warning: Expected 2 cameras (C=2), but found C={C}",
+            if ndim == 4:  # ZCYX
+                print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
+                print("  Loading 4D data into memory to add T dimension...")
+
+                # Load the 4D data into memory
+                numpy_4d_data = cast(np.ndarray, zarr_reader[:])
+
+                # Reshape to 5D (add singleton T dimension)
+                new_shape = (1, *shape)
+                numpy_5d_data = numpy_4d_data.reshape(new_shape)
+
+                # Create a new, in-memory Zarr array
+                zarr_array: zarr.Array = zarr.array(numpy_5d_data)
+
+                print(f"  In-memory 5D array shape: {zarr_array.shape}")
+
+            elif ndim == 5:  # TZCXY
+                # Use the 5D file-backed Zarr array directly
+                zarr_array = zarr_reader
+            else:
+                # Raise error for 3D or 6D+ data
+                raise ValueError(
+                    f"Unsupported data shape: {shape}. "
+                    "Expected 4D (ZCYX) or 5D (TZCXY)."
                 )
+        # --- END NEW ---
+
+        # Get the (now guaranteed 5D) shape
+        T, Z, C, Y, X = zarr_array.shape
+
+        if C != 2:
+            print(
+                f"Warning: Expected 2 cameras (C=2), but found C={C}",
+            )
 
         dummy_plane = np.zeros((Y, X), dtype=dtype)
         top_shape = _get_crop_shape(dummy_plane, top_roi)

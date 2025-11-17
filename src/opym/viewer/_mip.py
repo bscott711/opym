@@ -35,20 +35,45 @@ def create_mip(
     print(f"Opening {file_path.name} as lazy Zarr array...")
 
     try:
-        # --- FINAL FIX: Use the original, correct Zarr opening logic ---
+        # --- NEW: Handle 4D (single timepoint) vs 5D data ---
         store = tifffile.TiffFile(file_path).series[0].aszarr()
-        lazy_data = zarr.open(store, mode="r")
-        # -------------------------------------------------------------
+        # --- PYLANCE FIX: Use open_array to guarantee an Array type ---
+        zarr_reader: zarr.Array = zarr.open_array(store, mode="r")
+
+        shape = zarr_reader.shape
+        ndim = zarr_reader.ndim
+
+        if ndim == 4:  # ZCYX
+            print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
+            print("  Loading 4D data into memory to add T dimension...")
+
+            # Load the 4D data into memory
+            numpy_4d_data = cast(np.ndarray, zarr_reader[:])
+
+            # Reshape to 5D (add singleton T dimension)
+            new_shape = (1, *shape)
+            numpy_5d_data = numpy_4d_data.reshape(new_shape)
+
+            # Create a new, in-memory Zarr array
+            lazy_data: zarr.Array = zarr.array(numpy_5d_data)
+            print(f"  In-memory 5D array shape: {lazy_data.shape}")
+
+        elif ndim == 5:  # TZCXY
+            # Use the 5D file-backed Zarr array directly
+            lazy_data = zarr_reader
+        else:
+            # Raise error for 3D or 6D+ data
+            raise ValueError(
+                f"Unsupported data shape: {shape}. " "Expected 4D (ZCYX) or 5D (TZCXY)."
+            )
+        # --- END NEW ---
 
     except Exception as e:
         print(f"❌ ERROR: Could not open {file_path.name} as zarr.")
         print(f"  Details: {e}")
         raise
 
-    # This check will now validate that lazy_data is the array
-    if not isinstance(lazy_data, zarr.Array):
-        raise TypeError(f"Expected zarr.Array, but found {type(lazy_data)}.")
-
+    # Get the (now guaranteed 5D) shape
     T, Z, C, Y, X = lazy_data.shape
     print(f"Full data shape: {lazy_data.shape}")
 
