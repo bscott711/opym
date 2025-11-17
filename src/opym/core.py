@@ -70,36 +70,23 @@ def process_dataset(
         raise ValueError("Channels 0 or 3 selected, but bottom_roi is None.")
 
     try:
-        # --- NEW: Handle 4D (single timepoint) vs 5D data ---
+        # --- NEW: Handle 4D (single timepoint) vs 5D data (STREAM-SAFE) ---
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
-            # series.aszarr() returns a store, which we open
             store = series.aszarr()
-            zarr_reader: zarr.Array = zarr.open_array(store, mode="r")
+            zarr_array: zarr.Array = zarr.open_array(store, mode="r")
 
-            shape = zarr_reader.shape
-            ndim = zarr_reader.ndim
+            shape = zarr_array.shape
+            ndim = zarr_array.ndim
             dtype = series.dtype
 
             if ndim == 4:  # ZCYX
                 print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
-                print("  Loading 4D data into memory to add T dimension...")
-
-                # Load the 4D data into memory
-                numpy_4d_data = cast(np.ndarray, zarr_reader[:])
-
-                # Reshape to 5D (add singleton T dimension)
-                new_shape = (1, *shape)
-                numpy_5d_data = numpy_4d_data.reshape(new_shape)
-
-                # Create a new, in-memory Zarr array
-                zarr_array: zarr.Array = zarr.array(numpy_5d_data)
-
-                print(f"  In-memory 5D array shape: {zarr_array.shape}")
-
+                T = 1
+                Z, C, Y, X = shape
             elif ndim == 5:  # TZCXY
-                # Use the 5D file-backed Zarr array directly
-                zarr_array = zarr_reader
+                print(f"  Info: 5D data detected (shape {shape}).")
+                T, Z, C, Y, X = shape
             else:
                 # Raise error for 3D or 6D+ data
                 raise ValueError(
@@ -107,9 +94,6 @@ def process_dataset(
                     "Expected 4D (ZCYX) or 5D (TZCXY)."
                 )
         # --- END NEW ---
-
-        # Get the (now guaranteed 5D) shape
-        T, Z, C, Y, X = zarr_array.shape
 
         if C != 2:
             print(
@@ -136,7 +120,9 @@ def process_dataset(
         print(f"Using sanitized base name for output: {sanitized_name}")
 
         if output_format == OutputFormat.ZARR:
+            # --- FIX: Use sanitized_name, not paths.sanitized_name ---
             output_zarr_path = output_dir / (sanitized_name + "_processed.zarr")
+            # --- END FIX ---
             if output_zarr_path.exists():
                 print(
                     f"Warning: Output Zarr {output_zarr_path.name} "
@@ -163,8 +149,15 @@ def process_dataset(
             ) as pbar:
                 for t in range(T):
                     for z in range(Z):
-                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                        # --- NEW: Select correct indexing based on dimensions ---
+                        if ndim == 5:
+                            plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                            plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                        else:  # ndim == 4
+                            # T is 1, so t is always 0. We ignore t.
+                            plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
+                            plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
+                        # --- END NEW ---
 
                         # Pre-crop ROIs only if needed.
                         # Pylance needs casting because it doesn't assume 'need_top'
@@ -239,8 +232,15 @@ def process_dataset(
                 }
 
                 for z in range(Z):
-                    plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                    plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                    # --- NEW: Select correct indexing based on dimensions ---
+                    if ndim == 5:
+                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
+                    else:  # ndim == 4
+                        # T is 1, so t is always 0. We ignore t.
+                        plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
+                        plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
+                    # --- END NEW ---
 
                     # Process Cam 0
                     if 0 in channels_to_output:
