@@ -137,21 +137,26 @@ def get_petakit_context(
 
 # --- NEW: Helper function to convert Python types to MATLAB CLI strings ---
 def _to_matlab_str(val: object) -> str:
-    """Converts a Python type to its MATLAB string representation."""
+    """Converts a Python type to its MATLAB string representation for mcc."""
     if isinstance(val, bool):
         return "true" if val else "false"
     if isinstance(val, int | float):
         return str(val)
     if isinstance(val, str | Path):
-        return f"'{val}'"
+        return str(val)  # <-- FIX: Do NOT add extra quotes
     if isinstance(val, list):
         if not val:
             return "''"  # Use empty string for empty lists
-        # Convert list to MATLAB cell array string
-        return "{" + ",".join([_to_matlab_str(v) for v in val]) + "}"
+        # Check if it's a list of numbers or strings
+        if all(isinstance(v, int | float) for v in val):
+            # Numeric array: [1,2,3]
+            return "[" + ",".join(map(str, val)) + "]"
+        else:
+            # Cell array of strings: {'str1','str2'}
+            return "{" + ",".join([f"'{v}'" for v in val]) + "}"
     if val is None:
         return "''"  # Use empty string for None
-    return str(val)  # Fallback
+    raise TypeError(f"Unsupported MATLAB arg type: {type(val)}")
 
 
 def _run_petakit_base(
@@ -272,8 +277,11 @@ def _run_petakit_base(
     # 3. Build arguments
     # Add the first positional argument (input dir)
     cmd.append(_to_matlab_str([str(input_dir)]))
+
+    # --- FIX: Force masterCompute=True if mcc_mode=True ---
     if mcc_mode:
         master_compute = True
+    # --- END FIX ---
 
     # Collect all other parameters
     matlab_params = {
@@ -310,8 +318,8 @@ def _run_petakit_base(
 
     # Add all key-value pairs to the command
     for key, val in matlab_params.items():
-        cmd.append(key)  # <-- FIX: Remove the f"'{key}'" quotes
-        cmd.append(_to_matlab_str(val))
+        cmd.append(key)  # <-- FIX: No quotes on key
+        cmd.append(_to_matlab_str(val))  # <-- Uses new helper
 
     # 4. Set the environment for the subprocess
     env = os.environ.copy()
@@ -336,6 +344,14 @@ def _run_petakit_base(
         print("--- [opym.petakit] Subprocess finished. ---")
     except subprocess.CalledProcessError as e:
         print(f"❌ FATAL ERROR in mccMaster subprocess: {e}", file=sys.stderr)
+        # --- NEW: Print stdout/stderr if available ---
+        if e.stdout:
+            print("--- mccMaster STDOUT ---", file=sys.stderr)
+            print(e.stdout.decode(), file=sys.stderr)
+        if e.stderr:
+            print("--- mccMaster STDERR ---", file=sys.stderr)
+            print(e.stderr.decode(), file=sys.stderr)
+        # --- END NEW ---
         raise
     except FileNotFoundError as e:
         print(f"❌ FATAL ERROR: Could not find {mcc_script}: {e}", file=sys.stderr)
