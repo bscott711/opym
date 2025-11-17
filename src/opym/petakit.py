@@ -29,6 +29,52 @@ class PetaKitContext:
     dsr_output_dir: Path
 
 
+def generate_hpc_config(
+    mcr_root: str = "/cm/shared/apps_local/matlab/R2024B",
+    mcc_master_script: str = (
+        "/mmfs2/cm/shared/apps_local/petakit5d/mcc/linux/run_mccMaster.sh"
+    ),
+    output_file: Path | None = None,
+) -> Path:
+    """
+    Generates a 'pypetakit_config.json' file for HPC use.
+
+    Args:
+        mcr_root: The path to the MATLAB MCR root.
+        mcc_master_script: The path to the 'run_mccMaster.sh' script.
+        output_file: The path to save the file. If None, defaults to
+                     ~/pypetakit_config.json.
+
+    Returns:
+        The Path to the file that was written.
+    """
+    if output_file is None:
+        output_file = Path.home() / "pypetakit_config.json"
+
+    print(f"--- Generating PyPetaKit5D config at: {output_file} ---")
+
+    config_data = {
+        "MCCMasterStr": mcc_master_script,
+        "MCRParam": mcr_root,
+        "memPerCPU": 5.0,
+        "jobTimeLimit": 48,
+        "maxCPUNum": 48,
+        "GNUparallel": True,
+        "masterCompute": True,  # Run locally on the allocated node
+        "parseCluster": False,  # Do NOT submit sub-jobs
+        "SlurmParam": "",
+    }
+
+    try:
+        with output_file.open("w") as f:
+            json.dump(config_data, f, indent=4)
+        print(f"✅ Config saved to {output_file}")
+        return output_file
+    except Exception as e:
+        print(f"❌ ERROR: Could not write config file: {e}")
+        raise
+
+
 def get_petakit_context(
     processed_dir_path: Path,
     ds_dir_name: str = "DS",
@@ -59,14 +105,12 @@ def get_petakit_context(
         base_name = log_file.stem.replace("_processing_log", "")
     else:
         # Fallback: find the first data file and parse its name
-        # --- MODIFICATION: Update glob pattern to new format ---
         first_file = next(processed_dir.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
         if not first_file:
             raise FileNotFoundError(
                 "Could not find a '*_processing_log.json' file or any "
                 "'*_C..._T..tif' file to determine base_name."
             )
-        # --- MODIFICATION: Update regex to new format ---
         match = re.search(r"^(.*?)_C\d_T\d{3}\.tif$", first_file.name)
         if not match:
             raise ValueError(f"Could not parse base name from file: {first_file.name}")
@@ -173,6 +217,28 @@ def _run_petakit_base(
     )
 
 
+def _autodetect_hpc_config(kwargs: dict) -> dict:
+    """
+    Checks for a default HPC config file if one is not provided.
+    Also enables mcc_mode if a config file is in use.
+    """
+    # Check if a config file is already specified by the user
+    if "config_file" not in kwargs:
+        # If not, check if the default HPC config exists
+        default_config = Path.home() / "pypetakit_config.json"
+        if default_config.exists():
+            print(f"--- Found default config at {default_config}. Using it. ---")
+            kwargs["config_file"] = str(default_config)
+
+    # Automatically enable mcc_mode if a config file is being used
+    # (and not explicitly disabled by the user)
+    if "config_file" in kwargs and "mcc_mode" not in kwargs:
+        print("--- Config file detected, setting mcc_mode=True ---")
+        kwargs["mcc_mode"] = True
+
+    return kwargs
+
+
 def run_llsm_petakit_processing(
     source_dir: Path,
     *,
@@ -214,6 +280,10 @@ def run_llsm_petakit_processing(
         dsr_output_dir = source_dir / dsr_dir_name
         job_log_dir = source_dir.parent / "job_logs"
         os.makedirs(job_log_dir, exist_ok=True)
+
+        # --- NEW: Auto-detect config file ---
+        kwargs = _autodetect_hpc_config(kwargs)
+        # --- END NEW ---
 
         print(f"\nRunning job locally for LLSM TIFF series in: {source_dir.name}")
         print(f"  Base name (channelPattern): {base_name}")
@@ -269,6 +339,10 @@ def run_petakit_processing(
 
         # 2. Create required directories
         os.makedirs(ctx.job_log_dir, exist_ok=True)
+
+        # --- NEW: Auto-detect config file ---
+        kwargs = _autodetect_hpc_config(kwargs)
+        # --- END NEW ---
 
         print(f"\nRunning job locally for TIFF series in: {ctx.processed_dir.name}")
         print(f"  Base name: {ctx.base_name}")
