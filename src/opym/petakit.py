@@ -159,6 +159,45 @@ def _to_matlab_str(val: object) -> str:
     raise TypeError(f"Unsupported MATLAB arg type: {type(val)}")
 
 
+def _get_cpu_count() -> int:
+    """
+    Detects the number of available CPUs.
+
+    Prioritizes Slurm environment variables, then process affinity, then physical count.
+    """
+    # 1. Check Slurm allocation (specifically set by --cpus-per-task)
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            count = int(slurm_cpus)
+            print(
+                f"--- [opym.petakit] Auto-detected {count} CPUs "
+                "from SLURM_CPUS_PER_TASK."
+            )
+            return count
+        except ValueError:
+            pass
+
+    # 2. Check process affinity (accurate for Slurm allocations without env var)
+    # Available on Linux systems (most HPC clusters)
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            # type: ignore[attr-defined]
+            count = len(os.sched_getaffinity(0))  # type: ignore
+            print(
+                f"--- [opym.petakit] Auto-detected {count} CPUs "
+                "from process affinity."
+            )
+            return count
+        except (OSError, AttributeError):
+            pass
+
+    # 3. Fallback to total physical cores
+    count = os.cpu_count() or 1
+    print(f"--- [opym.petakit] Auto-detected {count} CPUs from os.cpu_count().")
+    return count
+
+
 def _run_petakit_base(
     input_dir: Path,
     output_ds_dir: Path,
@@ -190,7 +229,8 @@ def _run_petakit_base(
     master_compute: bool = False,
     config_file: str = "",
     mcc_mode: bool = False,
-    parse_parfor: bool = True,  # <-- ADDED THIS LINE
+    parse_parfor: bool = True,
+    cpus_per_task: int | None = None,
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
@@ -201,7 +241,6 @@ def _run_petakit_base(
 ) -> None:
     """
     Internal base function that runs the PyPetaKit5D wrapper.
-    ...
     """
     if block_size is None:
         block_size = [256, 256, 256]
@@ -209,6 +248,11 @@ def _run_petakit_base(
         ff_image_paths = [""]
     if background_paths is None:
         background_paths = [""]
+
+    # --- NEW: Auto-detect CPUs if not provided ---
+    if cpus_per_task is None:
+        cpus_per_task = _get_cpu_count()
+    # ---------------------------------------------
 
     # --- NEW: MCC/HPC BYPASS LOGIC ---
     if not mcc_mode or not config_file:
@@ -241,7 +285,8 @@ def _run_petakit_base(
             masterCompute=master_compute,
             configFile=config_file,
             mccMode=mcc_mode,
-            parseParfor=parse_parfor,  # <-- ADDED THIS LINE
+            parseParfor=parse_parfor,
+            cpusPerTask=cpus_per_task,  # Pass the detected count
             BKRemoval=bk_removal,
             save3DStack=save_3d_stack,
             saveMIP=save_mip,
@@ -302,10 +347,13 @@ def _run_petakit_base(
         "saveZarr": save_zarr,
         "blockSize": block_size,
         "save16bit": save_16bit,
-        # "parseCluster" and "masterCompute" MUST come from the JSON
+        # Explicitly pass cluster params to ensure override
+        "parseCluster": parse_cluster,
+        "masterCompute": master_compute,
         "configFile": config_file,
         "mccMode": mcc_mode,
-        "parseParfor": parse_parfor,  # <-- ADDED THIS LINE
+        "parseParfor": parse_parfor,
+        "cpusPerTask": cpus_per_task,  # Pass the detected count
         "BKRemoval": bk_removal,
         "save3DStack": save_3d_stack,
         "saveMIP": save_mip,
@@ -324,7 +372,7 @@ def _run_petakit_base(
         f"{matlab_root}/runtime/glnxa64",
         f"{matlab_root}/bin/glnxa64",
         f"{matlab_root}/sys/os/glnxa64",
-        f"{matlab_root}/sys/opengl/lib/glnxa64",  # <-- Fixed typo from glnxa6T4
+        f"{matlab_root}/sys/opengl/lib/glnxa64",
     ]
     current_ld_path = env.get("LD_LIBRARY_PATH", "")
     all_paths = mcr_paths + [current_ld_path]
@@ -336,8 +384,7 @@ def _run_petakit_base(
 
     # 5. Run the command
     try:
-        # --- FIX: Run without capturing output to stream in real-time ---
-        # This prevents buffer deadlocks. Output will print directly.
+        # Run without capturing output to stream in real-time
         subprocess.run(  # nosec B603
             cmd,
             check=True,
@@ -347,11 +394,70 @@ def _run_petakit_base(
         print("--- [opym.petakit] Subprocess finished. ---")
     except subprocess.CalledProcessError as e:
         print(f"❌ FATAL ERROR in mccMaster subprocess: {e}", file=sys.stderr)
-        # stdout/stderr will have already been printed to the notebook
         raise
     except FileNotFoundError as e:
         print(f"❌ FATAL ERROR: Could not find {mcc_script}: {e}", file=sys.stderr)
         print("   Please check the 'MCCMasterStr' path in your config JSON.")
+        raise
+
+
+def run_petakit_processing(
+    processed_dir_path: Path,
+    *,
+    ds_dir_name: str = "DS",
+    dsr_dir_name: str = "DSR",
+    cpus_per_task: int | None = None,
+    **kwargs,
+) -> None:
+    """
+    Runs the PyPetaKit5D wrapper on an 'opym' processed OPM TIFF series.
+
+    Args:
+        processed_dir_path: The path to the processed TIFF directory.
+        ds_dir_name: The name for the deskewed output subdirectory.
+        dsr_dir_name: The name for the deskewed+rotated output subdirectory.
+        cpus_per_task: Number of CPUs to use. If None, auto-detects from Slurm/System.
+        **kwargs: All other processing parameters for PyPetaKit5D.
+    """
+    try:
+        # 1. Get all paths
+        print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
+        ctx = get_petakit_context(
+            processed_dir_path,
+            ds_dir_name=ds_dir_name,
+            dsr_dir_name=dsr_dir_name,
+        )
+
+        # 2. Create required directories
+        os.makedirs(ctx.job_log_dir, exist_ok=True)
+
+        # --- Auto-detect config file ---
+        kwargs = _autodetect_hpc_config(kwargs)
+
+        print(f"\nRunning job locally for TIFF series in: {ctx.processed_dir.name}")
+        print(f"  Base name: {ctx.base_name}")
+        print(f"  Job log directory: {ctx.job_log_dir.name}")
+        print(f"  Deskew output: {ctx.ds_output_dir.name}")
+        print(f"  Rotate output: {ctx.dsr_output_dir.name}")
+
+        # 3. Run the base processor
+        _run_petakit_base(
+            input_dir=ctx.processed_dir,
+            output_ds_dir=ctx.ds_output_dir,
+            output_dsr_dir=ctx.dsr_output_dir,
+            base_name=ctx.base_name,
+            cpus_per_task=cpus_per_task,  # Pass None or value down
+            **kwargs,
+        )
+
+        print("--- PyPetaKit5D Processing Complete ---")
+
+    except FileNotFoundError as fnfe:
+        print(f"\n❌ SETUP ERROR: {fnfe}")
+        print("Ensure the input path and files exist.")
+        raise
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}")
         raise
 
 
@@ -435,65 +541,6 @@ def run_llsm_petakit_processing(
             output_ds_dir=ds_output_dir,
             output_dsr_dir=dsr_output_dir,
             base_name=base_name,
-            **kwargs,
-        )
-
-        print("--- PyPetaKit5D Processing Complete ---")
-
-    except FileNotFoundError as fnfe:
-        print(f"\n❌ SETUP ERROR: {fnfe}")
-        print("Ensure the input path and files exist.")
-        raise
-    except Exception as e:
-        print(f"\n❌ FATAL ERROR in PyPetaKit5D: {e}")
-        raise
-
-
-def run_petakit_processing(
-    processed_dir_path: Path,
-    *,
-    ds_dir_name: str = "DS",
-    dsr_dir_name: str = "DSR",
-    **kwargs,
-) -> None:
-    """
-    Runs the PyPetaKit5D wrapper on an 'opym' processed OPM TIFF series.
-
-    Args:
-        processed_dir_path: The path to the processed TIFF directory
-                            (e.g., '.../processed_tiff_series_split').
-        ds_dir_name: The name for the deskewed output subdirectory.
-        dsr_dir_name: The name for the deskewed+rotated output subdirectory.
-        **kwargs: All other processing parameters for PyPetaKit5D.
-    """
-    try:
-        # 1. Get all paths
-        print(f"--- Setting up PetaKit5D for: {processed_dir_path.name} ---")
-        ctx = get_petakit_context(
-            processed_dir_path,
-            ds_dir_name=ds_dir_name,
-            dsr_dir_name=dsr_dir_name,
-        )
-
-        # 2. Create required directories
-        os.makedirs(ctx.job_log_dir, exist_ok=True)
-
-        # --- NEW: Auto-detect config file ---
-        kwargs = _autodetect_hpc_config(kwargs)
-        # --- END NEW ---
-
-        print(f"\nRunning job locally for TIFF series in: {ctx.processed_dir.name}")
-        print(f"  Base name: {ctx.base_name}")
-        print(f"  Job log directory: {ctx.job_log_dir.name}")
-        print(f"  Deskew output: {ctx.ds_output_dir.name}")
-        print(f"  Rotate output: {ctx.dsr_output_dir.name}")
-
-        # 3. Run the base processor
-        _run_petakit_base(
-            input_dir=ctx.processed_dir,
-            output_ds_dir=ctx.ds_output_dir,
-            output_dsr_dir=ctx.dsr_output_dir,
-            base_name=ctx.base_name,
             **kwargs,
         )
 
