@@ -139,7 +139,7 @@ def get_petakit_context(
 def _to_matlab_str(val: object) -> str:
     """Converts a Python type to its MATLAB string representation for mcc."""
     if isinstance(val, bool):
-        return "true" if val else "false"
+        return "1" if val else "0"
     if isinstance(val, int | float):
         return str(val)
     if isinstance(val, str | Path):
