@@ -61,7 +61,7 @@ def generate_hpc_config(
         "memPerCPU": 5.0,
         "jobTimeLimit": 48,
         "maxCPUNum": 24,  # Set to your allocated core count
-        "GNUparallel": False,  # CRITICAL FIX: Forces use of internal parfor
+        "GNUparallel": True,  # RESTORED: Needed to trigger MCC bypass mode
         "masterCompute": True,  # Run locally on the allocated node
         "parseCluster": False,  # Do NOT submit sub-jobs
         "SlurmParam": "",
