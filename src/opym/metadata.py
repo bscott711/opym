@@ -13,18 +13,25 @@ from .utils import DerivedPaths, OutputFormat
 
 
 def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
-    """Helper to parse the 'SPIMAcqSettings' JSON string from the metadata."""
+    """
+    Helper to parse the 'AcqSettings.txt' file, which is assumed
+    to be a sibling of the metadata file.
+    """
+    acq_settings_file = metadata_file.parent / "AcqSettings.txt"
+    if not acq_settings_file.exists():
+        print(
+            f"Warning: AcqSettings.txt not found at {acq_settings_file}",
+            file=sys.stderr,
+        )
+        return {}
+
     try:
         # Open with 'latin-1' encoding to handle special characters
-        with metadata_file.open("r", encoding="latin-1") as f:
-            metadata = json.load(f)
-
-        summary = metadata.get("Summary", {})
-        spim_settings_str = summary.get("SPIMAcqSettings", "{}")
-        return json.loads(spim_settings_str)
+        with acq_settings_file.open("r", encoding="latin-1") as f:
+            return json.load(f)
     except Exception as e:
         print(
-            f"Warning: Could not parse SPIMAcqSettings from {metadata_file.name}: {e}",
+            f"Warning: Could not parse AcqSettings.txt: {e}",
             file=sys.stderr,
         )
         return {}
@@ -32,7 +39,7 @@ def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
 
 def parse_z_step(metadata_file: Path, default_z_step: float = 1.0) -> float:
     """
-    Parses the Micro-Manager metadata file to extract the Z-step size.
+    Parses the 'AcqSettings.txt' file to extract the Z-step size.
 
     Args:
         metadata_file: Path to the '_metadata.txt' file.
@@ -41,20 +48,19 @@ def parse_z_step(metadata_file: Path, default_z_step: float = 1.0) -> float:
     Returns:
         The Z-step size in microns.
     """
-    print(f"Parsing Z-step from {metadata_file.name}...")
+    print("Parsing Z-step from AcqSettings.txt...")
     try:
         spim_settings = _get_spim_settings(metadata_file)
 
-        # Micro-Manager 1.4 uses 'stepSize_um'
-        # Micro-Manager 2.0 uses 'zStep_um'
-        z_step = spim_settings.get("stepSize_um", spim_settings.get("zStep_um"))
+        # --- FIX: Use 'stepSizeUm' (capital U) from AcqSettings.txt ---
+        z_step = spim_settings.get("stepSizeUm", spim_settings.get("zStep_um"))
 
         if z_step is not None:
             print(f"  Found Z-step: {z_step} µm")
             return float(z_step)
 
         print(
-            "Warning: Could not find 'stepSize_um' or 'zStep_um' in metadata.",
+            "Warning: Could not find 'stepSizeUm' or 'zStep_um' in AcqSettings.txt.",
             file=sys.stderr,
         )
     except Exception as e:
@@ -74,13 +80,13 @@ def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
     """
     print(f"Parsing timestamps from {metadata_file.name}...")
     timestamps_sec = []
-    backup_interval_sec = 6.0
+
+    # Get timepoint interval from AcqSettings.txt
+    spim_settings = _get_spim_settings(metadata_file)
+    backup_interval_sec = spim_settings.get("timepointInterval", 6.0)
 
     try:
-        spim_settings = _get_spim_settings(metadata_file)
-        backup_interval_sec = spim_settings.get("timepointInterval", 6.0)
-
-        # Open with 'latin-1' encoding to handle special characters
+        # Open the metadata file for FrameKey data
         with metadata_file.open("r", encoding="latin-1") as f:
             metadata = json.load(f)
 
@@ -106,7 +112,8 @@ def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
 
     except Exception as e:
         print(
-            f"CRITICAL: Could not parse metadata: {e}. Using calculated times.",
+            f"CRITICAL: Could not parse {metadata_file.name}: {e}. "
+            "Using calculated times.",
             file=sys.stderr,
         )
         timestamps_sec = [(t * backup_interval_sec) for t in range(num_timepoints)]
