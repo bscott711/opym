@@ -7,9 +7,64 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import overload
+from typing import Any, overload
 
 from .utils import DerivedPaths, OutputFormat
+
+
+def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
+    """Helper to parse the 'SPIMAcqSettings' JSON string from the metadata."""
+    try:
+        # Open with 'latin-1' encoding to handle special characters
+        with metadata_file.open("r", encoding="latin-1") as f:
+            metadata = json.load(f)
+
+        summary = metadata.get("Summary", {})
+        spim_settings_str = summary.get("SPIMAcqSettings", "{}")
+        return json.loads(spim_settings_str)
+    except Exception as e:
+        print(
+            f"Warning: Could not parse SPIMAcqSettings from {metadata_file.name}: {e}",
+            file=sys.stderr,
+        )
+        return {}
+
+
+def parse_z_step(metadata_file: Path, default_z_step: float = 1.0) -> float:
+    """
+    Parses the Micro-Manager metadata file to extract the Z-step size.
+
+    Args:
+        metadata_file: Path to the '_metadata.txt' file.
+        default_z_step: A fallback value if parsing fails.
+
+    Returns:
+        The Z-step size in microns.
+    """
+    print(f"Parsing Z-step from {metadata_file.name}...")
+    try:
+        spim_settings = _get_spim_settings(metadata_file)
+
+        # Micro-Manager 1.4 uses 'stepSize_um'
+        # Micro-Manager 2.0 uses 'zStep_um'
+        z_step = spim_settings.get("stepSize_um", spim_settings.get("zStep_um"))
+
+        if z_step is not None:
+            print(f"  Found Z-step: {z_step} µm")
+            return float(z_step)
+
+        print(
+            "Warning: Could not find 'stepSize_um' or 'zStep_um' in metadata.",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(
+            f"CRITICAL: Error parsing Z-step: {e}. Using default.",
+            file=sys.stderr,
+        )
+
+    print(f"  Using default Z-step: {default_z_step} µm")
+    return default_z_step
 
 
 def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
@@ -22,18 +77,12 @@ def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
     backup_interval_sec = 6.0
 
     try:
+        spim_settings = _get_spim_settings(metadata_file)
+        backup_interval_sec = spim_settings.get("timepointInterval", 6.0)
+
         # Open with 'latin-1' encoding to handle special characters
         with metadata_file.open("r", encoding="latin-1") as f:
             metadata = json.load(f)
-
-        # Try to get the real interval from the summary
-        try:
-            summary = metadata.get("Summary", {})
-            spim_settings_str = summary.get("SPIMAcqSettings", "{}")
-            spim_settings = json.loads(spim_settings_str)
-            backup_interval_sec = spim_settings.get("timepointInterval", 6.0)
-        except Exception:
-            pass  # nosec B110
 
         for t in range(num_timepoints):
             # Key is "FrameKey-T-Z-C". We want the start of each
