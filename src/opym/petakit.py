@@ -139,11 +139,11 @@ def get_petakit_context(
 def _to_matlab_str(val: object) -> str:
     """Converts a Python type to its MATLAB string representation for mcc."""
     if isinstance(val, bool):
-        return "true" if val else "false"
+        return "true" if val else "false"  # <-- FIX: Must be true/false
     if isinstance(val, int | float):
         return str(val)
     if isinstance(val, str | Path):
-        return str(val)  # <-- FIX: Do NOT add extra quotes
+        return str(val)  # Do NOT add extra quotes
     if isinstance(val, list):
         if not val:
             return "''"  # Use empty string for empty lists
@@ -278,12 +278,6 @@ def _run_petakit_base(
     # Add the first positional argument (input dir)
     cmd.append(_to_matlab_str([str(input_dir)]))
 
-    # --- FIX: Force masterCompute=True if mcc_mode=True ---
-    if mcc_mode:
-        master_compute = True
-        parse_cluster = True
-    # --- END FIX ---
-
     # Collect all other parameters
     matlab_params = {
         "deskew": deskew,
@@ -295,8 +289,8 @@ def _run_petakit_base(
         "objectiveScan": objective_scan,
         "reverse": reverse_z,
         "channelPatterns": [base_name],
-        "DSDirName": output_ds_dir.name,
-        "DSRDirName": output_dsr_dir.name,
+        "DSDirName": str(output_ds_dir.name),
+        "DSRDirName": str(output_dsr_dir.name),
         "FFCorrection": ff_correction,
         "lowerLimit": lower_limit,
         "constOffset": const_offset,
@@ -307,10 +301,12 @@ def _run_petakit_base(
         "saveZarr": save_zarr,
         "blockSize": block_size,
         "save16bit": save_16bit,
-        "parseCluster": parse_cluster,
-        "masterCompute": master_compute,
+        # --- FIX: REMOVE cluster keys. They MUST come from the JSON ---
+        # "parseCluster": parse_cluster,
+        # "masterCompute": master_compute,
         "configFile": config_file,
         "mccMode": mcc_mode,
+        # --- END FIX ---
         "BKRemoval": bk_removal,
         "save3DStack": save_3d_stack,
         "saveMIP": save_mip,
@@ -319,8 +315,8 @@ def _run_petakit_base(
 
     # Add all key-value pairs to the command
     for key, val in matlab_params.items():
-        cmd.append(key)  # <-- FIX: No quotes on key
-        cmd.append(_to_matlab_str(val))  # <-- Uses new helper
+        cmd.append(key)
+        cmd.append(_to_matlab_str(val))
 
     # 4. Set the environment for the subprocess
     env = os.environ.copy()
@@ -329,7 +325,7 @@ def _run_petakit_base(
         f"{matlab_root}/runtime/glnxa64",
         f"{matlab_root}/bin/glnxa64",
         f"{matlab_root}/sys/os/glnxa64",
-        f"{matlab_root}/sys/opengl/lib/glnxa64",
+        f"{matlab_root}/sys/opengl/lib/glnxa6T4",
     ]
     current_ld_path = env.get("LD_LIBRARY_PATH", "")
     all_paths = mcr_paths + [current_ld_path]
@@ -341,17 +337,23 @@ def _run_petakit_base(
 
     # 5. Run the command
     try:
-        subprocess.run(cmd, check=True, env=env)  # nosec B404, B603
-        print("--- [opym.petakit] Subprocess finished. ---")
+        # We must capture stdout/stderr to print on failure
+        process = subprocess.run(  # nosec B603
+            cmd,
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # Print stdout on success
+        print(process.stdout)
     except subprocess.CalledProcessError as e:
         print(f"❌ FATAL ERROR in mccMaster subprocess: {e}", file=sys.stderr)
-        # --- NEW: Print stdout/stderr if available ---
-        if e.stdout:
-            print("--- mccMaster STDOUT ---", file=sys.stderr)
-            print(e.stdout.decode(), file=sys.stderr)
-        if e.stderr:
-            print("--- mccMaster STDERR ---", file=sys.stderr)
-            print(e.stderr.decode(), file=sys.stderr)
+        # --- NEW: Print stdout/stderr on failure ---
+        print("--- mccMaster STDOUT ---", file=sys.stderr)
+        print(e.stdout, file=sys.stderr)
+        print("--- mccMaster STDERR ---", file=sys.stderr)
+        print(e.stderr, file=sys.stderr)
         # --- END NEW ---
         raise
     except FileNotFoundError as e:
