@@ -190,6 +190,7 @@ def _run_petakit_base(
     master_compute: bool = False,
     config_file: str = "",
     mcc_mode: bool = False,
+    parse_parfor: bool = False,  # <-- ADDED THIS LINE
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
@@ -200,11 +201,7 @@ def _run_petakit_base(
 ) -> None:
     """
     Internal base function that runs the PyPetaKit5D wrapper.
-
-    --- MODIFIED ---
-    If mcc_mode is True, this function bypasses the buggy
-    ppk.XR_deskew_rotate_data_wrapper and calls the mccMaster
-    script directly using subprocess, with the correct environment.
+    ...
     """
     if block_size is None:
         block_size = [256, 256, 256]
@@ -244,6 +241,7 @@ def _run_petakit_base(
             masterCompute=master_compute,
             configFile=config_file,
             mccMode=mcc_mode,
+            parseParfor=parse_parfor,  # <-- ADDED THIS LINE
             BKRemoval=bk_removal,
             save3DStack=save_3d_stack,
             saveMIP=save_mip,
@@ -301,12 +299,10 @@ def _run_petakit_base(
         "saveZarr": save_zarr,
         "blockSize": block_size,
         "save16bit": save_16bit,
-        # --- FIX: REMOVE cluster keys. They MUST come from the JSON ---
-        # "parseCluster": parse_cluster,
-        # "masterCompute": master_compute,
+        # "parseCluster" and "masterCompute" MUST come from the JSON
         "configFile": config_file,
         "mccMode": mcc_mode,
-        # --- END FIX ---
+        "parseParfor": parse_parfor,  # <-- ADDED THIS LINE
         "BKRemoval": bk_removal,
         "save3DStack": save_3d_stack,
         "saveMIP": save_mip,
@@ -325,7 +321,7 @@ def _run_petakit_base(
         f"{matlab_root}/runtime/glnxa64",
         f"{matlab_root}/bin/glnxa64",
         f"{matlab_root}/sys/os/glnxa64",
-        f"{matlab_root}/sys/opengl/lib/glnxa6T4",
+        f"{matlab_root}/sys/opengl/lib/glnxa64",  # <-- Fixed typo from glnxa6T4
     ]
     current_ld_path = env.get("LD_LIBRARY_PATH", "")
     all_paths = mcr_paths + [current_ld_path]
