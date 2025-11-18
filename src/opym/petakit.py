@@ -276,6 +276,9 @@ def _run_petakit_base(
     # Add the first positional argument (input dir)
     cmd.append(_to_matlab_str([str(input_dir)]))
 
+    if mcc_mode:
+        parse_parfor = True
+
     # Collect all other parameters
     matlab_params = {
         "deskew": deskew,
