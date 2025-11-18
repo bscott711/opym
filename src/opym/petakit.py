@@ -281,6 +281,7 @@ def _run_petakit_base(
     # --- FIX: Force masterCompute=True if mcc_mode=True ---
     if mcc_mode:
         master_compute = True
+        parse_cluster = True
     # --- END FIX ---
 
     # Collect all other parameters
