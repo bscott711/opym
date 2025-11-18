@@ -190,7 +190,7 @@ def _run_petakit_base(
     master_compute: bool = False,
     config_file: str = "",
     mcc_mode: bool = False,
-    parse_parfor: bool = False,  # <-- ADDED THIS LINE
+    parse_parfor: bool = True,  # <-- ADDED THIS LINE
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
