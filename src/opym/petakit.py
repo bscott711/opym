@@ -333,24 +333,18 @@ def _run_petakit_base(
 
     # 5. Run the command
     try:
-        # We must capture stdout/stderr to print on failure
-        process = subprocess.run(  # nosec B603
+        # --- FIX: Run without capturing output to stream in real-time ---
+        # This prevents buffer deadlocks. Output will print directly.
+        subprocess.run(  # nosec B603
             cmd,
             check=True,
             env=env,
-            capture_output=True,
             text=True,
         )
-        # Print stdout on success
-        print(process.stdout)
+        print("--- [opym.petakit] Subprocess finished. ---")
     except subprocess.CalledProcessError as e:
         print(f"❌ FATAL ERROR in mccMaster subprocess: {e}", file=sys.stderr)
-        # --- NEW: Print stdout/stderr on failure ---
-        print("--- mccMaster STDOUT ---", file=sys.stderr)
-        print(e.stdout, file=sys.stderr)
-        print("--- mccMaster STDERR ---", file=sys.stderr)
-        print(e.stderr, file=sys.stderr)
-        # --- END NEW ---
+        # stdout/stderr will have already been printed to the notebook
         raise
     except FileNotFoundError as e:
         print(f"❌ FATAL ERROR: Could not find {mcc_script}: {e}", file=sys.stderr)
