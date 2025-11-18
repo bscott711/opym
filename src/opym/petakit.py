@@ -225,6 +225,7 @@ def _run_petakit_base(
     rotate: bool = True,
     interp_method: str = "linear",
     block_size: list[int] | None = None,
+    batch_size: list[int] | None = None,
     # Cluster & Config
     parse_cluster: bool = False,
     master_compute: bool = False,
@@ -232,7 +233,6 @@ def _run_petakit_base(
     mcc_mode: bool = False,
     parse_parfor: bool = True,
     cpus_per_task: int | None = None,
-    batch_size: list[int] | None = None,
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
@@ -284,7 +284,7 @@ def _run_petakit_base(
             zarrFile=zarr_file,
             saveZarr=save_zarr,
             blockSize=block_size,
-            batchSize=batch_size,  # Added batchSize
+            batchSize=batch_size,
             save16bit=save_16bit,
             parseCluster=parse_cluster,
             masterCompute=master_compute,
@@ -329,17 +329,6 @@ def _run_petakit_base(
     if mcc_mode:
         parse_parfor = True
 
-    # --- NEW: Overriding GNUparallel to ensure parseParfor works ---
-    # If the Python function explicitly asked for internal MATLAB parallelization,
-    # we must ensure the conflicting GNUparallel flag is set to false in the
-    # command-line parameters to override the config file's value.
-    if parse_parfor:
-        matlab_gnu_parallel = False
-    else:
-        # Fall back to the value defined in the config file
-        matlab_gnu_parallel = config_data.get("GNUparallel", False)
-    # --- END NEW LOGIC ---
-
     # Collect all other parameters
     matlab_params = {
         "deskew": deskew,
@@ -362,16 +351,17 @@ def _run_petakit_base(
         "zarrFile": zarr_file,
         "saveZarr": save_zarr,
         "blockSize": block_size,
-        "batchSize": batch_size,  # Pass batchSize
+        "batchSize": batch_size,
         "save16bit": save_16bit,
         # Explicitly pass cluster params to ensure override
         "parseCluster": parse_cluster,
         "masterCompute": master_compute,
         "configFile": config_file,
         "mccMode": mcc_mode,
-        "parseParfor": parse_parfor,
+        "parseParfor": parse_parfor,  # This is the key to single-node parallel
         "cpusPerTask": cpus_per_task,
-        "GNUparallel": matlab_gnu_parallel,  # <--- USED NEW LOGIC HERE
+        # 'GNUparallel' is intentionally removed here as it is not a recognized
+        # parameter of the target MATLAB function (XR_deskew_rotate_data_wrapper).
         "BKRemoval": bk_removal,
         "save3DStack": save_3d_stack,
         "saveMIP": save_mip,
