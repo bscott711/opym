@@ -198,6 +198,7 @@ def _get_cpu_count() -> int:
     return count
 
 
+# In petakit.py
 def _run_petakit_base(
     input_dir: Path,
     output_ds_dir: Path,
@@ -231,6 +232,7 @@ def _run_petakit_base(
     mcc_mode: bool = False,
     parse_parfor: bool = True,
     cpus_per_task: int | None = None,
+    batch_size: list[int] | None = None,
     # Redundant/Unused PyPetaKit5D args
     ff_correction: bool = False,
     lower_limit: float = 0.4,
@@ -244,12 +246,14 @@ def _run_petakit_base(
     """
     if block_size is None:
         block_size = [256, 256, 256]
+    if batch_size is None:
+        batch_size = [512, 512, 512]
     if ff_image_paths is None:
         ff_image_paths = [""]
     if background_paths is None:
         background_paths = [""]
 
-    # --- NEW: Auto-detect CPUs if not provided ---
+    # --- Auto-detect CPUs if not provided ---
     if cpus_per_task is None:
         cpus_per_task = _get_cpu_count()
     # ---------------------------------------------
@@ -280,13 +284,14 @@ def _run_petakit_base(
             zarrFile=zarr_file,
             saveZarr=save_zarr,
             blockSize=block_size,
+            batchSize=batch_size,  # Added batchSize
             save16bit=save_16bit,
             parseCluster=parse_cluster,
             masterCompute=master_compute,
             configFile=config_file,
             mccMode=mcc_mode,
             parseParfor=parse_parfor,
-            cpusPerTask=cpus_per_task,  # Pass the detected count
+            cpusPerTask=cpus_per_task,
             BKRemoval=bk_removal,
             save3DStack=save_3d_stack,
             saveMIP=save_mip,
@@ -324,6 +329,17 @@ def _run_petakit_base(
     if mcc_mode:
         parse_parfor = True
 
+    # --- NEW: Overriding GNUparallel to ensure parseParfor works ---
+    # If the Python function explicitly asked for internal MATLAB parallelization,
+    # we must ensure the conflicting GNUparallel flag is set to false in the
+    # command-line parameters to override the config file's value.
+    if parse_parfor:
+        matlab_gnu_parallel = False
+    else:
+        # Fall back to the value defined in the config file
+        matlab_gnu_parallel = config_data.get("GNUparallel", False)
+    # --- END NEW LOGIC ---
+
     # Collect all other parameters
     matlab_params = {
         "deskew": deskew,
@@ -346,6 +362,7 @@ def _run_petakit_base(
         "zarrFile": zarr_file,
         "saveZarr": save_zarr,
         "blockSize": block_size,
+        "batchSize": batch_size,  # Pass batchSize
         "save16bit": save_16bit,
         # Explicitly pass cluster params to ensure override
         "parseCluster": parse_cluster,
@@ -353,7 +370,8 @@ def _run_petakit_base(
         "configFile": config_file,
         "mccMode": mcc_mode,
         "parseParfor": parse_parfor,
-        "cpusPerTask": cpus_per_task,  # Pass the detected count
+        "cpusPerTask": cpus_per_task,
+        "GNUparallel": matlab_gnu_parallel,  # <--- USED NEW LOGIC HERE
         "BKRemoval": bk_removal,
         "save3DStack": save_3d_stack,
         "saveMIP": save_mip,
