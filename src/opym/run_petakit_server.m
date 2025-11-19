@@ -4,8 +4,6 @@
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 petakit_source_path = '/cm/shared/apps_local/petakit5d';
-
-% DYNAMIC PATH: Use the user's home directory + petakit_jobs
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
@@ -36,7 +34,6 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 
-% Start Persistent Parallel Pool
 pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     delete(pool);
@@ -68,36 +65,38 @@ while true
     fprintf('[Server] >>> Processing job: %s\n', currentFile);
 
     try
-        % Parse JSON
         fid = fopen(srcPath);
         raw = fread(fid, inf);
         fclose(fid);
         job = jsondecode(char(raw'));
 
-        % Extract Parameters
         if isfield(job, 'parameters')
             p = job.parameters;
         else
             p = struct();
         end
 
-        % --- FIX: Safe Parameter Extraction ---
-        % We call local function safelyGetParam instead of the broken lambda
+        % --- EXTRACT PARAMETERS ---
         val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
         val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
         val_skewAngle   = safelyGetParam(p, 'sheet_angle_deg', 31.8);
         val_deskew      = safelyGetParam(p, 'deskew', true);
         val_rotate      = safelyGetParam(p, 'rotate', true);
-        % --------------------------------------
+
+        % FIX: Get dynamic directory names (default to DS/DSR if missing)
+        val_dsDir       = safelyGetParam(p, 'ds_dir_name', 'DS');
+        val_dsrDir      = safelyGetParam(p, 'dsr_dir_name', 'DSR');
+        % --------------------------
 
         fprintf('         Data: %s\n', job.dataDir);
+        fprintf('         Out:  %s\n', val_dsrDir);
         fprintf('         Params: xy=%.3f, dz=%.3f, angle=%.2f\n', ...
                 val_xyPixelSize, val_dz, val_skewAngle);
 
         XR_deskew_rotate_data_wrapper( ...
             {job.dataDir}, ...
-            'DSDirName', 'DS', ...
-            'DSRDirName', 'DSR', ...
+            'DSDirName', val_dsDir, ...   % <-- Use dynamic name
+            'DSRDirName', val_dsrDir, ... % <-- Use dynamic name
             'channelPatterns', {job.baseName}, ...
             'deskew', val_deskew, ...
             'rotate', val_rotate, ...
@@ -133,11 +132,9 @@ while true
     end
 end
 
-% --- LOCAL HELPER FUNCTION ---
 function val = safelyGetParam(structure, fieldName, defaultValue)
     if isfield(structure, fieldName)
         val = structure.(fieldName);
-        % Handle empty values that sometimes come from JSON nulls
         if isempty(val)
             val = defaultValue;
         end
