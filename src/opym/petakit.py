@@ -96,14 +96,14 @@ def run_petakit_processing(
     **kwargs,
 ) -> str:
     """
-    Prepares context and submits a job for the provided directory.
-    Returns the Job ID (filename) so it can be tracked.
+    Prepares context and submits a 'deskew' job for OPM data.
     """
     try:
         print(f"--- Preparing PetaKit5D job for: {processed_dir_path.name} ---")
         ctx = get_petakit_context(processed_dir_path)
 
         payload = {
+            "jobType": "deskew",
             "dataDir": str(ctx.processed_dir),
             "baseName": ctx.base_name,
             "parameters": kwargs,
@@ -118,8 +118,7 @@ def run_petakit_processing(
 
 def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> str:
     """
-    Submits a job for an LLSM dataset.
-    Returns the Job ID (filename).
+    Submits a 'deskew' job for an LLSM dataset.
     """
     try:
         print(f"--- Preparing LLSM PetaKit5D job for: {source_dir.name} ---")
@@ -127,19 +126,29 @@ def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> str:
         if not source_dir.exists():
             raise FileNotFoundError(f"Directory not found: {source_dir}")
 
+        # Try to find an LLSM file to determine base name
+        # Pattern: name_CamA_ch0_stack0000.tif
         first_file = next(
             source_dir.glob("*_Cam[AB]_ch[0-9]_stack[0-9][0-9][0-9][0-9]*.tif"),
             None,
         )
         if not first_file:
-            raise FileNotFoundError(f"No LLSM files found in {source_dir}")
+            # Fallback for generic folders (like 'decon' output) that might have TIFs
+            # Try finding *any* TIF if the specific pattern fails
+            first_file = next(source_dir.glob("*.tif"), None)
 
+        if not first_file:
+            raise FileNotFoundError(f"No TIFF files found in {source_dir}")
+
+        # Attempt to parse LLSM base name, or fallback to folder name
         match = re.search(r"^(.*?)_Cam[AB]_", first_file.name)
-        if not match:
-            raise ValueError(f"Could not parse base name from: {first_file.name}")
-        base_name = match.group(1)
+        if match:
+            base_name = match.group(1)
+        else:
+            base_name = source_dir.name
 
         payload = {
+            "jobType": "deskew",
             "dataDir": str(source_dir),
             "baseName": base_name,
             "parameters": kwargs,
@@ -149,6 +158,53 @@ def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> str:
 
     except Exception as e:
         print(f"\n❌ Error submitting LLSM job: {e}")
+        raise
+
+
+def run_decon_processing(
+    data_dir: Path,
+    channel_patterns: list[str],
+    psf_paths: list[str],
+    result_dir_name: str = "decon",
+    iterations: int = 10,
+    gpu_job: bool = True,
+    skewed: bool = True,
+    rl_method: str = "simplified",
+    **kwargs,
+) -> str:
+    """
+    Submits a 'decon' job to the MATLAB server.
+    """
+    try:
+        print(f"--- Preparing Decon job for: {data_dir.name} ---")
+        data_dir = data_dir.resolve()
+        if not data_dir.exists():
+            raise FileNotFoundError(f"Data directory not found: {data_dir}")
+
+        # Base name for the job file (just use folder name)
+        base_name = data_dir.name
+
+        payload = {
+            "jobType": "decon",
+            "dataDir": str(data_dir),
+            "baseName": base_name,
+            "parameters": {
+                "channel_patterns": channel_patterns,
+                "psf_paths": psf_paths,
+                "result_dir_name": result_dir_name,
+                "iterations": iterations,
+                "gpu_job": gpu_job,
+                "skewed": skewed,
+                "rl_method": rl_method,
+                "save_16bit": True,
+                **kwargs,  # include any extras
+            },
+        }
+
+        return _submit_job(payload)
+
+    except Exception as e:
+        print(f"\n❌ Error submitting Decon job: {e}")
         raise
 
 
@@ -185,7 +241,6 @@ def wait_for_job(job_filename: str, poll_interval: int = 5) -> None:
             raise RuntimeError("MATLAB processing failed.")
 
         # Still processing?
-        # We can add a simple spinner or dot to show life
         sys.stdout.write(".")
         sys.stdout.flush()
 
