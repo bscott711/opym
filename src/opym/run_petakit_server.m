@@ -4,8 +4,21 @@
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 petakit_source_path = '/cm/shared/apps_local/petakit5d';
-base_queue_dir = '/mmfs2/scratch/SDSMT.LOCAL/bscott/petakit_jobs';
-numCPUs = 24;
+
+% DYNAMIC PATH: Use the user's home directory + petakit_jobs
+base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
+
+% --- DYNAMIC CPU DETECTION -----------------------------------------------
+% Check if running under Slurm and get the CPU allocation
+envCPUs = getenv('SLURM_CPUS_PER_TASK');
+if ~isempty(envCPUs)
+    numCPUs = str2double(envCPUs);
+    fprintf('[Server] Auto-detected %d CPUs from Slurm environment.\n', numCPUs);
+else
+    % Fallback for local testing
+    numCPUs = 24;
+    fprintf('[Server] No Slurm CPU count found. Using fallback: %d\n', numCPUs);
+end
 
 % Setup Directories
 queue_dir = fullfile(base_queue_dir, 'queue');
@@ -26,10 +39,18 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 
-% 2. Start Persistent Parallel Pool
+% 2. Configure & Start Persistent Parallel Pool
 pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     delete(pool);
+
+    % Safety: Ensure the local profile allows this many workers
+    c = parcluster('local');
+    if c.NumWorkers < numCPUs
+        c.NumWorkers = numCPUs;
+        saveProfile(c);
+    end
+
     fprintf('[Server] Starting persistent parpool with %d workers...\n', numCPUs);
     parpool('local', numCPUs);
 else
@@ -106,7 +127,7 @@ while true
             'parseParfor', true, ...   % Use OUR persistent pool
             'masterCompute', true, ... % Run on this node
             'largeFile', false, ...    % Parallelize over file list
-            'cpusPerTask', numCPUs ...
+            'cpusPerTask', numCPUs ... % Pass the specific CPU count
         );
 
         % 6. Success: Move to Completed

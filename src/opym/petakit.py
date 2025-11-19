@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # --- CONFIGURATION ---
-# Update this to the location where your MATLAB server watches for jobs
-QUEUE_DIR = Path("/mmfs2/scratch/SDSMT.LOCAL/bscott/petakit_jobs/queue")
+# Use Path.home() to make this generic for any user
+# The server script must use the same relative path: ~/petakit_jobs/queue
+QUEUE_DIR = Path.home() / "petakit_jobs/queue"
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,7 @@ def _submit_job(payload: dict) -> None:
     try:
         with job_file.open("w") as f:
             json.dump(payload, f, indent=4)
-        print("✅ Job submitted successfully.")
+        print("✅ Job submitted successfully. The MATLAB server will pick it up.")
     except Exception as e:
         print(f"❌ Failed to write job file: {e}")
         raise
@@ -102,6 +103,7 @@ def run_petakit_processing(
         ctx = get_petakit_context(processed_dir_path)
 
         # Construct the payload
+        # The server reads 'dataDir', 'baseName', and 'parameters'
         payload = {
             "dataDir": str(ctx.processed_dir),
             "baseName": ctx.base_name,
