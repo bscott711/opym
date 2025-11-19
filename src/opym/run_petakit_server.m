@@ -9,13 +9,11 @@ petakit_source_path = '/cm/shared/apps_local/petakit5d';
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
-% Check if running under Slurm and get the CPU allocation
 envCPUs = getenv('SLURM_CPUS_PER_TASK');
 if ~isempty(envCPUs)
     numCPUs = str2double(envCPUs);
     fprintf('[Server] Auto-detected %d CPUs from Slurm environment.\n', numCPUs);
 else
-    % Fallback for local testing
     numCPUs = 24;
     fprintf('[Server] No Slurm CPU count found. Using fallback: %d\n', numCPUs);
 end
@@ -30,7 +28,6 @@ if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
 % --- INITIALIZATION ------------------------------------------------------
-% 1. Load PetaKit
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
         run(fullfile(petakit_source_path, 'setup.m'));
@@ -39,18 +36,15 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 
-% 2. Configure & Start Persistent Parallel Pool
+% Start Persistent Parallel Pool
 pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     delete(pool);
-
-    % Safety: Ensure the local profile allows this many workers
     c = parcluster('local');
     if c.NumWorkers < numCPUs
         c.NumWorkers = numCPUs;
         saveProfile(c);
     end
-
     fprintf('[Server] Starting persistent parpool with %d workers...\n', numCPUs);
     parpool('local', numCPUs);
 else
@@ -61,50 +55,45 @@ fprintf('[Server] Ready. Watching: %s\n', queue_dir);
 
 % --- MAIN SERVER LOOP ----------------------------------------------------
 while true
-    % 1. Look for JSON files (FIFO order roughly)
     jobFiles = dir(fullfile(queue_dir, '*.json'));
 
     if isempty(jobFiles)
-        pause(2); % Sleep if idle
+        pause(2);
         continue;
     end
 
-    % 2. Pick the first job
     currentFile = jobFiles(1).name;
     srcPath = fullfile(queue_dir, currentFile);
 
     fprintf('[Server] >>> Processing job: %s\n', currentFile);
 
     try
-        % 3. Parse JSON Payload
+        % Parse JSON
         fid = fopen(srcPath);
         raw = fread(fid, inf);
         fclose(fid);
         job = jsondecode(char(raw'));
 
-        % 4. Extract Parameters with Defaults
-        % Access the 'parameters' struct from Python kwargs
+        % Extract Parameters
         if isfield(job, 'parameters')
             p = job.parameters;
         else
             p = struct();
         end
 
-        % Helper: Get field or default
-        getParam = @(s, f, d) iff(isfield(s, f), s.(f), d);
-
-        % Map Python (snake_case) to MATLAB variables
-        val_xyPixelSize = getParam(p, 'xy_pixel_size', 0.136);
-        val_dz          = getParam(p, 'z_step_um', 1.0);
-        val_skewAngle   = getParam(p, 'sheet_angle_deg', 31.8);
-        val_deskew      = getParam(p, 'deskew', true);
-        val_rotate      = getParam(p, 'rotate', true);
+        % --- FIX: Safe Parameter Extraction ---
+        % We call local function safelyGetParam instead of the broken lambda
+        val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
+        val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
+        val_skewAngle   = safelyGetParam(p, 'sheet_angle_deg', 31.8);
+        val_deskew      = safelyGetParam(p, 'deskew', true);
+        val_rotate      = safelyGetParam(p, 'rotate', true);
+        % --------------------------------------
 
         fprintf('         Data: %s\n', job.dataDir);
         fprintf('         Params: xy=%.3f, dz=%.3f, angle=%.2f\n', ...
                 val_xyPixelSize, val_dz, val_skewAngle);
 
-        % 5. Execute Processing
         XR_deskew_rotate_data_wrapper( ...
             {job.dataDir}, ...
             'DSDirName', 'DS', ...
@@ -123,19 +112,17 @@ while true
             'interpMethod', 'linear', ...
             'FFCorrection', false, ...
             'BKRemoval', false, ...
-            'parseCluster', false, ... % Do NOT use Slurm
-            'parseParfor', true, ...   % Use OUR persistent pool
-            'masterCompute', true, ... % Run on this node
-            'largeFile', false, ...    % Parallelize over file list
-            'cpusPerTask', numCPUs ... % Pass the specific CPU count
+            'parseCluster', false, ...
+            'parseParfor', true, ...
+            'masterCompute', true, ...
+            'largeFile', false, ...
+            'cpusPerTask', numCPUs ...
         );
 
-        % 6. Success: Move to Completed
         movefile(srcPath, fullfile(done_dir, currentFile));
         fprintf('[Server] <<< Finished: %s\n', currentFile);
 
     catch ME
-        % 7. Failure: Move to Failed and Log Error
         fprintf('[Server] !!! ERROR on %s: %s\n', currentFile, ME.message);
         movefile(srcPath, fullfile(fail_dir, currentFile));
 
@@ -146,11 +133,15 @@ while true
     end
 end
 
-% --- HELPER FUNCTION ---
-function val = iff(condition, trueVal, falseVal)
-    if condition
-        val = trueVal;
+% --- LOCAL HELPER FUNCTION ---
+function val = safelyGetParam(structure, fieldName, defaultValue)
+    if isfield(structure, fieldName)
+        val = structure.(fieldName);
+        % Handle empty values that sometimes come from JSON nulls
+        if isempty(val)
+            val = defaultValue;
+        end
     else
-        val = falseVal;
+        val = defaultValue;
     end
 end
