@@ -14,15 +14,12 @@ from .petakit import (
     PetaKitContext,
     get_petakit_context,
     run_llsm_petakit_processing,
-    run_petakit_from_config,
     run_petakit_processing,
 )
-
-# --- MODIFIED: Import from new roi_utils module ---
 from .roi_utils import (
     align_rois,
     load_rois_from_log,
-    process_rois_from_selector,  # <-- ADDED
+    process_rois_from_selector,
     save_rois_to_log,
 )
 from .utils import (
@@ -33,8 +30,6 @@ from .utils import (
     detect_microscopy_data_type,
     parse_roi_string,
 )
-
-# --- END MODIFICATION ---
 from .viewer import (
     composite_viewer,
     create_mip,
@@ -55,7 +50,7 @@ __all__ = [
     "save_rois_to_log",
     "load_rois_from_log",
     "align_rois",
-    "process_rois_from_selector",  # <-- ADDED
+    "process_rois_from_selector",
     "single_channel_viewer",
     "composite_viewer",
     "load_tiff_series",
@@ -67,7 +62,6 @@ __all__ = [
     "get_petakit_context",
     "run_petakit_processing",
     "run_llsm_petakit_processing",
-    "run_petakit_from_config",
     "detect_microscopy_data_type",
     "MicroscopyDataType",
 ]
