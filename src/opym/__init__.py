@@ -15,6 +15,7 @@ from .petakit import (
     get_petakit_context,
     run_llsm_petakit_processing,
     run_petakit_processing,
+    wait_for_job,
 )
 from .roi_utils import (
     align_rois,
@@ -64,4 +65,5 @@ __all__ = [
     "run_llsm_petakit_processing",
     "detect_microscopy_data_type",
     "MicroscopyDataType",
+    "wait_for_job",
 ]

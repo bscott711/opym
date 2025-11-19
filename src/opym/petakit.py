@@ -8,14 +8,16 @@ watched queue directory, which a running MATLAB server picks up and processes.
 
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 # --- CONFIGURATION ---
-# Use Path.home() to make this generic for any user
-# The server script must use the same relative path: ~/petakit_jobs/queue
-QUEUE_DIR = Path.home() / "petakit_jobs/queue"
+BASE_JOB_DIR = Path.home() / "petakit_jobs"
+QUEUE_DIR = BASE_JOB_DIR / "queue"
+COMPLETED_DIR = BASE_JOB_DIR / "completed"
+FAILED_DIR = BASE_JOB_DIR / "failed"
 
 
 @dataclass(frozen=True)
@@ -60,25 +62,30 @@ def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
     )
 
 
-def _submit_job(payload: dict) -> None:
-    """Writes the job payload to a JSON file in the queue directory."""
-    # Ensure queue exists
+def _submit_job(payload: dict) -> str:
+    """
+    Writes the job payload to a JSON file in the queue directory.
+    Returns: The filename of the submitted job.
+    """
+    # Ensure all directories exist
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    COMPLETED_DIR.mkdir(parents=True, exist_ok=True)
+    FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
     # Create a unique filename based on timestamp and base name
     timestamp = int(time.time() * 1000)
     safe_name = payload.get("baseName", "job")
-    # Sanitize filename
     safe_name = re.sub(r"[^\w\-_\.]", "_", safe_name)
     job_filename = f"{safe_name}_{timestamp}.json"
     job_file = QUEUE_DIR / job_filename
 
-    print(f"--- Submitting job to queue: {job_file} ---")
+    print(f"--- Submitting job to queue: {job_file.name} ---")
 
     try:
         with job_file.open("w") as f:
             json.dump(payload, f, indent=4)
-        print("✅ Job submitted successfully. The MATLAB server will pick it up.")
+        print("✅ Job ticket created.")
+        return job_filename
     except Exception as e:
         print(f"❌ Failed to write job file: {e}")
         raise
@@ -87,39 +94,32 @@ def _submit_job(payload: dict) -> None:
 def run_petakit_processing(
     processed_dir_path: Path,
     **kwargs,
-) -> None:
+) -> str:
     """
     Prepares context and submits a job for the provided directory.
-
-    Any keyword arguments passed (e.g., xy_pixel_size, z_step_um) are
-    forwarded to the MATLAB server in the JSON payload.
-
-    Args:
-        processed_dir_path: Path to 'processed_tiff_series_split'
-        **kwargs: Parameters to pass to MATLAB (e.g., z_step_um=1.0)
+    Returns the Job ID (filename) so it can be tracked.
     """
     try:
         print(f"--- Preparing PetaKit5D job for: {processed_dir_path.name} ---")
         ctx = get_petakit_context(processed_dir_path)
 
-        # Construct the payload
-        # The server reads 'dataDir', 'baseName', and 'parameters'
         payload = {
             "dataDir": str(ctx.processed_dir),
             "baseName": ctx.base_name,
             "parameters": kwargs,
         }
 
-        _submit_job(payload)
+        return _submit_job(payload)
 
     except Exception as e:
         print(f"\n❌ Error submitting job: {e}")
         raise
 
 
-def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> None:
+def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> str:
     """
-    Submits a job for an LLSM dataset (skipping opym preprocessing).
+    Submits a job for an LLSM dataset.
+    Returns the Job ID (filename).
     """
     try:
         print(f"--- Preparing LLSM PetaKit5D job for: {source_dir.name} ---")
@@ -127,7 +127,6 @@ def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> None:
         if not source_dir.exists():
             raise FileNotFoundError(f"Directory not found: {source_dir}")
 
-        # Determine base name for LLSM
         first_file = next(
             source_dir.glob("*_Cam[AB]_ch[0-9]_stack[0-9][0-9][0-9][0-9]*.tif"),
             None,
@@ -146,8 +145,48 @@ def run_llsm_petakit_processing(source_dir: Path, **kwargs) -> None:
             "parameters": kwargs,
         }
 
-        _submit_job(payload)
+        return _submit_job(payload)
 
     except Exception as e:
         print(f"\n❌ Error submitting LLSM job: {e}")
         raise
+
+
+def wait_for_job(job_filename: str, poll_interval: int = 5) -> None:
+    """
+    Blocks execution and polls for the job completion.
+    """
+    print(f"\n⏳ Waiting for MATLAB server to process: {job_filename} ...")
+    print("   (This cell will remain running until the job finishes)")
+
+    job_path_done = COMPLETED_DIR / job_filename
+    job_path_fail = FAILED_DIR / job_filename
+
+    start_time = time.time()
+
+    while True:
+        # Check Success
+        if job_path_done.exists():
+            duration = time.time() - start_time
+            print(f"\n✅ Job Completed Successfully! (Time: {duration:.1f}s)")
+            return
+
+        # Check Failure
+        if job_path_fail.exists():
+            print(f"\n❌ Job Failed! (Time: {time.time() - start_time:.1f}s)")
+            # Try to read the error log
+            log_file = FAILED_DIR / f"{job_filename}.log"
+            if log_file.exists():
+                print("-" * 40)
+                print(log_file.read_text())
+                print("-" * 40)
+            else:
+                print("   No error log found.")
+            raise RuntimeError("MATLAB processing failed.")
+
+        # Still processing?
+        # We can add a simple spinner or dot to show life
+        sys.stdout.write(".")
+        sys.stdout.flush()
+
+        time.sleep(poll_interval)
