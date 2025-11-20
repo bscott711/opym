@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import tifffile  # Needed to inspect dimensions for cropping jobs
+
 # --- CONFIGURATION ---
 BASE_JOB_DIR = Path.home() / "petakit_jobs"
 QUEUE_DIR = BASE_JOB_DIR / "queue"
@@ -27,9 +29,7 @@ class PetaKitContext:
 
 
 def get_petakit_context(processed_dir_path: Path) -> PetaKitContext:
-    """
-    Identifies the dataset structure from the user's selected folder.
-    """
+    """Identifies the dataset structure from the user's selected folder."""
     processed_dir = processed_dir_path.resolve()
     if not processed_dir.exists():
         raise FileNotFoundError(f"Directory not found: {processed_dir}")
@@ -79,19 +79,26 @@ def _submit_job(payload: dict) -> str:
         raise
 
 
+def _slice_to_list(s: slice | None) -> list[int] | None:
+    """Converts a python slice object to a [start, stop] list for JSON."""
+    if s is None:
+        return None
+    # Handle None in slice (e.g. [:100])
+    start = s.start if s.start is not None else 0
+    # We assume stop is provided for ROIs, but handle edge case
+    stop = s.stop if s.stop is not None else -1
+    return [int(start), int(stop)]
+
+
 def run_petakit_processing(
     processed_dir_path: Path,
-    interp_method: str = "cubic",  # <-- Default to cubic for better quality
+    interp_method: str = "cubic",
     **kwargs,
 ) -> str:
-    """
-    Prepares context and submits a 'deskew' job for OPM data.
-    """
+    """Prepares context and submits a 'deskew' job for OPM data."""
     try:
         print(f"--- Preparing PetaKit5D job for: {processed_dir_path.name} ---")
         ctx = get_petakit_context(processed_dir_path)
-
-        # Add interp_method to kwargs so it gets included in the payload
         kwargs["interp_method"] = interp_method
 
         payload = {
@@ -100,9 +107,7 @@ def run_petakit_processing(
             "baseName": ctx.base_name,
             "parameters": kwargs,
         }
-
         return _submit_job(payload)
-
     except Exception as e:
         print(f"\n❌ Error submitting job: {e}")
         raise
@@ -111,9 +116,7 @@ def run_petakit_processing(
 def run_llsm_petakit_processing(
     source_dir: Path, interp_method: str = "cubic", **kwargs
 ) -> str:
-    """
-    Submits a 'deskew' job for an LLSM dataset.
-    """
+    """Submits a 'deskew' job for an LLSM dataset."""
     try:
         print(f"--- Preparing LLSM PetaKit5D job for: {source_dir.name} ---")
         source_dir = source_dir.resolve()
@@ -125,7 +128,6 @@ def run_llsm_petakit_processing(
         )
         if not first_file:
             first_file = next(source_dir.glob("*.tif"), None)
-
         if not first_file:
             raise FileNotFoundError(f"No TIFF files found in {source_dir}")
 
@@ -133,16 +135,13 @@ def run_llsm_petakit_processing(
         base_name = match.group(1) if match else source_dir.name
 
         kwargs["interp_method"] = interp_method
-
         payload = {
             "jobType": "deskew",
             "dataDir": str(source_dir),
             "baseName": base_name,
             "parameters": kwargs,
         }
-
         return _submit_job(payload)
-
     except Exception as e:
         print(f"\n❌ Error submitting LLSM job: {e}")
         raise
@@ -182,11 +181,79 @@ def run_decon_processing(
                 **kwargs,
             },
         }
+        return _submit_job(payload)
+    except Exception as e:
+        print(f"\n❌ Error submitting Decon job: {e}")
+        raise
+
+
+def run_cropping_processing(
+    base_file: Path,
+    output_dir: Path,
+    sanitized_name: str,
+    top_roi: tuple[slice, slice] | None,
+    bottom_roi: tuple[slice, slice] | None,
+    channels_to_output: list[int],
+    rotate_90: bool = False,
+    **kwargs,
+) -> str:
+    """
+    Submits a 'crop' job to the MATLAB server.
+    Inspects file dimensions locally first to pass to MATLAB.
+    """
+    try:
+        print(f"--- Preparing Crop job for: {base_file.name} ---")
+        base_file = base_file.resolve()
+        output_dir = output_dir.resolve()
+
+        if not base_file.exists():
+            raise FileNotFoundError(f"Input file not found: {base_file}")
+
+        # Inspect dimensions locally using tifffile
+        # This saves MATLAB from guessing/scanning the whole file header
+        with tifffile.TiffFile(base_file) as tif:
+            series = tif.series[0]
+            shape = series.shape
+            # Detect dimensions (ZCYX or TZCXY)
+            ndim = len(shape)
+            if ndim == 4:  # ZCYX
+                T, Z, C, Y, X = 1, shape[0], shape[1], shape[2], shape[3]
+            elif ndim == 5:  # TZCXY
+                T, Z, C, Y, X = shape
+            else:
+                raise ValueError(f"Unsupported dimensions: {shape}")
+
+        print(f"  Detected Shape: T={T}, Z={Z}, C={C}, Y={Y}, X={X}")
+
+        # Convert python slices to JSON-safe lists [start, stop]
+        top_roi_list = (
+            [_slice_to_list(top_roi[0]), _slice_to_list(top_roi[1])] if top_roi else []
+        )
+        bot_roi_list = (
+            [_slice_to_list(bottom_roi[0]), _slice_to_list(bottom_roi[1])]
+            if bottom_roi
+            else []
+        )
+
+        payload = {
+            "jobType": "crop",
+            "dataDir": str(base_file),
+            "baseName": sanitized_name,
+            "parameters": {
+                "output_dir": str(output_dir),
+                "channels_to_output": channels_to_output,
+                "rotate_90": rotate_90,
+                "top_roi": top_roi_list,
+                "bottom_roi": bot_roi_list,
+                "dims": {"T": T, "Z": Z, "C": C, "Y": Y, "X": X},
+                **kwargs,
+            },
+        }
 
         return _submit_job(payload)
 
     except Exception as e:
-        print(f"\n❌ Error submitting Decon job: {e}")
+        print(f"\n❌ Error submitting Crop job: {e}")
         raise
 
 

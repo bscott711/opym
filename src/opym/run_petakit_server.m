@@ -1,18 +1,9 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
+% Usage: matlab -nodisplay -r "run_petakit_server"
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
-% Try to get path from environment (passed by launch script)
-petakit_source_path = getenv('PETAKIT_ROOT');
-
-% Fallback if running manually without the launcher
-if isempty(petakit_source_path)
-    petakit_source_path = '/cm/shared/apps_local/petakit5d';
-    fprintf('[Server] Warning: PETAKIT_ROOT not set. Using default: %s\n', petakit_source_path);
-else
-    fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
-end
-
+petakit_source_path = '/cm/shared/apps_local/petakit5d';
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
@@ -85,12 +76,161 @@ while true
             p = struct();
         end
 
-        % Determine Job Type (Default to 'deskew' if missing)
+        % Determine Job Type
         jobType = safelyGetParam(job, 'jobType', 'deskew');
 
         switch jobType
+            case 'crop'
+                % --- CROPPING JOB ---
+                fprintf('         Type: Crop/Rotate\n');
+                inputFile  = job.dataDir;
+                outputDir  = safelyGetParam(p, 'output_dir', '');
+                baseName   = job.baseName;
+                channels   = safelyGetParam(p, 'channels_to_output', []);
+                rotate90   = safelyGetParam(p, 'rotate_90', false);
+
+                % Get Dimensions
+                dims = p.dims;
+                T = dims.T; Z = dims.Z; C = dims.C; Y = dims.Y; X = dims.X;
+
+                % Parse ROIs (Convert Python [start, stop] to MATLAB indices)
+                % Python slice: [start, stop). MATLAB: start+1 : stop
+                topRoiRaw = safelyGetParam(p, 'top_roi', []);
+                botRoiRaw = safelyGetParam(p, 'bottom_roi', []);
+
+                % Helper to convert ROI or return empty
+                parseRoi = @(r) (~isempty(r)) * struct('y', r(1).', 'x', r(2).');
+
+                % Convert the nested cell arrays/structs from JSON
+                % Logic: JSON [[ystart,ystop], [xstart,xstop]]
+                topData = []; botData = [];
+                if ~isempty(topRoiRaw)
+                    % Convert 0-based [start, stop) to 1-based [start+1, stop]
+                    yS = topRoiRaw{1}; xS = topRoiRaw{2};
+                    topData.ys = yS(1)+1; topData.ye = yS(2);
+                    topData.xs = xS(1)+1; topData.xe = xS(2);
+                end
+                if ~isempty(botRoiRaw)
+                    yS = botRoiRaw{1}; xS = botRoiRaw{2};
+                    botData.ys = yS(1)+1; botData.ye = yS(2);
+                    botData.xs = xS(1)+1; botData.xe = xS(2);
+                end
+
+                if ~exist(outputDir, 'dir'), mkdir(outputDir); end
+
+                fprintf('         Input: %s\n', inputFile);
+                fprintf('         Output: %s\n', outputDir);
+                fprintf('         Parfor over %d Timepoints...\n', T);
+
+                % PARALLEL LOOP
+                parfor t = 0:(T-1)
+                    % Read full Z-stack for this timepoint
+                    % OME-TIFF Structure: Usually interleaved.
+                    % Index = t*Z*C + z*C + c + 1
+
+                    % Pre-allocate output stacks
+                    % Dimensions depend on rotation
+                    if ~isempty(topData)
+                        h = topData.ye - topData.ys + 1;
+                        w = topData.xe - topData.xs + 1;
+                    else
+                        h = botData.ye - botData.ys + 1;
+                        w = botData.xe - botData.xs + 1;
+                    end
+
+                    if rotate90
+                        stackSize = [Z, w, h]; % ZYX after rot
+                    else
+                        stackSize = [Z, h, w];
+                    end
+
+                    % We need a map to store data before writing
+                    % Keys: channel index (0,1,2,3). Value: 3D array.
+                    stackMap = containers.Map('KeyType','double','ValueType','any');
+
+                    % Initialize requested stacks
+                    chanList = cell2mat(channels);
+                    for k = 1:length(chanList)
+                        stackMap(chanList(k)) = zeros(stackSize, 'uint16');
+                    end
+
+                    % Read and Crop Z-slices
+                    % WARNING: imread in parfor on same file *can* be tricky but usually safe for read
+                    % Using Tiff object is faster but cannot be passed in/out of parfor easily.
+                    % We use imread for simplicity and robustness.
+
+                    for z = 0:(Z-1)
+                        % Read Cam0 (c=0) and Cam1 (c=1)
+                        idx0 = t*Z*C + z*C + 0 + 1;
+                        idx1 = t*Z*C + z*C + 1 + 1;
+
+                        img0 = imread(inputFile, idx0);
+                        img1 = imread(inputFile, idx1);
+
+                        % Process Channels
+                        % Map: 0=BotC0, 1=TopC0, 2=TopC1, 3=BotC1
+
+                        % Channel 0 (Bottom Cam0)
+                        if isKey(stackMap, 0) && ~isempty(botData)
+                            crop = img0(botData.ys:botData.ye, botData.xs:botData.xe);
+                            if rotate90, crop = rot90(crop); end
+                            temp = stackMap(0); temp(z+1,:,:) = crop; stackMap(0) = temp;
+                        end
+
+                        % Channel 1 (Top Cam0)
+                        if isKey(stackMap, 1) && ~isempty(topData)
+                            crop = img0(topData.ys:topData.ye, topData.xs:topData.xe);
+                            if rotate90, crop = rot90(crop); end
+                            temp = stackMap(1); temp(z+1,:,:) = crop; stackMap(1) = temp;
+                        end
+
+                        % Channel 2 (Top Cam1)
+                        if isKey(stackMap, 2) && ~isempty(topData)
+                            crop = img1(topData.ys:topData.ye, topData.xs:topData.xe);
+                            if rotate90, crop = rot90(crop); end
+                            temp = stackMap(2); temp(z+1,:,:) = crop; stackMap(2) = temp;
+                        end
+
+                        % Channel 3 (Bottom Cam1)
+                        if isKey(stackMap, 3) && ~isempty(botData)
+                            crop = img1(botData.ys:botData.ye, botData.xs:botData.xe);
+                            if rotate90, crop = rot90(crop); end
+                            temp = stackMap(3); temp(z+1,:,:) = crop; stackMap(3) = temp;
+                        end
+                    end
+
+                    % Write Tiffs
+                    % Filename: sanitized_C#_T###.tif
+                    keys = stackMap.keys;
+                    for k = 1:length(keys)
+                        cIdx = keys{k};
+                        outName = sprintf('%s_C%d_T%03d.tif', baseName, cIdx, t);
+                        outPath = fullfile(outputDir, outName);
+
+                        dataToWrite = stackMap(cIdx);
+
+                        % Write 3D Tiff
+                        % Use Tiff class for 3D writing
+                        tObj = Tiff(outPath, 'w');
+                        tagstruct.ImageLength = size(dataToWrite, 2);
+                        tagstruct.ImageWidth = size(dataToWrite, 3);
+                        tagstruct.Photometric = Tiff.Photometric.MinIsBlack;
+                        tagstruct.BitsPerSample = 16;
+                        tagstruct.SamplesPerPixel = 1;
+                        tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
+                        tagstruct.Software = 'MATLAB';
+
+                        for zSlice = 1:size(dataToWrite, 1)
+                            tObj.setTag(tagstruct);
+                            tObj.write(squeeze(dataToWrite(zSlice,:,:)));
+                            tObj.writeDirectory();
+                        end
+                        tObj.close();
+                    end
+                end
+
             case 'decon'
-                % --- DECONVOLUTION JOB ---
+                % ... [SAME AS BEFORE] ...
                 fprintf('         Type: Deconvolution\n');
                 fprintf('         Data: %s\n', job.dataDir);
 
@@ -123,7 +263,7 @@ while true
                 );
 
             otherwise
-                % --- DESKEW/ROTATE JOB (Default) ---
+                % ... [SAME AS BEFORE] ...
                 fprintf('         Type: Deskew/Rotate\n');
 
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
@@ -135,14 +275,10 @@ while true
                 val_reverseZ    = safelyGetParam(p, 'reverse_z', false);
                 val_dsDir       = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir      = safelyGetParam(p, 'dsr_dir_name', 'DSR');
-
-                % FIX: Read interp_method (Default to 'cubic')
                 val_interp      = safelyGetParam(p, 'interp_method', 'cubic');
 
                 fprintf('         Data: %s\n', job.dataDir);
                 fprintf('         Out:  %s\n', val_dsrDir);
-                fprintf('         Params: xy=%.4f, dz=%.3f, angle=%.2f, interp=%s\n', ...
-                        val_xyPixelSize, val_dz, val_skewAngle, val_interp);
 
                 XR_deskew_rotate_data_wrapper( ...
                     {job.dataDir}, ...
@@ -156,7 +292,7 @@ while true
                     'skewAngle', val_skewAngle, ...
                     'objectiveScan', val_objScan, ...
                     'reverse', val_reverseZ, ...
-                    'interpMethod', val_interp, ... % <-- Passed to PetaKit
+                    'interpMethod', val_interp, ...
                     'save16bit', true, ...
                     'save3DStack', true, ...
                     'saveMIP', true, ...
