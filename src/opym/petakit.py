@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import tifffile  # Needed to inspect dimensions for cropping jobs
+import tifffile
 
 # --- CONFIGURATION ---
 BASE_JOB_DIR = Path.home() / "petakit_jobs"
@@ -83,11 +83,66 @@ def _slice_to_list(s: slice | None) -> list[int] | None:
     """Converts a python slice object to a [start, stop] list for JSON."""
     if s is None:
         return None
-    # Handle None in slice (e.g. [:100])
     start = s.start if s.start is not None else 0
-    # We assume stop is provided for ROIs, but handle edge case
     stop = s.stop if s.stop is not None else -1
     return [int(start), int(stop)]
+
+
+def _build_file_map(base_file: Path) -> list[dict]:
+    """
+    Scans for Micro-Manager split OME-TIFFs (file.ome.tif, file_1.ome.tif...).
+    Returns a list of dicts mapping global frame indices to specific files.
+    """
+    print("  Scanning for split file chunks...")
+
+    if base_file.name.endswith(".ome.tif"):
+        stem = base_file.name[:-8]
+    elif base_file.name.endswith(".tif"):
+        stem = base_file.stem
+    else:
+        stem = base_file.name
+
+    parent = base_file.parent
+
+    chunks = []
+    if base_file.exists():
+        chunks.append((0, base_file))
+
+    pattern = re.compile(re.escape(stem) + r"_(\d+)\.ome\.tif$")
+
+    for f in parent.glob(f"{stem}_*.ome.tif"):
+        m = pattern.match(f.name)
+        if m:
+            idx = int(m.group(1))
+            chunks.append((idx, f))
+
+    chunks.sort(key=lambda x: x[0])
+
+    sorted_files = [c[1] for c in chunks]
+    print(f"  Found {len(sorted_files)} file chunk(s).")
+
+    file_map = []
+    current_global_start = 0
+
+    for f in sorted_files:
+        try:
+            with tifffile.TiffFile(f) as tif:
+                count = len(tif.pages)
+        except Exception as e:
+            print(f"    ⚠️ Warning: Could not read {f.name}: {e}")
+            break
+
+        entry = {
+            "path": str(f),
+            "start": current_global_start,
+            "count": count,
+            "end": current_global_start + count,  # exclusive
+        }
+        file_map.append(entry)
+        current_global_start += count
+
+    print(f"  Total available frames mapped: {current_global_start}")
+    return file_map
 
 
 def run_petakit_processing(
@@ -199,7 +254,6 @@ def run_cropping_processing(
 ) -> str:
     """
     Submits a 'crop' job to the MATLAB server.
-    Inspects file dimensions locally first to pass to MATLAB.
     """
     try:
         print(f"--- Preparing Crop job for: {base_file.name} ---")
@@ -209,23 +263,37 @@ def run_cropping_processing(
         if not base_file.exists():
             raise FileNotFoundError(f"Input file not found: {base_file}")
 
-        # Inspect dimensions locally using tifffile
-        # This saves MATLAB from guessing/scanning the whole file header
+        # Inspect dimensions
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
             shape = series.shape
-            # Detect dimensions (ZCYX or TZCXY)
             ndim = len(shape)
-            if ndim == 4:  # ZCYX
+            if ndim == 4:
                 T, Z, C, Y, X = 1, shape[0], shape[1], shape[2], shape[3]
-            elif ndim == 5:  # TZCXY
+            elif ndim == 5:
                 T, Z, C, Y, X = shape
             else:
                 raise ValueError(f"Unsupported dimensions: {shape}")
 
-        print(f"  Detected Shape: T={T}, Z={Z}, C={C}, Y={Y}, X={X}")
+        print(f"  Metadata Shape: T={T}, Z={Z}, C={C}, Y={Y}, X={X}")
 
-        # Convert python slices to JSON-safe lists [start, stop]
+        file_map = _build_file_map(base_file)
+
+        total_frames_mapped = file_map[-1]["end"] if file_map else 0
+        expected_frames = T * Z * C
+
+        # --- FIX: Split string manually to avoid syntax error in f-string ---
+        if total_frames_mapped < expected_frames:
+            msg = (
+                f"⚠️  Warning: File map found {total_frames_mapped} frames, "
+                f"but metadata expects {expected_frames}."
+            )
+            print(msg)
+            if Z * C > 0:
+                T_new = total_frames_mapped // (Z * C)
+                print(f"    📉 Adjusting job to T={T_new}")
+                T = T_new
+
         top_roi_list = (
             [_slice_to_list(top_roi[0]), _slice_to_list(top_roi[1])] if top_roi else []
         )
@@ -246,6 +314,7 @@ def run_cropping_processing(
                 "top_roi": top_roi_list,
                 "bottom_roi": bot_roi_list,
                 "dims": {"T": T, "Z": Z, "C": C, "Y": Y, "X": X},
+                "file_map": file_map,
                 **kwargs,
             },
         }
@@ -267,14 +336,14 @@ def wait_for_job(job_filename: str, poll_interval: int = 5) -> None:
 
     while True:
         if job_path_done.exists():
-            print(
-                f"\n✅ Job Completed Successfully! "
-                f"(Time: {time.time() - start_time:.1f}s)"
-            )
+            duration = time.time() - start_time
+            # --- FIX: Manual string concatenation for safe line wrapping ---
+            print(f"\n✅ Job Completed Successfully! (Time: {duration:.1f}s)")
             return
 
         if job_path_fail.exists():
-            print(f"\n❌ Job Failed! (Time: {time.time() - start_time:.1f}s)")
+            duration = time.time() - start_time
+            print(f"\n❌ Job Failed! (Time: {duration:.1f}s)")
             log_file = FAILED_DIR / f"{job_filename}.log"
             if log_file.exists():
                 print("-" * 40)

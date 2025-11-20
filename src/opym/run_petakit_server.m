@@ -5,7 +5,6 @@
 petakit_source_path = '/cm/shared/apps_local/petakit5d';
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
-% --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('SLURM_CPUS_PER_TASK');
 if ~isempty(envCPUs)
     numCPUs = str2double(envCPUs);
@@ -15,7 +14,6 @@ else
     fprintf('[Server] No Slurm CPU count found. Using fallback: %d\n', numCPUs);
 end
 
-% Setup Directories
 queue_dir = fullfile(base_queue_dir, 'queue');
 done_dir  = fullfile(base_queue_dir, 'completed');
 fail_dir  = fullfile(base_queue_dir, 'failed');
@@ -24,7 +22,6 @@ if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
 if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
-% --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
         run(fullfile(petakit_source_path, 'setup.m'));
@@ -49,7 +46,6 @@ end
 
 fprintf('[Server] Ready. Watching: %s\n', queue_dir);
 
-% --- MAIN SERVER LOOP ----------------------------------------------------
 while true
     jobFiles = dir(fullfile(queue_dir, '*.json'));
 
@@ -81,37 +77,31 @@ while true
             case 'crop'
                 % --- CROPPING JOB ---
                 fprintf('         Type: Crop/Rotate\n');
-                inputFile  = job.dataDir;
                 outputDir  = safelyGetParam(p, 'output_dir', '');
                 baseName   = job.baseName;
                 channels   = safelyGetParam(p, 'channels_to_output', []);
                 rotate90   = safelyGetParam(p, 'rotate_90', false);
+                fileMap    = safelyGetParam(p, 'file_map', []); % NEW: File Map
 
                 dims = p.dims;
                 T = dims.T; Z = dims.Z; C = dims.C; Y = dims.Y; X = dims.X;
 
-                % ROI Parsing
                 topRoiRaw = safelyGetParam(p, 'top_roi', []);
                 botRoiRaw = safelyGetParam(p, 'bottom_roi', []);
 
                 topData = []; botData = [];
+
                 if ~isempty(topRoiRaw)
-                    if iscell(topRoiRaw)
-                        yS = topRoiRaw{1}; xS = topRoiRaw{2};
-                    else
-                        yS = topRoiRaw(1,:); xS = topRoiRaw(2,:);
-                    end
+                    if iscell(topRoiRaw), yS = topRoiRaw{1}; xS = topRoiRaw{2};
+                    else, yS = topRoiRaw(1,:); xS = topRoiRaw(2,:); end
                     yS = double(yS); xS = double(xS);
                     topData.ys = yS(1)+1; topData.ye = yS(2);
                     topData.xs = xS(1)+1; topData.xe = xS(2);
                 end
 
                 if ~isempty(botRoiRaw)
-                    if iscell(botRoiRaw)
-                        yS = botRoiRaw{1}; xS = botRoiRaw{2};
-                    else
-                        yS = botRoiRaw(1,:); xS = botRoiRaw(2,:);
-                    end
+                    if iscell(botRoiRaw), yS = botRoiRaw{1}; xS = botRoiRaw{2};
+                    else, yS = botRoiRaw(1,:); xS = botRoiRaw(2,:); end
                     yS = double(yS); xS = double(xS);
                     botData.ys = yS(1)+1; botData.ye = yS(2);
                     botData.xs = xS(1)+1; botData.xe = xS(2);
@@ -119,20 +109,14 @@ while true
 
                 if ~exist(outputDir, 'dir'), mkdir(outputDir); end
 
-                if iscell(channels)
-                    chanList = cell2mat(channels);
-                else
-                    chanList = double(channels);
-                end
+                if iscell(channels), chanList = cell2mat(channels);
+                else, chanList = double(channels); end
 
-                fprintf('         Parfor over %d Timepoints...\n', T);
+                fprintf('         Parfor over %d Timepoints (Multi-file aware)...\n', T);
 
-                % --- FIX: Call Helper Function for Parfor ---
-                runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData);
-                % --------------------------------------------
+                runCropParfor(fileMap, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData);
 
             case 'decon'
-                % --- DECONVOLUTION JOB ---
                 fprintf('         Type: Deconvolution\n');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {});
@@ -163,7 +147,6 @@ while true
                 );
 
             otherwise
-                % --- DESKEW/ROTATE JOB ---
                 fprintf('         Type: Deskew/Rotate\n');
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
@@ -215,8 +198,7 @@ while true
     end
 end
 
-% --- HELPER FUNCTIONS ---
-
+% --- HELPERS ---
 function val = safelyGetParam(structure, fieldName, defaultValue)
     if isfield(structure, fieldName)
         val = structure.(fieldName);
@@ -228,10 +210,38 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
     end
 end
 
-function runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData)
+% NEW: Helper to find which file contains the global index
+function [fPath, localIdx] = getFileForIndex(globalIdx, fMap)
+    % globalIdx is 0-based from MATLAB calculation (t*Z*C + ...)
+    % We convert to 1-based for output at the very end if needed,
+    % but imread 2nd arg is the "Index", which is 1-based.
+
+    % Iterate through map to find the range
+    % fMap is a struct array with fields: path, start, count, end
+
+    for i = 1:length(fMap)
+        fStart = fMap(i).start; % 0-based
+        fEnd   = fMap(i).end;   % exclusive
+
+        if globalIdx >= fStart && globalIdx < fEnd
+            fPath = fMap(i).path;
+            % Calculate 1-based index for that specific file
+            % Offset = globalIdx - fStart
+            % MATLAB imread index = Offset + 1
+            localIdx = (globalIdx - fStart) + 1;
+            return;
+        end
+    end
+
+    error('Global index %d out of bounds for mapped files.', globalIdx);
+end
+
+function runCropParfor(fileMap, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData)
+    % Convert struct array from JSON to MATLAB struct array if needed
+    % Usually jsondecode makes a struct array automatically.
+
     parfor t = 0:(T-1)
-        % Dimension Calc (Inside loop to be safe, or pass in)
-        % We need to calculate output size for allocating zeros
+        % Calculate Dimensions
         if ~isempty(topData)
             h = topData.ye - topData.ys + 1;
             w = topData.xe - topData.xs + 1;
@@ -252,11 +262,16 @@ function runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z,
         end
 
         for z = 0:(Z-1)
-            idx0 = t*Z*C + z*C + 0 + 1;
-            idx1 = t*Z*C + z*C + 1 + 1;
+            % Global 0-based indices (interleaved)
+            gIdx0 = t*Z*C + z*C + 0;
+            gIdx1 = t*Z*C + z*C + 1;
 
-            img0 = imread(inputFile, idx0);
-            img1 = imread(inputFile, idx1);
+            % Resolve File and Local Index
+            [fPath0, lIdx0] = getFileForIndex(gIdx0, fileMap);
+            [fPath1, lIdx1] = getFileForIndex(gIdx1, fileMap);
+
+            img0 = imread(fPath0, lIdx0);
+            img1 = imread(fPath1, lIdx1);
 
             if isKey(stackMap, 0) && ~isempty(botData)
                 crop = img0(botData.ys:botData.ye, botData.xs:botData.xe);
@@ -288,7 +303,7 @@ function runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z,
 
             dataToWrite = stackMap(cIdx);
 
-            % Initialize tagstruct locally to avoid classification error
+            tObj = Tiff(outPath, 'w');
             tagstruct = struct();
             tagstruct.ImageLength = size(dataToWrite, 2);
             tagstruct.ImageWidth = size(dataToWrite, 3);
@@ -298,7 +313,6 @@ function runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z,
             tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
             tagstruct.Software = 'MATLAB';
 
-            tObj = Tiff(outPath, 'w');
             for zSlice = 1:size(dataToWrite, 1)
                 tObj.setTag(tagstruct);
                 tObj.write(squeeze(dataToWrite(zSlice,:,:)));

@@ -1,168 +1,162 @@
-import json
+#!/usr/bin/env python3
+"""
+Robust Auto-Fixer for Line Lengths (E501).
+Safely splits long strings, respecting f-string expressions.
+"""
+
 import re
-import shutil
-import subprocess  # nosec B404
+import sys
 from pathlib import Path
 
-
-def get_indentation(line: str) -> str:
-    """Returns the whitespace at the start of the line."""
-    return line[: len(line) - len(line.lstrip())]
+LINE_LIMIT = 88
 
 
-def extract_limit_from_message(message: str) -> int:
+def is_inside_fstring_expression(line: str, split_index: int) -> bool:
     """
-    Parses Ruff error message to find the configured line length limit.
+    Determines if the split_index is inside an f-string expression {...}.
+    This prevents splitting like: f"Value: {calc - " \n " 1}"
     """
-    match = re.search(r"Line too long \(\d+ > (\d+)\)", message)
-    if match:
-        return int(match.group(1))
-    return 88  # Default fallback
+    # Find the start of the string (simplified for common cases)
+    match = re.search(r'f["\']', line)
+    if not match:
+        return False  # Not an f-string, safe to split (mostly)
+
+    start_quote = match.start()
+
+    # Count braces from the start of the string up to the split point
+    # We only care about braces *inside* the string content
+    balance = 0
+
+    for i, char in enumerate(line):
+        if i >= split_index:
+            break
+
+        if i < start_quote:
+            continue
+
+        if char == "{":
+            balance += 1
+        elif char == "}":
+            balance -= 1
+
+    # If balance > 0, we are inside a { ... } block
+    return balance > 0
 
 
-def split_long_line(line_content: str, target_len: int) -> str:
-    """
-    Splits a line containing a long string or comment into two lines.
-    """
-    if len(line_content) <= target_len:
-        return line_content
+def fix_file(file_path: Path):
+    content = file_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    new_lines = []
+    modified = False
 
-    indent = get_indentation(line_content)
-    stripped = line_content.lstrip()
+    for i, line in enumerate(lines):
+        if len(line) <= LINE_LIMIT:
+            new_lines.append(line)
+            continue
 
-    # --- STRATEGY 1: Full-Line Comments ---
-    if stripped.startswith("#"):
-        # Skip special comments (shebang, encoding, pylint/ruff ignores)
-        if stripped.startswith("#!") or "coding=" in stripped or "noqa" in stripped:
-            return line_content
+        # Check for string patterns we can split
+        # Matches:  variable = "string content..." or return f"string..."
+        # Group 1: Indentation + Variable/Code
+        # Group 2: Quote type (", ', f", f')
+        # Group 3: String content
+        # Group 4: End quote
+        match = re.match(r'^(\s*.*?)((?:f|r)?["\'])(.*)(["\']\s*[\),]?)$', line)
 
-        split_idx = line_content.rfind(" ", 0, target_len)
+        if match:
+            prefix = match.group(1)
+            quote_start = match.group(2)  # e.g. f"
+            content_str = match.group(3)
+            suffix = match.group(4)  # e.g. ",
 
-        if split_idx < len(indent) + 2:
-            return line_content
+            # Calculate raw quote character ( " or ' )
+            raw_quote = quote_start[-1]
 
-        prefix = line_content[:split_idx]
-        suffix = line_content[split_idx + 1 :]
+            # Calculate available space
+            current_len = (
+                len(prefix) + len(quote_start) + len(content_str) + len(suffix)
+            )
+            excess = current_len - LINE_LIMIT
 
-        return f"{prefix}\n{indent}# {suffix}"
-
-    # --- STRATEGY 2: Strings (Implicit Concatenation) ---
-    if " " not in line_content or ("'" not in line_content and '"' not in line_content):
-        return line_content
-
-    quote_char = '"' if '"' in line_content else "'"
-    limit = target_len - 5
-    if limit < 10:
-        limit = 80
-
-    split_idx = line_content.rfind(" ", 0, limit)
-
-    if split_idx < len(indent) + 5:
-        return line_content
-
-    prefix = line_content[:split_idx]
-    suffix = line_content[split_idx + 1 :]
-
-    return f"{prefix} {quote_char}\n{indent}    {quote_char}{suffix}"
-
-
-def fix_python_file(file_path: Path, errors: list):
-    try:
-        with open(file_path, encoding="utf-8") as f:
-            lines = f.readlines()
-
-        modified = False
-        errors.sort(key=lambda x: x["location"]["row"], reverse=True)
-
-        for err in errors:
-            if err["code"] != "E501":
+            if excess <= 0:
+                new_lines.append(line)
                 continue
 
-            line_idx = err["location"]["row"] - 1
-            limit = extract_limit_from_message(err["message"])
+            # Determine split point (try to split at space)
+            # We want the first part to be around LINE_LIMIT length
+            target_len = (
+                LINE_LIMIT - len(prefix) - len(quote_start) - 2
+            )  # -2 for closing quote and slash
 
-            if 0 <= line_idx < len(lines):
-                original = lines[line_idx].rstrip("\n")
-                fixed = split_long_line(original, target_len=limit)
+            if target_len <= 10:  # Too cramped to split properly
+                new_lines.append(line)
+                continue
 
-                if fixed != original:
-                    lines[line_idx] = fixed + "\n"
-                    modified = True
-                    print(f"  ✅ Fixed line {line_idx + 1} (Limit: {limit})")
-                else:
-                    print(f"  ⚠️  Skipped line {line_idx + 1} (Too complex)")
+            # Find safe split index
+            # Look for space closest to target_len from the left
+            split_candidate = -1
+            for j in range(target_len, 0, -1):
+                if j < len(content_str) and content_str[j] == " ":
+                    split_candidate = j
+                    break
 
-        if modified:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+            if split_candidate == -1:
+                # No spaces? Force split at limit
+                split_candidate = target_len
 
-    except Exception as e:
-        print(f"  ❌ Error processing {file_path}: {e}")
+            # --- SAFETY CHECK: Don't split inside f-string expressions ---
+            if "f" in quote_start and is_inside_fstring_expression(
+                line, len(prefix) + len(quote_start) + split_candidate
+            ):
+                print(f"⚠️  Skipping unsafe f-string split in {file_path.name}:{i + 1}")
+                new_lines.append(line)
+                continue
+            # -------------------------------------------------------------
+
+            part1 = content_str[:split_candidate]
+            part2 = content_str[
+                split_candidate:
+            ]  # Include the space in second part or keep in first?
+            # Usually better to keep space at end of line or start of next.
+
+            # Construct new lines
+            # Line 1: prefix + quote_start + part1 + " " (implicit concatenation)
+            # OR use explicit backslash if inside function call?
+            # Safer to use implicit string concatenation with parens,
+            # but here we use standard split.
+
+            # Approach: Close quote, newline, indent, open quote
+            indent = " " * (len(prefix) + 4)  # Simple indent
+
+            # Handle parenthesis wrapping if detected
+            if prefix.strip().endswith("("):
+                indent = " " * len(prefix)
+
+            line1 = f"{prefix}{quote_start}{part1}{raw_quote}"
+            line2 = f"{indent}{quote_start}{part2}{suffix}"
+
+            new_lines.append(line1)
+            new_lines.append(line2)
+            modified = True
+            print(f"Fixed line {i + 1} in {file_path.name}")
+        else:
+            new_lines.append(line)
+
+    if modified:
+        file_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
 def main():
-    print("🚀 Running Ruff (using pyproject.toml rules)...")
+    if len(sys.argv) < 2:
+        print("Usage: python autofix_long_lines.py <file_or_directory>")
+        sys.exit(1)
 
-    # SECURITY FIX: Resolve the full path to the executable
-    # This prevents B607 (starting process with partial path)
-    ruff_executable = shutil.which("ruff")
-    if not ruff_executable:
-        print("❌ Error: 'ruff' executable not found in PATH.")
-        return
+    target = Path(sys.argv[1])
 
-    try:
-        # SECURITY FIX: Added nosec B603
-        # We are passing a known executable and hardcoded arguments.
-        result = subprocess.run(
-            [ruff_executable, "check", ".", "--output-format", "json"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )  # nosec B603
-    except Exception as e:
-        print(f"❌ Error executing ruff: {e}")
-        return
-
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        if not result.stdout.strip():
-            print("✅ No errors output by Ruff.")
-        else:
-            print("⚠️  Ruff output was not valid JSON.")
-        return
-
-    e501_errors = [e for e in data if e["code"] == "E501"]
-
-    if not e501_errors:
-        print("✅ No E501 (Line too long) errors found.")
-        return
-
-    files_map = {}
-    for item in e501_errors:
-        fname = item["filename"]
-        if fname not in files_map:
-            files_map[fname] = []
-        files_map[fname].append(item)
-
-    print(
-        f"⚠️  Found {len(e501_errors)} line-length errors in {len(files_map)} files.\n"
-    )
-
-    for fname, errs in files_map.items():
-        path = Path(fname)
-        if not path.exists():
-            continue
-
-        print(f"📄 Checking {fname}...")
-        if fname.endswith(".py"):
-            fix_python_file(path, errs)
-        elif fname.endswith(".ipynb"):
-            print("  ⚠️  Skipping Notebook (Manual edit recommended).")
-        else:
-            print("  ℹ️  Skipping non-Python file.")
-
-    print("\n✨ Done.")
+    if target.is_file():
+        fix_file(target)
+    elif target.is_dir():
+        for py_file in target.rglob("*.py"):
+            fix_file(py_file)
 
 
 if __name__ == "__main__":
