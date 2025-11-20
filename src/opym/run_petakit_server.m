@@ -75,12 +75,11 @@ while true
             p = struct();
         end
 
-        % Determine Job Type
         jobType = safelyGetParam(job, 'jobType', 'deskew');
 
         switch jobType
             case 'crop'
-                % --- CROPPING JOB (New Logic) ---
+                % --- CROPPING JOB ---
                 fprintf('         Type: Crop/Rotate\n');
                 inputFile  = job.dataDir;
                 outputDir  = safelyGetParam(p, 'output_dir', '');
@@ -91,28 +90,48 @@ while true
                 dims = p.dims;
                 T = dims.T; Z = dims.Z; C = dims.C; Y = dims.Y; X = dims.X;
 
-                % Parse ROIs (Convert Python 0-based [start, stop] to MATLAB 1-based)
+                % --- FIX: Handle ROI Parsing (Matrix vs Cell) ---
                 topRoiRaw = safelyGetParam(p, 'top_roi', []);
                 botRoiRaw = safelyGetParam(p, 'bottom_roi', []);
 
                 topData = []; botData = [];
+
                 if ~isempty(topRoiRaw)
-                    yS = topRoiRaw{1}; xS = topRoiRaw{2};
+                    if iscell(topRoiRaw)
+                        yS = topRoiRaw{1}; xS = topRoiRaw{2};
+                    else
+                        yS = topRoiRaw(1,:); xS = topRoiRaw(2,:);
+                    end
+                    yS = double(yS); xS = double(xS);
                     topData.ys = yS(1)+1; topData.ye = yS(2);
                     topData.xs = xS(1)+1; topData.xe = xS(2);
                 end
+
                 if ~isempty(botRoiRaw)
-                    yS = botRoiRaw{1}; xS = botRoiRaw{2};
+                    if iscell(botRoiRaw)
+                        yS = botRoiRaw{1}; xS = botRoiRaw{2};
+                    else
+                        yS = botRoiRaw(1,:); xS = botRoiRaw(2,:);
+                    end
+                    yS = double(yS); xS = double(xS);
                     botData.ys = yS(1)+1; botData.ye = yS(2);
                     botData.xs = xS(1)+1; botData.xe = xS(2);
                 end
+                % ---------------------------------------------
 
                 if ~exist(outputDir, 'dir'), mkdir(outputDir); end
 
                 fprintf('         Parfor over %d Timepoints...\n', T);
 
+                % --- FIX: Handle Channels Parsing ---
+                if iscell(channels)
+                    chanList = cell2mat(channels);
+                else
+                    chanList = double(channels);
+                end
+
                 parfor t = 0:(T-1)
-                    % Dimensions depend on rotation
+                    % Calc dimensions based on rotation
                     if ~isempty(topData)
                         h = topData.ye - topData.ys + 1;
                         w = topData.xe - topData.xs + 1;
@@ -127,22 +146,18 @@ while true
                         stackSize = [Z, h, w];
                     end
 
-                    % Use a Map to hold data in the workers
                     stackMap = containers.Map('KeyType','double','ValueType','any');
-                    chanList = cell2mat(channels);
                     for k = 1:length(chanList)
                         stackMap(chanList(k)) = zeros(stackSize, 'uint16');
                     end
 
                     for z = 0:(Z-1)
-                        % Calculate index (interleaved Z, then C)
                         idx0 = t*Z*C + z*C + 0 + 1;
                         idx1 = t*Z*C + z*C + 1 + 1;
 
                         img0 = imread(inputFile, idx0);
                         img1 = imread(inputFile, idx1);
 
-                        % Channel Mapping: 0=BotC0, 1=TopC0, 2=TopC1, 3=BotC1
                         if isKey(stackMap, 0) && ~isempty(botData)
                             crop = img0(botData.ys:botData.ye, botData.xs:botData.xe);
                             if rotate90, crop = rot90(crop); end
@@ -165,7 +180,6 @@ while true
                         end
                     end
 
-                    % Write Tiffs
                     keys = stackMap.keys;
                     for k = 1:length(keys)
                         cIdx = keys{k};
@@ -174,7 +188,6 @@ while true
 
                         dataToWrite = stackMap(cIdx);
 
-                        % Write 3D Tiff
                         tObj = Tiff(outPath, 'w');
                         tagstruct.ImageLength = size(dataToWrite, 2);
                         tagstruct.ImageWidth = size(dataToWrite, 3);
@@ -194,7 +207,6 @@ while true
                 end
 
             case 'decon'
-                % --- DECONVOLUTION JOB ---
                 fprintf('         Type: Deconvolution\n');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {});
@@ -225,7 +237,6 @@ while true
                 );
 
             otherwise
-                % --- DESKEW/ROTATE JOB ---
                 fprintf('         Type: Deskew/Rotate\n');
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
