@@ -90,12 +90,11 @@ while true
                 dims = p.dims;
                 T = dims.T; Z = dims.Z; C = dims.C; Y = dims.Y; X = dims.X;
 
-                % --- FIX: Handle ROI Parsing (Matrix vs Cell) ---
+                % ROI Parsing
                 topRoiRaw = safelyGetParam(p, 'top_roi', []);
                 botRoiRaw = safelyGetParam(p, 'bottom_roi', []);
 
                 topData = []; botData = [];
-
                 if ~isempty(topRoiRaw)
                     if iscell(topRoiRaw)
                         yS = topRoiRaw{1}; xS = topRoiRaw{2};
@@ -117,96 +116,23 @@ while true
                     botData.ys = yS(1)+1; botData.ye = yS(2);
                     botData.xs = xS(1)+1; botData.xe = xS(2);
                 end
-                % ---------------------------------------------
 
                 if ~exist(outputDir, 'dir'), mkdir(outputDir); end
 
-                fprintf('         Parfor over %d Timepoints...\n', T);
-
-                % --- FIX: Handle Channels Parsing ---
                 if iscell(channels)
                     chanList = cell2mat(channels);
                 else
                     chanList = double(channels);
                 end
 
-                parfor t = 0:(T-1)
-                    % Calc dimensions based on rotation
-                    if ~isempty(topData)
-                        h = topData.ye - topData.ys + 1;
-                        w = topData.xe - topData.xs + 1;
-                    else
-                        h = botData.ye - botData.ys + 1;
-                        w = botData.xe - botData.xs + 1;
-                    end
+                fprintf('         Parfor over %d Timepoints...\n', T);
 
-                    if rotate90
-                        stackSize = [Z, w, h];
-                    else
-                        stackSize = [Z, h, w];
-                    end
-
-                    stackMap = containers.Map('KeyType','double','ValueType','any');
-                    for k = 1:length(chanList)
-                        stackMap(chanList(k)) = zeros(stackSize, 'uint16');
-                    end
-
-                    for z = 0:(Z-1)
-                        idx0 = t*Z*C + z*C + 0 + 1;
-                        idx1 = t*Z*C + z*C + 1 + 1;
-
-                        img0 = imread(inputFile, idx0);
-                        img1 = imread(inputFile, idx1);
-
-                        if isKey(stackMap, 0) && ~isempty(botData)
-                            crop = img0(botData.ys:botData.ye, botData.xs:botData.xe);
-                            if rotate90, crop = rot90(crop); end
-                            temp = stackMap(0); temp(z+1,:,:) = crop; stackMap(0) = temp;
-                        end
-                        if isKey(stackMap, 1) && ~isempty(topData)
-                            crop = img0(topData.ys:topData.ye, topData.xs:topData.xe);
-                            if rotate90, crop = rot90(crop); end
-                            temp = stackMap(1); temp(z+1,:,:) = crop; stackMap(1) = temp;
-                        end
-                        if isKey(stackMap, 2) && ~isempty(topData)
-                            crop = img1(topData.ys:topData.ye, topData.xs:topData.xe);
-                            if rotate90, crop = rot90(crop); end
-                            temp = stackMap(2); temp(z+1,:,:) = crop; stackMap(2) = temp;
-                        end
-                        if isKey(stackMap, 3) && ~isempty(botData)
-                            crop = img1(botData.ys:botData.ye, botData.xs:botData.xe);
-                            if rotate90, crop = rot90(crop); end
-                            temp = stackMap(3); temp(z+1,:,:) = crop; stackMap(3) = temp;
-                        end
-                    end
-
-                    keys = stackMap.keys;
-                    for k = 1:length(keys)
-                        cIdx = keys{k};
-                        outName = sprintf('%s_C%d_T%03d.tif', baseName, cIdx, t);
-                        outPath = fullfile(outputDir, outName);
-
-                        dataToWrite = stackMap(cIdx);
-
-                        tObj = Tiff(outPath, 'w');
-                        tagstruct.ImageLength = size(dataToWrite, 2);
-                        tagstruct.ImageWidth = size(dataToWrite, 3);
-                        tagstruct.Photometric = Tiff.Photometric.MinIsBlack;
-                        tagstruct.BitsPerSample = 16;
-                        tagstruct.SamplesPerPixel = 1;
-                        tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
-                        tagstruct.Software = 'MATLAB';
-
-                        for zSlice = 1:size(dataToWrite, 1)
-                            tObj.setTag(tagstruct);
-                            tObj.write(squeeze(dataToWrite(zSlice,:,:)));
-                            tObj.writeDirectory();
-                        end
-                        tObj.close();
-                    end
-                end
+                % --- FIX: Call Helper Function for Parfor ---
+                runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData);
+                % --------------------------------------------
 
             case 'decon'
+                % --- DECONVOLUTION JOB ---
                 fprintf('         Type: Deconvolution\n');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {});
@@ -237,6 +163,7 @@ while true
                 );
 
             otherwise
+                % --- DESKEW/ROTATE JOB ---
                 fprintf('         Type: Deskew/Rotate\n');
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
@@ -288,6 +215,8 @@ while true
     end
 end
 
+% --- HELPER FUNCTIONS ---
+
 function val = safelyGetParam(structure, fieldName, defaultValue)
     if isfield(structure, fieldName)
         val = structure.(fieldName);
@@ -296,5 +225,86 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
         end
     else
         val = defaultValue;
+    end
+end
+
+function runCropParfor(inputFile, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData)
+    parfor t = 0:(T-1)
+        % Dimension Calc (Inside loop to be safe, or pass in)
+        % We need to calculate output size for allocating zeros
+        if ~isempty(topData)
+            h = topData.ye - topData.ys + 1;
+            w = topData.xe - topData.xs + 1;
+        else
+            h = botData.ye - botData.ys + 1;
+            w = botData.xe - botData.xs + 1;
+        end
+
+        if rotate90
+            stackSize = [Z, w, h];
+        else
+            stackSize = [Z, h, w];
+        end
+
+        stackMap = containers.Map('KeyType','double','ValueType','any');
+        for k = 1:length(chanList)
+            stackMap(chanList(k)) = zeros(stackSize, 'uint16');
+        end
+
+        for z = 0:(Z-1)
+            idx0 = t*Z*C + z*C + 0 + 1;
+            idx1 = t*Z*C + z*C + 1 + 1;
+
+            img0 = imread(inputFile, idx0);
+            img1 = imread(inputFile, idx1);
+
+            if isKey(stackMap, 0) && ~isempty(botData)
+                crop = img0(botData.ys:botData.ye, botData.xs:botData.xe);
+                if rotate90, crop = rot90(crop); end
+                temp = stackMap(0); temp(z+1,:,:) = crop; stackMap(0) = temp;
+            end
+            if isKey(stackMap, 1) && ~isempty(topData)
+                crop = img0(topData.ys:topData.ye, topData.xs:topData.xe);
+                if rotate90, crop = rot90(crop); end
+                temp = stackMap(1); temp(z+1,:,:) = crop; stackMap(1) = temp;
+            end
+            if isKey(stackMap, 2) && ~isempty(topData)
+                crop = img1(topData.ys:topData.ye, topData.xs:topData.xe);
+                if rotate90, crop = rot90(crop); end
+                temp = stackMap(2); temp(z+1,:,:) = crop; stackMap(2) = temp;
+            end
+            if isKey(stackMap, 3) && ~isempty(botData)
+                crop = img1(botData.ys:botData.ye, botData.xs:botData.xe);
+                if rotate90, crop = rot90(crop); end
+                temp = stackMap(3); temp(z+1,:,:) = crop; stackMap(3) = temp;
+            end
+        end
+
+        keys = stackMap.keys;
+        for k = 1:length(keys)
+            cIdx = keys{k};
+            outName = sprintf('%s_C%d_T%03d.tif', baseName, cIdx, t);
+            outPath = fullfile(outputDir, outName);
+
+            dataToWrite = stackMap(cIdx);
+
+            % Initialize tagstruct locally to avoid classification error
+            tagstruct = struct();
+            tagstruct.ImageLength = size(dataToWrite, 2);
+            tagstruct.ImageWidth = size(dataToWrite, 3);
+            tagstruct.Photometric = Tiff.Photometric.MinIsBlack;
+            tagstruct.BitsPerSample = 16;
+            tagstruct.SamplesPerPixel = 1;
+            tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
+            tagstruct.Software = 'MATLAB';
+
+            tObj = Tiff(outPath, 'w');
+            for zSlice = 1:size(dataToWrite, 1)
+                tObj.setTag(tagstruct);
+                tObj.write(squeeze(dataToWrite(zSlice,:,:)));
+                tObj.writeDirectory();
+            end
+            tObj.close();
+        end
     end
 end
