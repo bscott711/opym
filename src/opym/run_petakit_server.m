@@ -5,6 +5,7 @@
 petakit_source_path = '/cm/shared/apps_local/petakit5d';
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
+% --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('SLURM_CPUS_PER_TASK');
 if ~isempty(envCPUs)
     numCPUs = str2double(envCPUs);
@@ -14,6 +15,7 @@ else
     fprintf('[Server] No Slurm CPU count found. Using fallback: %d\n', numCPUs);
 end
 
+% Setup Directories
 queue_dir = fullfile(base_queue_dir, 'queue');
 done_dir  = fullfile(base_queue_dir, 'completed');
 fail_dir  = fullfile(base_queue_dir, 'failed');
@@ -75,13 +77,29 @@ while true
 
         switch jobType
             case 'crop'
-                % --- CROPPING JOB ---
                 fprintf('         Type: Crop/Rotate\n');
                 outputDir  = safelyGetParam(p, 'output_dir', '');
                 baseName   = job.baseName;
                 channels   = safelyGetParam(p, 'channels_to_output', []);
                 rotate90   = safelyGetParam(p, 'rotate_90', false);
-                fileMap    = safelyGetParam(p, 'file_map', []); % NEW: File Map
+                fileMap    = safelyGetParam(p, 'file_map', []);
+
+                % --- DEBUG: Print File Map ---
+                fprintf('         File Map Summary:\n');
+                if isempty(fileMap)
+                    fprintf('         [WARNING] File map is EMPTY!\n');
+                else
+                    % Handle struct array vs cell array vs single struct
+                    if isstruct(fileMap)
+                        for i = 1:length(fileMap)
+                            fprintf('           Chunk %d: %d -> %d (%s)\n', ...
+                                i, fileMap(i).start, fileMap(i).end, fileMap(i).path);
+                        end
+                    else
+                        fprintf('         [WARNING] fileMap is not a struct array. Type: %s\n', class(fileMap));
+                    end
+                end
+                % -----------------------------
 
                 dims = p.dims;
                 T = dims.T; Z = dims.Z; C = dims.C; Y = dims.Y; X = dims.X;
@@ -112,7 +130,7 @@ while true
                 if iscell(channels), chanList = cell2mat(channels);
                 else, chanList = double(channels); end
 
-                fprintf('         Parfor over %d Timepoints (Multi-file aware)...\n', T);
+                fprintf('         Parfor over %d Timepoints...\n', T);
 
                 runCropParfor(fileMap, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData);
 
@@ -198,7 +216,6 @@ while true
     end
 end
 
-% --- HELPERS ---
 function val = safelyGetParam(structure, fieldName, defaultValue)
     if isfield(structure, fieldName)
         val = structure.(fieldName);
@@ -210,38 +227,23 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
     end
 end
 
-% NEW: Helper to find which file contains the global index
 function [fPath, localIdx] = getFileForIndex(globalIdx, fMap)
-    % globalIdx is 0-based from MATLAB calculation (t*Z*C + ...)
-    % We convert to 1-based for output at the very end if needed,
-    % but imread 2nd arg is the "Index", which is 1-based.
-
     % Iterate through map to find the range
-    % fMap is a struct array with fields: path, start, count, end
-
     for i = 1:length(fMap)
         fStart = fMap(i).start; % 0-based
         fEnd   = fMap(i).end;   % exclusive
 
         if globalIdx >= fStart && globalIdx < fEnd
             fPath = fMap(i).path;
-            % Calculate 1-based index for that specific file
-            % Offset = globalIdx - fStart
-            % MATLAB imread index = Offset + 1
             localIdx = (globalIdx - fStart) + 1;
             return;
         end
     end
-
     error('Global index %d out of bounds for mapped files.', globalIdx);
 end
 
 function runCropParfor(fileMap, outputDir, baseName, chanList, rotate90, T, Z, C, topData, botData)
-    % Convert struct array from JSON to MATLAB struct array if needed
-    % Usually jsondecode makes a struct array automatically.
-
     parfor t = 0:(T-1)
-        % Calculate Dimensions
         if ~isempty(topData)
             h = topData.ye - topData.ys + 1;
             w = topData.xe - topData.xs + 1;
@@ -262,11 +264,9 @@ function runCropParfor(fileMap, outputDir, baseName, chanList, rotate90, T, Z, C
         end
 
         for z = 0:(Z-1)
-            % Global 0-based indices (interleaved)
             gIdx0 = t*Z*C + z*C + 0;
             gIdx1 = t*Z*C + z*C + 1;
 
-            % Resolve File and Local Index
             [fPath0, lIdx0] = getFileForIndex(gIdx0, fileMap);
             [fPath1, lIdx1] = getFileForIndex(gIdx1, fileMap);
 
