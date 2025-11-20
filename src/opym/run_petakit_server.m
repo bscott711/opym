@@ -1,9 +1,18 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% Usage: matlab -nodisplay -r "run_petakit_server"
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
-petakit_source_path = '/cm/shared/apps_local/petakit5d';
+% Try to get path from environment (passed by launch script)
+petakit_source_path = getenv('PETAKIT_ROOT');
+
+% Fallback if running manually without the launcher
+if isempty(petakit_source_path)
+    petakit_source_path = '/cm/shared/apps_local/petakit5d';
+    fprintf('[Server] Warning: PETAKIT_ROOT not set. Using default: %s\n', petakit_source_path);
+else
+    fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
+end
+
 base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
@@ -85,7 +94,6 @@ while true
                 fprintf('         Type: Deconvolution\n');
                 fprintf('         Data: %s\n', job.dataDir);
 
-                % Extract Parameters
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
@@ -95,7 +103,6 @@ while true
                 val_method = safelyGetParam(p, 'rl_method', 'simplified');
                 val_16bit  = safelyGetParam(p, 'save_16bit', true);
 
-                % Convert string arrays to cell arrays of char vectors for MATLAB
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
                 if isstring(val_psfs), val_psfs = cellstr(val_psfs); end
 
@@ -118,24 +125,24 @@ while true
             otherwise
                 % --- DESKEW/ROTATE JOB (Default) ---
                 fprintf('         Type: Deskew/Rotate\n');
-                fprintf('         Data: %s\n', job.dataDir);
 
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
                 val_skewAngle   = safelyGetParam(p, 'sheet_angle_deg', 31.8);
                 val_deskew      = safelyGetParam(p, 'deskew', true);
                 val_rotate      = safelyGetParam(p, 'rotate', true);
-
-                % Expanded parameters for LLSM/Overrides
                 val_objScan     = safelyGetParam(p, 'objective_scan', false);
                 val_reverseZ    = safelyGetParam(p, 'reverse_z', false);
-
                 val_dsDir       = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir      = safelyGetParam(p, 'dsr_dir_name', 'DSR');
 
+                % FIX: Read interp_method (Default to 'cubic')
+                val_interp      = safelyGetParam(p, 'interp_method', 'cubic');
+
+                fprintf('         Data: %s\n', job.dataDir);
                 fprintf('         Out:  %s\n', val_dsrDir);
-                fprintf('         Params: xy=%.4f, dz=%.3f, angle=%.2f\n', ...
-                        val_xyPixelSize, val_dz, val_skewAngle);
+                fprintf('         Params: xy=%.4f, dz=%.3f, angle=%.2f, interp=%s\n', ...
+                        val_xyPixelSize, val_dz, val_skewAngle, val_interp);
 
                 XR_deskew_rotate_data_wrapper( ...
                     {job.dataDir}, ...
@@ -147,12 +154,12 @@ while true
                     'xyPixelSize', val_xyPixelSize, ...
                     'dz', val_dz, ...
                     'skewAngle', val_skewAngle, ...
-                    'objectiveScan', val_objScan, ... % Dynamic
-                    'reverse', val_reverseZ, ...      % Dynamic
+                    'objectiveScan', val_objScan, ...
+                    'reverse', val_reverseZ, ...
+                    'interpMethod', val_interp, ... % <-- Passed to PetaKit
                     'save16bit', true, ...
                     'save3DStack', true, ...
                     'saveMIP', true, ...
-                    'interpMethod', 'linear', ...
                     'FFCorrection', false, ...
                     'BKRemoval', false, ...
                     'parseCluster', false, ...
@@ -169,7 +176,6 @@ while true
     catch ME
         fprintf('[Server] !!! ERROR on %s: %s\n', currentFile, ME.message);
         movefile(srcPath, fullfile(fail_dir, currentFile));
-
         errLog = fullfile(fail_dir, [currentFile '.log']);
         fid = fopen(errLog, 'w');
         fprintf(fid, '%s\n', getReport(ME));
