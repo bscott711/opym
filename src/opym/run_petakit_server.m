@@ -1,8 +1,9 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% UPDATED: Uses direct python execution for robustness.
+% UPDATED: Robust "Launcher-Driven" Python configuration.
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
+% 1. PetaKit Path
 petakit_source_path = getenv('PETAKIT_ROOT');
 if isempty(petakit_source_path)
     petakit_source_path = '/cm/shared/apps_local/petakit5d';
@@ -11,19 +12,29 @@ else
     fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
 end
 
-% --- FIX: USE PYTHON INTERPRETER DIRECTLY ---
-% Instead of looking for the 'opym' binary shim, we use the venv python.
-homeDir = getenv('HOME');
-pythonPath = fullfile(homeDir, 'software', 'opym', '.venv', 'bin', 'python');
+% 2. Python Path (CRITICAL FIX)
+% We rely on the launcher script to export 'OPYM_PYTHON' pointing to the
+% correct executable (e.g., ~/.conda/envs/ppk5d/bin/python).
+pythonPath = getenv('OPYM_PYTHON');
 
-if ~exist(pythonPath, 'file')
-    fprintf('[Server] ⚠️ WARNING: Could not find Python at: %s\n', pythonPath);
-    fprintf('[Server]    Please run `uv sync` in the opym folder on the cluster.\n');
+if isempty(pythonPath)
+    % Fallback: Try to use whatever 'python' is in the system PATH
+    [status, cmdOut] = system('which python');
+    if status == 0
+        pythonPath = strtrim(cmdOut);
+        fprintf('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s\n', pythonPath);
+    else
+        error('[Server] ❌ CRITICAL: OPYM_PYTHON not set and no python found in PATH.');
+    end
 else
-    fprintf('[Server] Using Python: %s\n', pythonPath);
+    if ~exist(pythonPath, 'file')
+        fprintf('[Server] ❌ CRITICAL: The path in OPYM_PYTHON does not exist:\n   %s\n', pythonPath);
+    else
+        fprintf('[Server] Using Python: %s\n', pythonPath);
+    end
 end
 
-base_queue_dir = fullfile(homeDir, 'petakit_jobs');
+base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('SLURM_CPUS_PER_TASK');
@@ -102,7 +113,7 @@ while true
                 val_format = safelyGetParam(p, 'format', 'tiff-series');
 
                 % COMMAND: python -m opym.cli [ARGS]
-                % This ensures we use the installed module without needing the bin wrapper
+                % This bypasses 'command not found' errors for the 'opym' shim.
                 cmd = sprintf('%s -m opym.cli "%s" --format %s', pythonPath, job.dataDir, val_format);
 
                 if val_rotate
@@ -167,7 +178,7 @@ while true
                 );
 
             otherwise
-                % --- DESKEW/ROTATE JOB (Default) ---
+                % --- DESKEW/ROTATE JOB ---
                 fprintf('         Type: Deskew/Rotate\n');
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
