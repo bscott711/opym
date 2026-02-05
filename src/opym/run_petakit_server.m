@@ -1,6 +1,6 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% UPDATED: Now supports 'crop' jobs via absolute path to opym CLI.
+% UPDATED: Uses direct python execution for robustness.
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 petakit_source_path = getenv('PETAKIT_ROOT');
@@ -11,16 +11,16 @@ else
     fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
 end
 
-% --- FIX: DEFINE OPYM PATH EXPLICITLY ---
-% We assume the standard location: ~/software/opym/.venv/bin/opym
+% --- FIX: USE PYTHON INTERPRETER DIRECTLY ---
+% Instead of looking for the 'opym' binary shim, we use the venv python.
 homeDir = getenv('HOME');
-opymPath = fullfile(homeDir, 'software', 'opym', '.venv', 'bin', 'opym');
+pythonPath = fullfile(homeDir, 'software', 'opym', '.venv', 'bin', 'python');
 
-if ~exist(opymPath, 'file')
-    fprintf('[Server] ⚠️ WARNING: Could not find opym executable at: %s\n', opymPath);
-    fprintf('[Server]    Verify you installed it with `uv sync` or `uv pip install -e .`\n');
+if ~exist(pythonPath, 'file')
+    fprintf('[Server] ⚠️ WARNING: Could not find Python at: %s\n', pythonPath);
+    fprintf('[Server]    Please run `uv sync` in the opym folder on the cluster.\n');
 else
-    fprintf('[Server] Using opym CLI at: %s\n', opymPath);
+    fprintf('[Server] Using Python: %s\n', pythonPath);
 end
 
 base_queue_dir = fullfile(homeDir, 'petakit_jobs');
@@ -93,7 +93,7 @@ while true
 
         switch jobType
             case 'crop'
-                % --- CROPPING JOB (Python CLI) ---
+                % --- CROPPING JOB (Direct Python Module Call) ---
                 fprintf('         Type: OPM Cropping\n');
 
                 val_rois   = safelyGetParam(p, 'rois', struct());
@@ -101,8 +101,9 @@ while true
                 val_rotate = safelyGetParam(p, 'rotate', true);
                 val_format = safelyGetParam(p, 'format', 'tiff-series');
 
-                % Use ABSOLUTE path to executable
-                cmd = sprintf('%s "%s" --format %s', opymPath, job.dataDir, val_format);
+                % COMMAND: python -m opym.cli [ARGS]
+                % This ensures we use the installed module without needing the bin wrapper
+                cmd = sprintf('%s -m opym.cli "%s" --format %s', pythonPath, job.dataDir, val_format);
 
                 if val_rotate
                     cmd = [cmd ' --rotate'];
