@@ -11,10 +11,10 @@ from .dataloader import (
 )
 from .metadata import create_processing_log, parse_timestamps
 from .petakit import (
-    PetaKitContext,
-    get_petakit_context,
-    run_llsm_petakit_processing,
+    monitor_job_background,
     run_petakit_processing,
+    submit_remote_crop_job,
+    submit_remote_deskew_job,
     wait_for_job,
 )
 from .roi_utils import (
@@ -59,10 +59,10 @@ __all__ = [
     "create_mip",
     "interactive_roi_selector",
     "visualize_alignment",
-    "PetaKitContext",
-    "get_petakit_context",
+    "submit_remote_crop_job",
+    "submit_remote_deskew_job",
+    "monitor_job_background",
     "run_petakit_processing",
-    "run_llsm_petakit_processing",
     "detect_microscopy_data_type",
     "MicroscopyDataType",
     "wait_for_job",
