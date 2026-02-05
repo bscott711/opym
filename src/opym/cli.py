@@ -19,7 +19,16 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    # --- FIX: Allow positional arguments for MATLAB compatibility ---
+    parser.add_argument(
+        "input_pos",
+        nargs="?",
+        type=Path,
+        help="Positional input file path (alternative to --input-file).",
+    )
+    # ----------------------------------------------------------------
+
+    input_group = parser.add_mutually_exclusive_group(required=False)
     input_group.add_argument(
         "--input-file",
         type=Path,
@@ -67,7 +76,6 @@ def main():
         action="store_true",
         help="Rotate the cropped ROIs by 90 degrees counter-clockwise before saving.",
     )
-    # --- NEW: --channels argument ---
     parser.add_argument(
         "-c",
         "--channels",
@@ -75,15 +83,29 @@ def main():
         default="0,1,2,3",
         help="Comma-separated list of output channels to save (e.g., '0,1,2,3').",
     )
-    # --- END NEW ---
 
     args = parser.parse_args()
+
+    # --- FIX: Consolidate Positional Input into args.input_file ---
+    # If a positional argument was provided but no flag, use the positional arg.
+    if args.input_pos and not args.input_file:
+        args.input_file = args.input_pos
+
+    # Manual validation for required inputs
+    if not args.input_file and not args.input_dir:
+        parser.error(
+            "one of the arguments --input-file (or positional file), "
+            "--input-dir is required"
+        )
+
+    if args.input_pos and args.input_dir:
+        parser.error("Argument --input-dir not allowed with positional input file.")
+    # --------------------------------------------------------------
 
     print("--- Starting OPM Cropper Job ---")
     try:
         output_format = OutputFormat(args.format)
 
-        # --- NEW: Parse channels list ---
         try:
             channels_to_output = [int(c.strip()) for c in args.channels.split(",")]
             if not all(0 <= c <= 3 for c in channels_to_output):
@@ -95,7 +117,6 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-        # --- END NEW ---
 
         if args.input_dir:
             if not args.roi_from_log:
@@ -131,7 +152,6 @@ def main():
                 top_roi = _tuple_to_roi(top_roi_data) if top_roi_data else None
                 bottom_roi = _tuple_to_roi(bottom_roi_data) if bottom_roi_data else None
 
-                # --- NEW: Validate ROIs against selected channels ---
                 need_top = (1 in channels_to_output) or (2 in channels_to_output)
                 need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
@@ -143,7 +163,6 @@ def main():
                         f"{channels_to_output} not found in log."
                     )
                     continue
-                # --- END NEW ---
 
                 run_processing_job(
                     base_file=base_file.resolve(),
@@ -177,7 +196,6 @@ def main():
                     parse_roi_string(args.bottom_roi) if args.bottom_roi else None
                 )
 
-            # --- NEW: Validate ROIs against selected channels ---
             need_top = (1 in channels_to_output) or (2 in channels_to_output)
             need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
@@ -193,7 +211,6 @@ def main():
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            # --- END NEW ---
 
             print(f"\n--- Processing {args.input_file.name} ---")
             run_processing_job(
