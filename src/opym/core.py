@@ -52,25 +52,8 @@ def process_dataset(
     if rotate_90:
         print("    90-degree rotation: ENABLED")
 
-    # --- MODIFICATION: Default to all 4 channels if not specified ---
-    if channels_to_output is None:
-        channels_to_output = [0, 1, 2, 3]
-    if not channels_to_output:
-        raise ValueError("channels_to_output list cannot be empty.")
-
-    print(f"  Outputting channels: {channels_to_output}")
-
-    # Determine which ROIs are needed
-    need_top = (1 in channels_to_output) or (2 in channels_to_output)
-    need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
-
-    if need_top and top_roi is None:
-        raise ValueError("Channels 1 or 2 selected, but top_roi is None.")
-    if need_bottom and bottom_roi is None:
-        raise ValueError("Channels 0 or 3 selected, but bottom_roi is None.")
-
     try:
-        # --- NEW: Handle 4D (single timepoint) vs 5D data (STREAM-SAFE) ---
+        # --- Handle 4D (single timepoint) vs 5D data (STREAM-SAFE) ---
         with tifffile.TiffFile(base_file) as tif:
             series = tif.series[0]
             store = series.aszarr()
@@ -88,16 +71,44 @@ def process_dataset(
                 print(f"  Info: 5D data detected (shape {shape}).")
                 T, Z, C, Y, X = shape
             else:
-                # Raise error for 3D or 6D+ data
                 raise ValueError(
                     f"Unsupported data shape: {shape}. "
                     "Expected 4D (ZCYX) or 5D (TZCXY)."
                 )
-        # --- END NEW ---
 
-        if C != 2:
-            print(
-                f"Warning: Expected 2 cameras (C=2), but found C={C}",
+        # --- DYNAMIC EXCITATION DETECTION ---
+        if C % 2 != 0:
+            raise ValueError(
+                "Expected an even number of channels (pairs of cameras), "
+                f"but found C={C}."
+            )
+
+        n_excitations = C // 2
+        print(f"  Detected {C} Channels -> {n_excitations} Excitation(s) x 2 Cameras.")
+
+        # Default: Output ALL crops for ALL excitations
+        # Excitation 0 maps to 0-3, Excitation 1 maps to 4-7, etc.
+        if channels_to_output is None:
+            channels_to_output = list(range(n_excitations * 4))
+
+        if not channels_to_output:
+            raise ValueError("channels_to_output list cannot be empty.")
+
+        print(f"  Outputting channels: {channels_to_output}")
+
+        # Optimize ROI cropping: Check if ANY output channel needs top or bottom
+        # Top crops are at indices 1, 2, 5, 6, 9, 10... (modulo 4 in [1, 2])
+        # Bottom crops are at indices 0, 3, 4, 7, 8, 11... (modulo 4 in [0, 3])
+        need_top = any((ch % 4 in [1, 2]) for ch in channels_to_output)
+        need_bottom = any((ch % 4 in [0, 3]) for ch in channels_to_output)
+
+        if need_top and top_roi is None:
+            raise ValueError(
+                "Channels requiring Top ROI selected, but top_roi is None."
+            )
+        if need_bottom and bottom_roi is None:
+            raise ValueError(
+                "Channels requiring Bottom ROI selected, but bottom_roi is None."
             )
 
         dummy_plane = np.zeros((Y, X), dtype=dtype)
@@ -107,9 +118,7 @@ def process_dataset(
         if top_shape and bottom_shape and (top_shape != bottom_shape):
             raise ValueError(f"ROI shapes do not match: {top_shape} vs {bottom_shape}")
 
-        # Determine output shape from the first available ROI
         Y_new, X_new = top_shape or bottom_shape or (0, 0)
-
         C_new = len(channels_to_output)
 
         if rotate_90:
@@ -120,13 +129,11 @@ def process_dataset(
         print(f"Using sanitized base name for output: {sanitized_name}")
 
         if output_format == OutputFormat.ZARR:
-            # --- FIX: Use sanitized_name, not paths.sanitized_name ---
             output_zarr_path = output_dir / (sanitized_name + "_processed.zarr")
-            # --- END FIX ---
             if output_zarr_path.exists():
                 print(
-                    f"Warning: Output Zarr {output_zarr_path.name} "
-                    "already exists. Deleting it..."
+                    f"Warning: Output Zarr {output_zarr_path.name} already exists. "
+                    "Deleting it..."
                 )
                 shutil.rmtree(output_zarr_path)
 
@@ -138,7 +145,6 @@ def process_dataset(
                 dtype=dtype,
                 chunks=chunks,
             )
-            # Map output channel index (0, 1, ...) to its file name (0, 2, ...)
             channel_map = {c_out: i for i, c_out in enumerate(channels_to_output)}
             print(
                 f"Created new {C_new}-channel OME-Zarr store: {output_zarr_path.name}"
@@ -149,74 +155,92 @@ def process_dataset(
             ) as pbar:
                 for t in range(T):
                     for z in range(Z):
-                        # --- NEW: Select correct indexing based on dimensions ---
-                        if ndim == 5:
-                            plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                            plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
-                        else:  # ndim == 4
-                            # T is 1, so t is always 0. We ignore t.
-                            plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
-                            plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
-                        # --- END NEW ---
+                        # Iterate over excitations (pairs of cameras)
+                        for exc in range(n_excitations):
+                            # Calculate input channel indices for this excitation
+                            cam0_idx = exc * 2
+                            cam1_idx = exc * 2 + 1
 
-                        # Pre-crop ROIs only if needed.
-                        # Pylance needs casting because it doesn't assume 'need_top'
-                        # implies 'top_roi' is not None inside the loop.
-                        if need_top:
-                            t_roi = cast(tuple[slice, slice], top_roi)
-                            top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
-                            top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
-                        else:
-                            top_crop_c0 = None
-                            top_crop_c1 = None
+                            # Base output index (e.g., 0 for Exc0, 4 for Exc1)
+                            out_base = exc * 4
 
-                        if need_bottom:
-                            b_roi = cast(tuple[slice, slice], bottom_roi)
-                            bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
-                            bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
-                        else:
-                            bot_crop_c0 = None
-                            bot_crop_c1 = None
-
-                        if rotate_90:
-                            # Pylance needs casts to know we aren't rotating None
-                            if top_crop_c0 is not None:
-                                top_crop_c0 = np.rot90(
-                                    cast(np.ndarray, top_crop_c0), k=1
+                            # Fetch planes dynamically
+                            if ndim == 5:
+                                plane_cam0 = cast(
+                                    np.ndarray, zarr_array[t, z, cam0_idx]
                                 )
-                            if top_crop_c1 is not None:
-                                top_crop_c1 = np.rot90(
-                                    cast(np.ndarray, top_crop_c1), k=1
+                                plane_cam1 = cast(
+                                    np.ndarray, zarr_array[t, z, cam1_idx]
                                 )
-                            if bot_crop_c0 is not None:
-                                bot_crop_c0 = np.rot90(
-                                    cast(np.ndarray, bot_crop_c0), k=1
-                                )
-                            if bot_crop_c1 is not None:
-                                bot_crop_c1 = np.rot90(
-                                    cast(np.ndarray, bot_crop_c1), k=1
+                            else:  # ndim == 4
+                                plane_cam0 = cast(np.ndarray, zarr_array[z, cam0_idx])
+                                plane_cam1 = cast(np.ndarray, zarr_array[z, cam1_idx])
+
+                            # --- CROP & ROTATE ---
+                            if need_top:
+                                t_roi = cast(tuple[slice, slice], top_roi)
+                                top_crop_c0 = plane_cam0[t_roi[0], t_roi[1]]
+                                top_crop_c1 = plane_cam1[t_roi[0], t_roi[1]]
+                            else:
+                                top_crop_c0, top_crop_c1 = None, None
+
+                            if need_bottom:
+                                b_roi = cast(tuple[slice, slice], bottom_roi)
+                                bot_crop_c0 = plane_cam0[b_roi[0], b_roi[1]]
+                                bot_crop_c1 = plane_cam1[b_roi[0], b_roi[1]]
+                            else:
+                                bot_crop_c0, bot_crop_c1 = None, None
+
+                            if rotate_90:
+                                if top_crop_c0 is not None:
+                                    top_crop_c0 = np.rot90(
+                                        cast(np.ndarray, top_crop_c0), k=1
+                                    )
+                                if top_crop_c1 is not None:
+                                    top_crop_c1 = np.rot90(
+                                        cast(np.ndarray, top_crop_c1), k=1
+                                    )
+                                if bot_crop_c0 is not None:
+                                    bot_crop_c0 = np.rot90(
+                                        cast(np.ndarray, bot_crop_c0), k=1
+                                    )
+                                if bot_crop_c1 is not None:
+                                    bot_crop_c1 = np.rot90(
+                                        cast(np.ndarray, bot_crop_c1), k=1
+                                    )
+
+                            # --- WRITE OUTPUTS ---
+                            # Map: 0=Bot-C0, 1=Top-C0, 2=Top-C1, 3=Bot-C1
+
+                            # Output ID: out_base + 0 (Bot C0)
+                            if (out_base + 0) in channels_to_output:
+                                idx = channel_map[out_base + 0]
+                                zarr_out[t, z, idx, :, :] = cast(
+                                    np.ndarray, bot_crop_c0
                                 )
 
-                        # Write only selected channels
-                        # Explicit casts required for __setitem__
-                        if 0 in channels_to_output:
-                            zarr_out[t, z, channel_map[0], :, :] = cast(
-                                np.ndarray, bot_crop_c0
-                            )
-                        if 1 in channels_to_output:
-                            zarr_out[t, z, channel_map[1], :, :] = cast(
-                                np.ndarray, top_crop_c0
-                            )
-                        if 2 in channels_to_output:
-                            zarr_out[t, z, channel_map[2], :, :] = cast(
-                                np.ndarray, top_crop_c1
-                            )
-                        if 3 in channels_to_output:
-                            zarr_out[t, z, channel_map[3], :, :] = cast(
-                                np.ndarray, bot_crop_c1
-                            )
+                            # Output ID: out_base + 1 (Top C0)
+                            if (out_base + 1) in channels_to_output:
+                                idx = channel_map[out_base + 1]
+                                zarr_out[t, z, idx, :, :] = cast(
+                                    np.ndarray, top_crop_c0
+                                )
 
-                        pbar.update(C)  # Update pbar by number of input cams
+                            # Output ID: out_base + 2 (Top C1)
+                            if (out_base + 2) in channels_to_output:
+                                idx = channel_map[out_base + 2]
+                                zarr_out[t, z, idx, :, :] = cast(
+                                    np.ndarray, top_crop_c1
+                                )
+
+                            # Output ID: out_base + 3 (Bot C1)
+                            if (out_base + 3) in channels_to_output:
+                                idx = channel_map[out_base + 3]
+                                zarr_out[t, z, idx, :, :] = cast(
+                                    np.ndarray, bot_crop_c1
+                                )
+
+                            pbar.update(2)  # Update by 2 cameras processed
 
             print(f"✅ Saved processed series to {output_zarr_path.name}")
 
@@ -225,52 +249,71 @@ def process_dataset(
             tif_meta = {"axes": "ZYX"}
 
             for t in tqdm(range(T), desc=" ├ Streaming & Writing", unit="TP"):
-                # Create empty stacks only for the channels we need
+                # Initialize ONLY requested stacks
                 stacks_to_write = {
                     c_out: np.zeros(output_stack_shape_3d, dtype=dtype)
                     for c_out in channels_to_output
                 }
 
                 for z in range(Z):
-                    # --- NEW: Select correct indexing based on dimensions ---
-                    if ndim == 5:
-                        plane_cam0 = cast(np.ndarray, zarr_array[t, z, 0])
-                        plane_cam1 = cast(np.ndarray, zarr_array[t, z, 1])
-                    else:  # ndim == 4
-                        # T is 1, so t is always 0. We ignore t.
-                        plane_cam0 = cast(np.ndarray, zarr_array[z, 0])
-                        plane_cam1 = cast(np.ndarray, zarr_array[z, 1])
-                    # --- END NEW ---
+                    # Iterate Excitations
+                    for exc in range(n_excitations):
+                        cam0_idx = exc * 2
+                        cam1_idx = exc * 2 + 1
+                        out_base = exc * 4
 
-                    # Process Cam 0
-                    if 0 in channels_to_output:
-                        b_roi = cast(tuple[slice, slice], bottom_roi)
-                        crop = plane_cam0[b_roi[0], b_roi[1]]
-                        stacks_to_write[0][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
-                    if 1 in channels_to_output:
-                        t_roi = cast(tuple[slice, slice], top_roi)
-                        crop = plane_cam0[t_roi[0], t_roi[1]]
-                        stacks_to_write[1][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
+                        if ndim == 5:
+                            plane_cam0 = cast(np.ndarray, zarr_array[t, z, cam0_idx])
+                            plane_cam1 = cast(np.ndarray, zarr_array[t, z, cam1_idx])
+                        else:
+                            plane_cam0 = cast(np.ndarray, zarr_array[z, cam0_idx])
+                            plane_cam1 = cast(np.ndarray, zarr_array[z, cam1_idx])
 
-                    # Process Cam 1
-                    if 2 in channels_to_output:
-                        t_roi = cast(tuple[slice, slice], top_roi)
-                        crop = plane_cam1[t_roi[0], t_roi[1]]
-                        stacks_to_write[2][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
-                    if 3 in channels_to_output:
-                        b_roi = cast(tuple[slice, slice], bottom_roi)
-                        crop = plane_cam1[b_roi[0], b_roi[1]]
-                        stacks_to_write[3][z, :, :] = (
-                            np.rot90(crop, k=1) if rotate_90 else crop
-                        )
+                        # Cam 0 - Bottom (ID + 0)
+                        if (out_base + 0) in channels_to_output:
+                            b_roi = cast(tuple[slice, slice], bottom_roi)
+                            crop = plane_cam0[b_roi[0], b_roi[1]]
+                            if rotate_90:
+                                stacks_to_write[out_base + 0][z, :, :] = np.rot90(
+                                    crop, k=1
+                                )
+                            else:
+                                stacks_to_write[out_base + 0][z, :, :] = crop
 
-                # Write the stacks to TIFF files
+                        # Cam 0 - Top (ID + 1)
+                        if (out_base + 1) in channels_to_output:
+                            t_roi = cast(tuple[slice, slice], top_roi)
+                            crop = plane_cam0[t_roi[0], t_roi[1]]
+                            if rotate_90:
+                                stacks_to_write[out_base + 1][z, :, :] = np.rot90(
+                                    crop, k=1
+                                )
+                            else:
+                                stacks_to_write[out_base + 1][z, :, :] = crop
+
+                        # Cam 1 - Top (ID + 2)
+                        if (out_base + 2) in channels_to_output:
+                            t_roi = cast(tuple[slice, slice], top_roi)
+                            crop = plane_cam1[t_roi[0], t_roi[1]]
+                            if rotate_90:
+                                stacks_to_write[out_base + 2][z, :, :] = np.rot90(
+                                    crop, k=1
+                                )
+                            else:
+                                stacks_to_write[out_base + 2][z, :, :] = crop
+
+                        # Cam 1 - Bottom (ID + 3)
+                        if (out_base + 3) in channels_to_output:
+                            b_roi = cast(tuple[slice, slice], bottom_roi)
+                            crop = plane_cam1[b_roi[0], b_roi[1]]
+                            if rotate_90:
+                                stacks_to_write[out_base + 3][z, :, :] = np.rot90(
+                                    crop, k=1
+                                )
+                            else:
+                                stacks_to_write[out_base + 3][z, :, :] = crop
+
+                # Write TIFFs
                 for c_out, stack_data in stacks_to_write.items():
                     out_name = f"{sanitized_name}_C{c_out}_T{t:03d}.tif"
                     tifffile.imwrite(
