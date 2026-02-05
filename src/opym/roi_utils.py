@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import overload
 
 import numpy as np
+from skimage.filters import window
 from skimage.registration import phase_cross_correlation
 
 
@@ -95,15 +96,21 @@ def align_rois(
     mip_data: np.ndarray,
     top_roi: tuple[slice, slice],
     bottom_roi: tuple[slice, slice],
+    max_shift: float = 60.0,
 ) -> tuple[slice, slice]:
     """
     Calculates the pixel shift between two ROIs from a 2D MIP
     using phase cross-correlation and returns the adjusted second ROI.
 
+    Robustness improvements:
+    1. Uses a Hanning window to suppress edge artifacts.
+    2. Rejects shifts larger than `max_shift`.
+
     Args:
         mip_data: The 2D (Y, X) Max Intensity Projection array.
         top_roi: (slice, slice) for the reference ROI (Y, X).
         bottom_roi: (slice, slice) for the target ROI (Y, X).
+        max_shift: Maximum allowable shift in pixels.
 
     Returns:
         The adjusted (slice, slice) for the bottom ROI.
@@ -112,15 +119,41 @@ def align_rois(
 
     try:
         # Crop the data from the MIP for registration
-        top_crop = mip_data[top_roi[0], top_roi[1]]
-        bottom_crop_before = mip_data[bottom_roi[0], bottom_roi[1]]
+        top_crop = mip_data[top_roi[0], top_roi[1]].astype(float)
+        bottom_crop = mip_data[bottom_roi[0], bottom_roi[1]].astype(float)
+
+        # Ensure shapes match (they should if ROISelector was used)
+        if top_crop.shape != bottom_crop.shape:
+            print("  ⚠️ ROI shapes do not match. Skipping alignment.")
+            return bottom_roi
+
+        # --- Robustness 1: Apply Windowing ---
+        # "Hann" window fades edges to zero, removing "box" artifacts from FFT
+        w_top = window("hann", top_crop.shape)
+        w_bot = window("hann", bottom_crop.shape)
 
         shift, _, _ = phase_cross_correlation(
-            top_crop, bottom_crop_before, upsample_factor=10
+            top_crop * w_top,
+            bottom_crop * w_bot,
+            upsample_factor=10,
+            normalization=None,  # type: ignore # Often better for windowed data
         )
         dy, dx = shift
-        print(f"Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
+        shift_magnitude = np.sqrt(dy**2 + dx**2)
 
+        print(f"  Detected shift (dy, dx): ({dy:.2f}, {dx:.2f}) pixels.")
+
+        # --- Robustness 2: Sanity Check ---
+        if shift_magnitude > max_shift:
+            print(
+                f"  ⚠️ Shift ({shift_magnitude:.1f} px) exceeds limit ({max_shift} px)."
+            )
+            print(
+                "     Assuming false positive (grid/noise lock). Keeping Manual ROIs."
+            )
+            return bottom_roi
+
+        # Apply valid shift
         old_y_start, old_y_end = bottom_roi[0].start, bottom_roi[0].stop
         old_x_start, old_x_end = bottom_roi[1].start, bottom_roi[1].stop
 
@@ -133,7 +166,7 @@ def align_rois(
             slice(new_y_start, new_y_end),
             slice(new_x_start, new_x_end),
         )
-        print(f"Adjusted Bottom ROI Slice: {aligned_bottom_roi}")
+        print(f"  ✅ Adjusted Bottom ROI: {aligned_bottom_roi}")
         return aligned_bottom_roi
 
     except Exception as e:
@@ -187,22 +220,19 @@ def process_rois_from_selector(
             bottom_roi_unaligned,
         )
         final_top_roi = top_roi_unaligned
-        print("\n✅ Both ROIs valid. Alignment complete.")
+        print("\n✅ ROI Processing complete.")
 
     elif top_roi_valid:
-        # --- Only top ROI is valid ---
         print("\nℹ️ Bottom ROI is empty. Skipping alignment.")
         final_top_roi = top_roi_unaligned
         final_bottom_roi = None
 
     elif bottom_roi_valid:
-        # --- Only bottom ROI is valid ---
         print("\nℹ️ Top ROI is empty. Skipping alignment.")
         final_top_roi = None
         final_bottom_roi = bottom_roi_unaligned
 
     else:
-        # --- Neither ROI is valid ---
         print("\n❌ ERROR: Both ROIs appear to be empty. No ROIs will be saved.")
         final_top_roi = None
         final_bottom_roi = None
