@@ -79,9 +79,9 @@ def main():
     parser.add_argument(
         "-c",
         "--channels",
-        type=str,
-        default="0,1,2,3",
-        help="Comma-separated list of output channels to save (e.g., '0,1,2,3').",
+        nargs="+",
+        default=["0", "1", "2", "3"],
+        help="Space-separated list of output channels to save (e.g., '0 1 2 3').",
     )
 
     args = parser.parse_args()
@@ -107,13 +107,19 @@ def main():
         output_format = OutputFormat(args.format)
 
         try:
-            channels_to_output = [int(c.strip()) for c in args.channels.split(",")]
-            if not all(0 <= c <= 3 for c in channels_to_output):
+            channels_to_output = []
+            for item in args.channels:
+                # Split by comma in case user mixed formats like "0,1" "2"
+                for part in item.split(","):
+                    if part.strip():
+                        channels_to_output.append(int(part.strip()))
+
+            if not all(c >= 0 for c in channels_to_output):
                 raise ValueError
         except ValueError:
             print(
                 "❌ ERROR: Invalid --channels format. "
-                "Expected comma-separated numbers 0-3.",
+                "Expected space-separated numbers (e.g., 0 1 2 3).",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -152,6 +158,9 @@ def main():
                 top_roi = _tuple_to_roi(top_roi_data) if top_roi_data else None
                 bottom_roi = _tuple_to_roi(bottom_roi_data) if bottom_roi_data else None
 
+                # Simplified check: just ensure requested channels are valid generally
+                # Specific logic for top/bottom cameras usually assumes 4ch setup.
+                # If using >4 channels, ensure you have appropriate ROIs.
                 need_top = (1 in channels_to_output) or (2 in channels_to_output)
                 need_bottom = (0 in channels_to_output) or (3 in channels_to_output)
 
