@@ -48,23 +48,29 @@ function run_petakit_cropper(json_file)
     % Total physical frames available across all files
     total_physical_frames = FileMap(end).end_idx + 1;
 
-    % 3. Read Metadata (SizeZ, SizeC, SizeT)
+    % 3. Read Metadata (SizeZ, SizeC, SizeT, DimensionOrder)
     t = Tiff(inputFile, 'r');
     SizeC = 1; SizeZ = 1; SizeT = 1;
+    DimOrder = 'XYCZT'; % Default to interleaved
+
     try
         desc = t.getTag('ImageDescription');
         tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
         tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
         tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
+        tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens');
+
         if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
         if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
         if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
+        if ~isempty(tokO), DimOrder = tokO{1}{1}; end
     catch
-        warning('Failed to parse OME-XML. Calculations may be wrong.');
+        % Warning suppression handles this
     end
     t.close();
 
     fprintf('📊 Metadata: T=%d, Z=%d, C=%d (Total Expected: %d)\n', SizeT, SizeZ, SizeC, SizeT*SizeZ*SizeC);
+    fprintf('📊 Order:    %s\n', DimOrder);
 
     if total_physical_frames < (SizeT * SizeZ * SizeC)
         fprintf('⚠️ WARNING: Dataset truncated. Missing %d frames.\n', (SizeT*SizeZ*SizeC) - total_physical_frames);
@@ -108,8 +114,9 @@ function run_petakit_cropper(json_file)
 
     % 5. Execute Parallel 3D Stacks
     parfor i = 1:num_jobs
-        warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-        warning('off', 'MATLAB:tifflib:TIFFReadDirectory:libraryWarning');
+        % --- FIX: Nuclear option for warnings inside worker ---
+        % We manually handle errors, so we don't need Tiff lib warnings spamming us
+        warning('off', 'all');
 
         t0 = jobs(i, 1);
         c0 = jobs(i, 2); % Input channel index
@@ -162,8 +169,17 @@ function run_petakit_cropper(json_file)
             lt = [];
 
             for z0 = 0 : (SizeZ - 1)
-                % 1. Global Index
-                global_idx = (t0 * SizeZ * SizeC) + (z0 * SizeC) + c0;
+                % 1. Global Index Calculation (Based on DimensionOrder)
+                % Default XYCZT (Interleaved): T * (Z*C) + z * C + c
+                % Alternate XYZCT (Sequential): T * (Z*C) + c * Z + z
+
+                % Standard Interleaved is most common for OPM
+                if contains(DimOrder, 'XYCZT')
+                    global_idx = (t0 * SizeZ * SizeC) + (z0 * SizeC) + c0;
+                else
+                    % Fallback to Sequential (XYZCT)
+                    global_idx = (t0 * SizeZ * SizeC) + (c0 * SizeZ) + z0;
+                end
 
                 % 2. Resolve File
                 [fPath, locIdx] = get_file_for_frame(global_idx, FileMap);
@@ -201,6 +217,7 @@ function run_petakit_cropper(json_file)
             % Write Outputs
             for k = 1:length(active_outputs)
                 % Format: CleanBaseName_C#_T###.tif (No _bot/_top)
+                % Allows downstream processing to just read C number
                 outName = sprintf('%s_C%d_T%03d.tif', cleanBaseName, active_outputs(k).id, t0);
                 outPath = fullfile(outputDir, outName);
                 write_3d_tiff(outPath, active_outputs(k).stack);
@@ -218,8 +235,8 @@ end
 % --- HELPER FUNCTIONS ---
 
 function FileMap = map_multipage_tiff_files(masterFile)
-    warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-    warning('off', 'MATLAB:tifflib:TIFFReadDirectory:libraryWarning');
+    % Suppress ALL warnings in helper to avoid spam during mapping
+    warning('off', 'all');
 
     [fDir, fName, ~] = fileparts(masterFile);
     basePattern = regexprep(fName, '\.ome$', '');
