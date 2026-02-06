@@ -1,6 +1,6 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% UPDATED: Robust "Launcher-Driven" Python configuration.
+% UPDATED: Now uses native MATLAB Parallel Cropping.
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
@@ -24,7 +24,8 @@ if isempty(pythonPath)
         pythonPath = strtrim(cmdOut);
         fprintf('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s\n', pythonPath);
     else
-        error('[Server] ❌ CRITICAL: OPYM_PYTHON not set and no python found in PATH.');
+        % Non-critical error now, since cropping is pure MATLAB
+        fprintf('[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.\n');
     end
 else
     if ~exist(pythonPath, 'file')
@@ -104,47 +105,12 @@ while true
 
         switch jobType
             case 'crop'
-                % --- CROPPING JOB (Direct Python Module Call) ---
-                fprintf('         Type: OPM Cropping\n');
+                % --- CROPPING JOB (Native MATLAB Parallel) ---
+                fprintf('         Type: OPM Cropping (MATLAB Parallel)\n');
 
-                val_rois   = safelyGetParam(p, 'rois', struct());
-                val_chans  = safelyGetParam(p, 'channels', []);
-                val_rotate = safelyGetParam(p, 'rotate', true);
-                val_format = safelyGetParam(p, 'format', 'tiff-series');
-
-                % COMMAND: python -m opym.cli [ARGS]
-                % This bypasses 'command not found' errors for the 'opym' shim.
-                cmd = sprintf('%s -m opym.cli "%s" --format %s', pythonPath, job.dataDir, val_format);
-
-                if val_rotate
-                    cmd = [cmd ' --rotate'];
-                else
-                    cmd = [cmd ' --no-rotate'];
-                end
-
-                if isfield(val_rois, 'top') && ~isempty(val_rois.top)
-                   cmd = sprintf('%s --top-roi "%s"', cmd, val_rois.top);
-                end
-                if isfield(val_rois, 'bottom') && ~isempty(val_rois.bottom)
-                   cmd = sprintf('%s --bottom-roi "%s"', cmd, val_rois.bottom);
-                end
-
-                if ~isempty(val_chans)
-                    if size(val_chans, 1) > 1, val_chans = val_chans'; end
-                    chanStr = sprintf('%d ', val_chans);
-                    cmd = sprintf('%s --channels %s', cmd, strtrim(chanStr));
-                end
-
-                fprintf('         Exec: %s\n', cmd);
-
-                % Execute Shell Command
-                [status, cmdOut] = system(cmd);
-
-                if status ~= 0
-                    error('Opym CLI failed with exit code %d:\n%s', status, cmdOut);
-                else
-                    disp(cmdOut);
-                end
+                % Call the dedicated parallel cropper function
+                % srcPath is the full path to the JSON job file
+                run_petakit_cropper(srcPath);
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---
