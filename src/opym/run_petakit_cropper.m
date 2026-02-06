@@ -1,7 +1,7 @@
 function run_petakit_cropper(json_file)
 % RUN_PETAKIT_CROPPER High-performance parallel cropping for PetaKit5D
 %   Refactored to handle Micro-Manager "Split" OME-TIFFs (multiple 4GB files).
-%   Output: 3D Stacks [Base]_C[c]_T[t].tif
+%   Output: 3D Stacks [Base]_C[c]_T[t].tif matching notebook channel logic.
 
     % 0. Suppress annoying TIFF warnings globally
     warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
@@ -38,25 +38,24 @@ function run_petakit_cropper(json_file)
         req_channels = job.parameters.channels;
     end
 
-    % --- NEW: Map Multi-Part Files ---
-    % Micro-Manager splits files into Pos0.ome.tif, Pos0_1.ome.tif, etc.
-    % We must map the global frame index to the specific file and local index.
+    % --- Map Multi-Part Files ---
     FileMap = map_multipage_tiff_files(inputFile);
+
+    if isempty(FileMap)
+        error('❌ CRITICAL: No matching TIFF files found for %s', inputFile);
+    end
 
     % Total physical frames available across all files
     total_physical_frames = FileMap(end).end_idx + 1;
 
-    % 3. Read Metadata (SizeZ, SizeC, SizeT) from Master File
-    % The first file usually contains the OME-XML for the whole dataset
+    % 3. Read Metadata (SizeZ, SizeC, SizeT)
     t = Tiff(inputFile, 'r');
     SizeC = 1; SizeZ = 1; SizeT = 1;
-
     try
         desc = t.getTag('ImageDescription');
         tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
         tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
         tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
-
         if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
         if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
         if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
@@ -65,11 +64,10 @@ function run_petakit_cropper(json_file)
     end
     t.close();
 
-    fprintf('📊 Metadata: T=%d, Z=%d, C=%d (Expected: %d frames)\n', SizeT, SizeZ, SizeC, SizeT*SizeZ*SizeC);
-    fprintf('📊 Physical: %d frames found across %d files.\n', total_physical_frames, numel(FileMap));
+    fprintf('📊 Metadata: T=%d, Z=%d, C=%d (Total Expected: %d)\n', SizeT, SizeZ, SizeC, SizeT*SizeZ*SizeC);
 
     if total_physical_frames < (SizeT * SizeZ * SizeC)
-        fprintf('⚠️ WARNING: Dataset seems truncated. Missing %d frames.\n', (SizeT*SizeZ*SizeC) - total_physical_frames);
+        fprintf('⚠️ WARNING: Dataset truncated. Missing %d frames.\n', (SizeT*SizeZ*SizeC) - total_physical_frames);
     end
 
     % Write Processing Log
@@ -80,21 +78,26 @@ function run_petakit_cropper(json_file)
     logStruct.actual_frames = total_physical_frames;
     logStruct.rois = job.parameters.rois;
     logStruct.rotate = do_rotate;
-    logStruct.channel_mapping = 'C0,3=Bot; C1,2=Top';
+    logStruct.channel_mapping = 'Even Input(0,2): C(2n)=Bot, C(2n+1)=Top; Odd Input(1,3): C(2n)=Top, C(2n+1)=Bot';
 
-    jsonTxt = jsonencode(logStruct, 'PrettyPrint', true);
-    logPath = fullfile(outputDir, [cleanBaseName, '_processing_log.json']);
-    fid = fopen(logPath, 'w');
-    fprintf(fid, '%s', jsonTxt);
+    fid = fopen(fullfile(outputDir, [cleanBaseName, '_processing_log.json']), 'w');
+    fprintf(fid, '%s', jsonencode(logStruct, 'PrettyPrint', true));
     fclose(fid);
-    fprintf('📝 Log written: %s\n', logPath);
 
-    % 4. Build Job List (Flattened T * C)
+    % 4. Build Job List (Flattened T * InputC)
     jobs = [];
     for t_idx = 0 : (SizeT - 1)
         for c_idx = 0 : (SizeC - 1)
-            if ~isempty(req_channels) && ~ismember(c_idx, req_channels)
-                continue;
+            % Check if this input channel is needed for any requested output
+            % Logic: Input C maps to Outputs (2*C) and (2*C+1)
+            out1 = 2 * c_idx;
+            out2 = 2 * c_idx + 1;
+
+            if ~isempty(req_channels)
+                % If neither derived output is requested, skip this input
+                if ~ismember(out1, req_channels) && ~ismember(out2, req_channels)
+                    continue;
+                end
             end
             jobs = [jobs; t_idx, c_idx]; %#ok<AGROW>
         end
@@ -109,32 +112,48 @@ function run_petakit_cropper(json_file)
         warning('off', 'MATLAB:tifflib:TIFFReadDirectory:libraryWarning');
 
         t0 = jobs(i, 1);
-        c0 = jobs(i, 2);
+        c0 = jobs(i, 2); % Input channel index
 
-        % Channel Logic
-        is_top = ismember(mod(c0, 4), [1, 2]);
-        is_bot = ismember(mod(c0, 4), [0, 3]);
+        % --- Channel Mapping Logic ---
+        % Even Inputs (0, 2): Bot -> Output 2*c0, Top -> Output 2*c0+1
+        % Odd Inputs (1, 3):  Top -> Output 2*c0, Bot -> Output 2*c0+1
+        is_even_input = (mod(c0, 2) == 0);
 
-        target_roi = [];
-        suffix = '';
+        % Structure to hold active outputs for this pass
+        outputs_to_process = struct('id', {}, 'roi', {});
 
-        if is_top && ~isempty(top_roi)
-            target_roi = top_roi;
-            suffix = 'top';
-        elseif is_bot && ~isempty(bot_roi)
-            target_roi = bot_roi;
-            suffix = 'bot';
+        idA = 2 * c0;
+        idB = 2 * c0 + 1;
+
+        if is_even_input
+            % A=Bot, B=Top
+            outputs_to_process(end+1) = struct('id', idA, 'roi', bot_roi);
+            outputs_to_process(end+1) = struct('id', idB, 'roi', top_roi);
         else
-            continue;
+            % A=Top, B=Bot
+            outputs_to_process(end+1) = struct('id', idA, 'roi', top_roi);
+            outputs_to_process(end+1) = struct('id', idB, 'roi', bot_roi);
         end
 
-        % Prepare 3D Stack Buffer
-        h = target_roi(2) - target_roi(1) + 1;
-        w = target_roi(4) - target_roi(3) + 1;
-        if do_rotate
-            stack = zeros(w, h, SizeZ, 'uint16');
-        else
-            stack = zeros(h, w, SizeZ, 'uint16');
+        % Filter: Remove outputs not requested or with invalid ROIs
+        active_outputs = [];
+        for k = 1:length(outputs_to_process)
+            op = outputs_to_process(k);
+            if (isempty(req_channels) || ismember(op.id, req_channels)) && ~isempty(op.roi)
+                % Pre-allocate stack in struct
+                h = op.roi(2) - op.roi(1) + 1;
+                w = op.roi(4) - op.roi(3) + 1;
+                if do_rotate
+                    op.stack = zeros(w, h, SizeZ, 'uint16');
+                else
+                    op.stack = zeros(h, w, SizeZ, 'uint16');
+                end
+                active_outputs = [active_outputs, op]; %#ok<AGROW>
+            end
+        end
+
+        if isempty(active_outputs)
+            continue;
         end
 
         try
@@ -143,42 +162,49 @@ function run_petakit_cropper(json_file)
             lt = [];
 
             for z0 = 0 : (SizeZ - 1)
-                % 1. Global Index (0-based)
+                % 1. Global Index
                 global_idx = (t0 * SizeZ * SizeC) + (z0 * SizeC) + c0;
 
-                % 2. Resolve File and Local Index
+                % 2. Resolve File
                 [fPath, locIdx] = get_file_for_frame(global_idx, FileMap);
 
                 if isempty(fPath)
-                    continue; % Frame missing (truncated)
+                    continue; % Frame missing
                 end
 
-                % 3. Switch file if needed
+                % 3. Switch file
                 if ~strcmp(fPath, current_file_path)
                     if ~isempty(lt), lt.close(); end
                     lt = Tiff(fPath, 'r');
                     current_file_path = fPath;
                 end
 
-                % 4. Read (locIdx is 0-based from mapping, Tiff needs 1-based)
-                lt.setDirectory(locIdx + 1);
-                img = lt.read();
+                % 4. Read
+                try
+                    lt.setDirectory(locIdx + 1);
+                    img = lt.read();
 
-                % 5. Crop
-                crop = img(target_roi(1):target_roi(2), target_roi(3):target_roi(4));
-                if do_rotate
-                    crop = rot90(crop);
+                    % 5. Crop for all active outputs
+                    for k = 1:length(active_outputs)
+                        roi = active_outputs(k).roi;
+                        crop = img(roi(1):roi(2), roi(3):roi(4));
+                        if do_rotate, crop = rot90(crop); end
+                        active_outputs(k).stack(:,:,z0+1) = crop;
+                    end
+                catch
+                    continue; % Silent fail for bad frame
                 end
-
-                stack(:, :, z0 + 1) = crop;
             end
 
             if ~isempty(lt), lt.close(); end
 
-            % Write Output
-            outName = sprintf('%s_%s_C%d_T%03d.tif', cleanBaseName, suffix, c0, t0);
-            outPath = fullfile(outputDir, outName);
-            write_3d_tiff(outPath, stack);
+            % Write Outputs
+            for k = 1:length(active_outputs)
+                % Format: CleanBaseName_C#_T###.tif (No _bot/_top)
+                outName = sprintf('%s_C%d_T%03d.tif', cleanBaseName, active_outputs(k).id, t0);
+                outPath = fullfile(outputDir, outName);
+                write_3d_tiff(outPath, active_outputs(k).stack);
+            end
 
         catch ME
             fprintf('❌ Error T=%d C=%d: %s\n', t0, c0, ME.message);
@@ -192,45 +218,28 @@ end
 % --- HELPER FUNCTIONS ---
 
 function FileMap = map_multipage_tiff_files(masterFile)
-    % Scans directory for split files (Pos0.ome.tif, Pos0_1.ome.tif...)
-    % Returns a struct array mapping global indices to files.
+    warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+    warning('off', 'MATLAB:tifflib:TIFFReadDirectory:libraryWarning');
 
-    [fDir, fName, fExt] = fileparts(masterFile);
-
-    % 1. Identify Base Pattern
-    % Expected: "Name.ome.tif" or "Name_MMStack_Pos0.ome.tif"
-    % Split files: "Name_1.ome.tif", "Name_2.ome.tif"
-
-    % Clean the ".ome" part for regex matching
+    [fDir, fName, ~] = fileparts(masterFile);
     basePattern = regexprep(fName, '\.ome$', '');
 
-    d = dir(fullfile(fDir, ['*.tif'])); % Broad search first
+    d = dir(fullfile(fDir, ['*.tif']));
 
     fileList = {};
     indices = [];
 
-    % Regex to find siblings: baseName_(\d+).ome.tif
-    % Note: The master file usually has NO number, or we treat it as 0.
-
-    % Escape special regex chars in filename
     safeBase = regexptranslate('escape', basePattern);
-
-    % Pattern 1: The Master File
     patMaster = ['^' safeBase '\.ome\.tif$'];
-    % Pattern 2: Sibling Files
     patSibling = ['^' safeBase '_(\d+)\.ome\.tif$'];
 
     for k = 1:length(d)
         thisName = d(k).name;
-
-        % Check if master
         if ~isempty(regexp(thisName, patMaster, 'once'))
             fileList{end+1} = fullfile(d(k).folder, thisName);
-            indices(end+1) = 0; % 0 sort order
+            indices(end+1) = 0;
             continue;
         end
-
-        % Check if sibling
         tok = regexp(thisName, patSibling, 'tokens');
         if ~isempty(tok)
             idx = str2double(tok{1}{1});
@@ -239,47 +248,35 @@ function FileMap = map_multipage_tiff_files(masterFile)
         end
     end
 
-    % Sort by index
     [~, sortIdx] = sort(indices);
     sortedFiles = fileList(sortIdx);
 
-    % Build Map (Expensive but done once)
     FileMap = struct('path', {}, 'start_idx', {}, 'end_idx', {});
-
     current_global_start = 0;
 
     fprintf('   Mapping files...\n');
     for k = 1:length(sortedFiles)
         fPath = sortedFiles{k};
-
-        % Count frames
         t = Tiff(fPath, 'r');
         num_frames = 0;
         while true
             num_frames = num_frames + 1;
             if t.lastDirectory(), break; end
-            t.nextDirectory();
+            try t.nextDirectory(); catch, break; end
         end
         t.close();
 
         FileMap(k).path = fPath;
         FileMap(k).start_idx = current_global_start;
         FileMap(k).end_idx = current_global_start + num_frames - 1;
-
         [~, n, e] = fileparts(fPath);
         fprintf('     [%d] %s%s -> Frames %d to %d\n', k, n, e, FileMap(k).start_idx, FileMap(k).end_idx);
-
         current_global_start = current_global_start + num_frames;
     end
 end
 
 function [fPath, locIdx] = get_file_for_frame(globalIdx, FileMap)
-    % Binary search or simple scan to find which file contains the frame
-    fPath = '';
-    locIdx = 0;
-
-    % Optimization: It's likely the same file as before or the next one.
-    % Simple loop is fast enough for <50 files.
+    fPath = ''; locIdx = 0;
     for k = 1:length(FileMap)
         if globalIdx >= FileMap(k).start_idx && globalIdx <= FileMap(k).end_idx
             fPath = FileMap(k).path;
