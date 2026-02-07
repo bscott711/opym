@@ -6,6 +6,7 @@ function run_bigtiff_cropper(job)
 %   - We iterate Raw Channels 1-4.
 %   - Cam 1 (Raw Ch 1 & 3): Bottom=Low, Top=High
 %   - Cam 2 (Raw Ch 2 & 4): Top=Low, Bottom=High (Inverted)
+%   - FIXED: Output filenames now use 0-based time indexing (T0000 instead of T0001).
 
     % --- 1. Setup ---
     p = job.parameters;
@@ -50,10 +51,7 @@ function run_bigtiff_cropper(job)
 
     loader = BigTiffFastLoader(masterFile);
 
-    % FIX: Do NOT use petakit 'readtiff', it only accepts 1 arg.
-    % We rely on the internal 'readStdTiff' set by the class constructor.
-    % loader.ReaderHandle = @(f, idx) readtiff(f, idx); <--- REMOVED
-
+    % Dimensions
     T = loader.Dimensions.SizeT;
     Z = loader.Dimensions.SizeZ;
     RawC = loader.Dimensions.SizeC;
@@ -64,10 +62,11 @@ function run_bigtiff_cropper(job)
     % --- 3. Parallel Execution ---
     tic;
     parfor k = 1:num_raw_stacks
-        % Suppress warnings inside workers too
+        % Suppress warnings inside workers
         warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
 
         % Map linear index 'k' to Raw(Channel, Time)
+        % Note: t is 1-based here (1..T) because it drives the Loader
         [rc, t] = ind2sub([RawC, T], k);
 
         % A. Load Frame (Loader handles descrambling automatically)
@@ -93,17 +92,21 @@ function run_bigtiff_cropper(job)
             ch_Bot = base_out_ch + 1; % e.g. 3
         end
 
-        % C. Crop & Save
-        % Bottom
+        % --- WRITE OUTPUT (0-BASED TIME FIX) ---
+        % We subtract 1 from 't' so the filename starts at T0000
+
+        % C. Crop and Save BOTTOM
         stackBot = rawStack(roiBot.y, roiBot.x, :);
         if doRotate, stackBot = rot90(stackBot); end
-        fNameBot = sprintf('img_C%02d_T%04d.tif', ch_Bot, t);
+
+        fNameBot = sprintf('img_C%02d_T%04d.tif', ch_Bot, t - 1); % <--- FIX HERE
         writetiff(stackBot, fullfile(outDir, fNameBot));
 
-        % Top
+        % D. Crop and Save TOP
         stackTop = rawStack(roiTop.y, roiTop.x, :);
         if doRotate, stackTop = rot90(stackTop); end
-        fNameTop = sprintf('img_C%02d_T%04d.tif', ch_Top, t);
+
+        fNameTop = sprintf('img_C%02d_T%04d.tif', ch_Top, t - 1); % <--- FIX HERE
         writetiff(stackTop, fullfile(outDir, fNameTop));
     end
     t_end = toc;

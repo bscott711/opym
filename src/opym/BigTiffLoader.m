@@ -4,12 +4,13 @@ classdef BigTiffFastLoader < handle
     % LOGIC:
     %   1. Reads OME-XML from the master file header.
     %   2. Parses <TiffData> tags to map (T,Z,C) -> (File, IFD).
-    %   3. Supports scrambled channels, multi-file splitting, and gaps.
+    %   3. Automatically handles hardware scrambling and multi-file splits.
+    %   4. QUIET MODE: Suppresses custom tag warnings from the Tiff library.
 
     properties
         MasterFile      % Path to the master .ome.tif
         FileMap         % Cell array of file paths
-        FrameMap        % Struct Array or Matrix: Map{t,z,c} -> [FileIdx, LocalIFD]
+        FrameMap        % Struct containing FileIdx and IFD arrays
         Dimensions      % Struct with fields SizeT, SizeZ, SizeC
         Geometry        % Struct with W, H, BytesPerPixel
         ReaderHandle    % Function handle for the actual reading
@@ -22,11 +23,11 @@ classdef BigTiffFastLoader < handle
             end
             obj.MasterFile = filePath;
 
-            % 1. Parse Metadata & Build Map
+            % 1. Parse Metadata & Build Map (Quietly)
             fprintf('📖 Parsing OME-XML Map (this may take 2-3 seconds)...\n');
             obj.parseXMLMap();
 
-            % 2. Default Reader (User should overwrite with petakit reader)
+            % 2. Default Reader (Standard Tiff with Suppression)
             obj.ReaderHandle = @(f, idx) readStdTiff(f, idx);
 
             fprintf('✅ Loader initialized. Dimensions: T=%d, Z=%d, C=%d.\n', ...
@@ -44,9 +45,6 @@ classdef BigTiffFastLoader < handle
             end
 
             % 1. Look up File Index and Local IFD
-            % Map is stored as (C, Z, T) for efficiency or struct
-            % We use linear indexing into the mapped arrays
-
             fIdx = obj.FrameMap.FileIdx(c, z, t);
             ifd  = obj.FrameMap.IFD(c, z, t);
 
@@ -56,11 +54,11 @@ classdef BigTiffFastLoader < handle
 
             targetFile = obj.FileMap{fIdx};
 
-            % 2. Read
-            % Note: OME XML IFDs are 0-based. MATLAB Tiff is 1-based.
-            % We add +1 here.
+            % 2. Read Frame
             try
-                img = obj.ReaderHandle(targetFile, ifd + 1);
+                % OME XML is 0-based. MATLAB is 1-based.
+                idx = double(ifd) + 1;
+                img = obj.ReaderHandle(targetFile, idx);
             catch ME
                 warning(ME.identifier, '%s', ME.message);
                 rethrow(ME);
@@ -70,117 +68,118 @@ classdef BigTiffFastLoader < handle
 
     methods (Access = private)
         function parseXMLMap(obj)
-            % READ OME HEADER
-            t = Tiff(obj.MasterFile, 'r');
+            % SUPPRESS WARNINGS during metadata read
+            wState1 = warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+            wState2 = warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+
             try
-                xmlStr = t.getTag('ImageDescription');
-            catch
-                error('Could not read ImageDescription tag.');
-            end
-            t.close();
+                % READ OME HEADER
+                t = Tiff(obj.MasterFile, 'r');
+                try
+                    xmlStr = t.getTag('ImageDescription');
+                catch
+                    error('Could not read ImageDescription tag.');
+                end
+                t.close();
 
-            % 1. PARSE DIMENSIONS
-            obj.Dimensions.SizeC = 1;
-            obj.Dimensions.SizeZ = 1;
-            obj.Dimensions.SizeT = 1;
+                % 1. PARSE DIMENSIONS
+                obj.Dimensions.SizeC = 1;
+                obj.Dimensions.SizeZ = 1;
+                obj.Dimensions.SizeT = 1;
 
-            tok = regexp(xmlStr, 'SizeC="(\d+)"', 'tokens');
-            if ~isempty(tok), obj.Dimensions.SizeC = str2double(tok{1}{1}); end
-            tok = regexp(xmlStr, 'SizeZ="(\d+)"', 'tokens');
-            if ~isempty(tok), obj.Dimensions.SizeZ = str2double(tok{1}{1}); end
-            tok = regexp(xmlStr, 'SizeT="(\d+)"', 'tokens');
-            if ~isempty(tok), obj.Dimensions.SizeT = str2double(tok{1}{1}); end
+                tok = regexp(xmlStr, 'SizeC="(\d+)"', 'tokens');
+                if ~isempty(tok), obj.Dimensions.SizeC = str2double(tok{1}{1}); end
+                tok = regexp(xmlStr, 'SizeZ="(\d+)"', 'tokens');
+                if ~isempty(tok), obj.Dimensions.SizeZ = str2double(tok{1}{1}); end
+                tok = regexp(xmlStr, 'SizeT="(\d+)"', 'tokens');
+                if ~isempty(tok), obj.Dimensions.SizeT = str2double(tok{1}{1}); end
 
-            % Geometry
-            tTemp = Tiff(obj.MasterFile, 'r');
-            obj.Geometry.W = double(tTemp.getTag('ImageWidth'));
-            obj.Geometry.H = double(tTemp.getTag('ImageLength'));
-            tTemp.close();
+                % Geometry
+                tTemp = Tiff(obj.MasterFile, 'r');
+                obj.Geometry.W = double(tTemp.getTag('ImageWidth'));
+                obj.Geometry.H = double(tTemp.getTag('ImageLength'));
+                tTemp.close();
 
-            % 2. PRE-ALLOCATE MAP
-            % We use 3D arrays for instant lookup: (C, Z, T)
-            sz = [obj.Dimensions.SizeC, obj.Dimensions.SizeZ, obj.Dimensions.SizeT];
-            obj.FrameMap.FileIdx = zeros(sz, 'uint8'); % Up to 255 files
-            obj.FrameMap.IFD     = zeros(sz, 'uint32');
+                % 2. PRE-ALLOCATE MAP
+                sz = [obj.Dimensions.SizeC, obj.Dimensions.SizeZ, obj.Dimensions.SizeT];
+                obj.FrameMap.FileIdx = zeros(sz, 'uint8');
+                obj.FrameMap.IFD     = zeros(sz, 'uint32');
 
-            % 3. IDENTIFY ALL FILES IN SET
-            % Find all siblings to map UUID filenames to real paths
-            [masterDir, masterName, ~] = fileparts(obj.MasterFile);
-            baseName = regexprep(masterName, '\.ome$', '');
-            d = dir(fullfile(masterDir, '*.tif'));
+                % 3. IDENTIFY ALL FILES
+                [masterDir, masterName, ~] = fileparts(obj.MasterFile);
+                d = dir(fullfile(masterDir, '*.tif'));
 
-            % Map "FileNameInXML" -> "RealFullPath"
-            nameToPath = containers.Map;
-            realFiles = {};
+                nameToPath = containers.Map;
+                realFiles = {};
 
-            % Populate file list
-            for k=1:length(d)
-                % Store just the filename as key
-                nameToPath(d(k).name) = fullfile(masterDir, d(k).name);
-                % Also store sequential index for the lookup array
-                realFiles{end+1} = fullfile(masterDir, d(k).name); %#ok<AGROW>
-            end
-            obj.FileMap = realFiles;
+                for k=1:length(d)
+                    nameToPath(d(k).name) = fullfile(masterDir, d(k).name);
+                    realFiles{end+1} = fullfile(masterDir, d(k).name); %#ok<AGROW>
+                end
+                obj.FileMap = realFiles;
 
-            % Create a helper to map filename string to index in obj.FileMap
-            % (Reverse lookup)
-            nameToIdx = containers.Map;
-            for k=1:length(realFiles)
-                [~, n, e] = fileparts(realFiles{k});
-                nameToIdx([n e]) = k;
-            end
+                nameToIdx = containers.Map;
+                for k=1:length(realFiles)
+                    [~, n, e] = fileparts(realFiles{k});
+                    nameToIdx([n e]) = k;
+                end
 
-            % 4. REGEX PARSE TIFFDATA
-            % Pattern: Looks for FirstC, FirstT, FirstZ, IFD, and UUID FileName
-            % Note: This handles explicit TiffData entries (PlaneCount=1)
-
-            % We extract blocks to handle the "FileName" context
-            % Regex is complex; we assume standard OME layout:
-            % <TiffData ... IFD="X" ...> <UUID FileName="Y">...
-
-            % Faster approach: Extract all TiffData blocks
-            pat = '<TiffData\s+FirstC="(\d+)"\s+FirstT="(\d+)"\s+FirstZ="(\d+)"\s+IFD="(\d+)".*?>\s*<UUID\s+FileName="([^"]+)"';
-            tokens = regexp(xmlStr, pat, 'tokens');
-
-            if isempty(tokens)
-                % Try alternate ordering of attributes if first failed
+                % 4. REGEX PARSE TIFFDATA
                 pat = 'FirstC="(\d+)".*?FirstT="(\d+)".*?FirstZ="(\d+)".*?IFD="(\d+)".*?FileName="([^"]+)"';
                 tokens = regexp(xmlStr, pat, 'tokens');
-            end
 
-            if isempty(tokens)
-                 error('Could not parse TiffData map. XML format might be unique.');
-            end
-
-            % 5. FILL THE MAP
-            fprintf('   Mapping %d frames...\n', length(tokens));
-
-            for k = 1:length(tokens)
-                tk = tokens{k};
-                c = str2double(tk{1}) + 1; % 1-based
-                t = str2double(tk{2}) + 1;
-                z = str2double(tk{3}) + 1;
-                ifd = str2double(tk{4});   % 0-based
-                fName = tk{5};
-
-                % Resolve File Index
-                if isKey(nameToIdx, fName)
-                    fIdx = nameToIdx(fName);
-
-                    % Update Map
-                    obj.FrameMap.FileIdx(c, z, t) = fIdx;
-                    obj.FrameMap.IFD(c, z, t)     = ifd;
-                else
-                    warning('File in XML not found on disk: %s', fName);
+                if isempty(tokens)
+                    error('Could not parse TiffData map from XML.');
                 end
+
+                fprintf('   Mapping %d frames from XML...\n', length(tokens));
+
+                for k = 1:length(tokens)
+                    tk = tokens{k};
+                    c = str2double(tk{1}) + 1; % 1-based
+                    t = str2double(tk{2}) + 1;
+                    z = str2double(tk{3}) + 1;
+                    ifd = str2double(tk{4});   % 0-based
+                    fName = tk{5};
+
+                    if isKey(nameToIdx, fName)
+                        fIdx = nameToIdx(fName);
+                        obj.FrameMap.FileIdx(c, z, t) = fIdx;
+                        obj.FrameMap.IFD(c, z, t)     = ifd;
+                    else
+                        warning('File in XML not found on disk: %s', fName);
+                    end
+                end
+
+            catch ME
+                % Restore warnings on error
+                warning(wState1);
+                warning(wState2);
+                rethrow(ME);
             end
+
+            % Restore warnings after success (optional)
+            warning(wState1);
+            warning(wState2);
         end
     end
 end
 
 function img = readStdTiff(fPath, idx)
-    t = Tiff(fPath, 'r');
-    t.setDirectory(idx);
-    img = t.read();
-    t.close();
+    % SILENCE WARNINGS for each read operation
+    wState1 = warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+    wState2 = warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+
+    try
+        t = Tiff(fPath, 'r');
+        t.setDirectory(idx);
+        img = t.read();
+        t.close();
+    catch ME
+        warning(wState1);
+        rethrow(ME);
+    end
+
+    warning(wState1);
+    warning(wState2);
 end

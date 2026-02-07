@@ -15,6 +15,7 @@ import tifffile
 def load_llsm_tiff_series(directory: Path):
     """
     Parses a directory of LLSM TIFFs and returns viewer parameters.
+    Normalizes indices to start at 0.
 
     Returns a tuple of:
     (get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name)
@@ -23,10 +24,8 @@ def load_llsm_tiff_series(directory: Path):
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # Parse T, C, and Z limits from files
-    t_vals = set()
-    c_vals = set()
-    file_map = {}  # Dictionary to map (t, c) -> file_path
+    # Temporary storage for matches before normalization
+    raw_matches = []
     base_name = None
     first_file = None
 
@@ -41,28 +40,43 @@ def load_llsm_tiff_series(directory: Path):
         if match:
             if base_name is None:
                 base_name = match.group(1)
-                first_file = f  # Store the first file we find
+                first_file = f
 
-            t = int(match.group(4))
-            c = int(match.group(3))
+            t_raw = int(match.group(4))
+            c_raw = int(match.group(3))
+            raw_matches.append((t_raw, c_raw, f))
 
-            t_vals.add(t)
-            c_vals.add(c)
-            file_map[(t, c)] = f
-
-    if not file_map or not first_file or base_name is None:
+    if not raw_matches or not first_file or base_name is None:
         raise FileNotFoundError(
             "No valid LLSM TIFF files "
             "(e.g., '*_CamA_ch0_stack0000*.tif') "
             f"found in {directory}"
         )
 
-    print(f"Found base name: {base_name}")
+    # --- NORMALIZE INDICES TO 0 ---
+    t_min_raw = min(m[0] for m in raw_matches)
+    c_min_raw = min(m[1] for m in raw_matches)
 
-    # Get min/max values
-    T_min = min(t_vals)
+    file_map = {}
+    t_vals = set()
+    c_vals = set()
+
+    for t_raw, c_raw, f in raw_matches:
+        t_norm = t_raw - t_min_raw
+        c_norm = c_raw - c_min_raw
+        file_map[(t_norm, c_norm)] = f
+        t_vals.add(t_norm)
+        c_vals.add(c_norm)
+
+    print(f"Found base name: {base_name}")
+    if t_min_raw != 0:
+        t_max_raw = max(m[0] for m in raw_matches)
+        print(f"  -> Normalizing Time: {t_min_raw}..{t_max_raw} -> 0..{max(t_vals)}")
+
+    # Get min/max values (now 0-based)
+    T_min = 0
     T_max = max(t_vals)
-    C_min = min(c_vals)
+    C_min = 0
     C_max = max(c_vals)
 
     # Use the first_file we already found
@@ -91,7 +105,7 @@ def load_llsm_tiff_series(directory: Path):
 def load_tiff_series(directory: Path):
     """
     Parses a directory of processed OPM TIFFs and returns viewer parameters.
-    Updated to handle variable padding (e.g. C0 vs C00, T000 vs T0001).
+    Automatically normalizes T and C indices to start at 0.
 
     Args:
         directory: The Path object pointing to the processed tiff series.
@@ -103,8 +117,7 @@ def load_tiff_series(directory: Path):
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # 1. Flexible Glob: Find anything looking like *_C*_T*.tif
-    # This matches 'img_C00_T0001.tif' AND 'Name_C0_T000.tif'
+    # 1. Flexible Glob
     files = sorted(list(directory.glob("*_C*_T*.tif")))
 
     if not files:
@@ -112,14 +125,10 @@ def load_tiff_series(directory: Path):
             f"No compatible TIFF files (e.g., '*_Cxx_Txxxx.tif') found in {directory}"
         )
 
-    # 2. Flexible Regex: Capture Base, C, and T regardless of digit count
-    # Anchored to end to handle extensions correctly
+    # 2. Flexible Regex
     file_pattern_re = re.compile(r"^(.*?)_C(\d+)_T(\d+)\.tif$", re.IGNORECASE)
 
-    t_vals = set()
-    c_vals = set()
-    file_map = {}  # Map (t, c) -> Path
-
+    raw_matches = []
     base_name = None
     first_file = None
 
@@ -128,36 +137,58 @@ def load_tiff_series(directory: Path):
     for f in files:
         match = file_pattern_re.match(f.name)
         if match:
-            # Capture base name from the first valid match
             if base_name is None:
                 base_name = match.group(1)
                 first_file = f
 
-            # Ensure we don't mix base names (e.g. if folder has junk)
+            # Ensure consistency
             if match.group(1) != base_name:
                 continue
 
-            c = int(match.group(2))
-            t = int(match.group(3))
+            c_raw = int(match.group(2))
+            t_raw = int(match.group(3))
+            raw_matches.append((t_raw, c_raw, f))
 
-            c_vals.add(c)
-            t_vals.add(t)
-            file_map[(t, c)] = f
-
-    if not file_map:
+    if not raw_matches:
         raise ValueError("Files found but regex failed to parse C/T values.")
+
+    # --- NORMALIZE INDICES TO 0 ---
+    # Find the lowest value for T and C in the folder
+    t_min_raw = min(m[0] for m in raw_matches)
+    c_min_raw = min(m[1] for m in raw_matches)
+
+    file_map = {}
+    t_vals = set()
+    c_vals = set()
+
+    # Rebuild map with 0-based keys
+    for t_raw, c_raw, f in raw_matches:
+        t_norm = t_raw - t_min_raw
+        c_norm = c_raw - c_min_raw
+
+        file_map[(t_norm, c_norm)] = f
+        t_vals.add(t_norm)
+        c_vals.add(c_norm)
 
     print(f"Found base name: {base_name}")
 
-    T_min = min(t_vals)
+    # Inform user of shift if it happened
+    if t_min_raw != 0:
+        t_max_raw = max(m[0] for m in raw_matches)
+        print(f"  -> Normalizing Time: {t_min_raw}..{t_max_raw} -> 0..{max(t_vals)}")
+
+    if c_min_raw != 0:
+        c_max_raw = max(m[1] for m in raw_matches)
+        print(f"  -> Normalizing Chan: {c_min_raw}..{c_max_raw} -> 0..{max(c_vals)}")
+
+    T_min = 0
     T_max = max(t_vals)
-    C_min = min(c_vals)
+    C_min = 0
     C_max = max(c_vals)
 
     # Get dimensions from the first valid file
     first_stack = tifffile.imread(first_file)
     if len(first_stack.shape) == 2:
-        # Handle 2D images (Z=1) gracefully
         Z_max = 0
         Y, X = first_stack.shape
     else:
@@ -170,7 +201,7 @@ def load_tiff_series(directory: Path):
 
     @functools.lru_cache(maxsize=8)
     def get_stack(t, c):
-        """Loads a 3D ZYX stack using the pre-built file map."""
+        """Loads a 3D ZYX stack using the pre-built file map (0-based keys)."""
         file_path = file_map.get((t, c))
 
         if not file_path or not file_path.exists():
