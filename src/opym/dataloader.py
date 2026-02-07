@@ -91,68 +91,78 @@ def load_llsm_tiff_series(directory: Path):
 def load_tiff_series(directory: Path):
     """
     Parses a directory of processed OPM TIFFs and returns viewer parameters.
+    Updated to handle variable padding (e.g. C0 vs C00, T000 vs T0001).
 
     Args:
-        directory: The Path object pointing to the processed_tiff_series_split
-                   directory.
+        directory: The Path object pointing to the processed tiff series.
 
     Returns:
-        A tuple containing:
-        - get_stack (Callable): A cached function to load a (T, C) stack.
-        - T_min (int): The minimum time index found.
-        - T_max (int): The maximum time index found.
-        - C_min (int): The minimum channel index found.
-        - C_max (int): The maximum channel index found.
-        - Z_max (int): The maximum Z index.
-        - Y (int): The Y dimension of the images.
-        - X (int): The X dimension of the images.
-        - base_name (str): The parsed base name of the files.
+        Standard viewer tuple.
     """
-    print("Loading OPM TIFF series...")
+    print(f"Loading OPM TIFF series from: {directory.name}")
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # --- MODIFICATION: Find file with new C..._T... format ---
-    first_file = next(directory.glob("*_C[0-9]_T[0-9][0-9][0-9].tif"), None)
-    if not first_file:
+    # 1. Flexible Glob: Find anything looking like *_C*_T*.tif
+    # This matches 'img_C00_T0001.tif' AND 'Name_C0_T000.tif'
+    files = sorted(list(directory.glob("*_C*_T*.tif")))
+
+    if not files:
         raise FileNotFoundError(
-            f"No processed TIFF files (e.g., '*_C0_T000.tif') found in {directory}"
+            f"No compatible TIFF files (e.g., '*_Cxx_Txxxx.tif') found in {directory}"
         )
 
-    # --- MODIFICATION: Use regex to parse base name from new format ---
-    file_pattern_re = re.compile(r"^(.*?)_C\d_T\d{3}\.tif$")
-    match = file_pattern_re.match(first_file.name)
-    if not match:
-        raise ValueError(f"Could not parse base name from file: {first_file.name}")
+    # 2. Flexible Regex: Capture Base, C, and T regardless of digit count
+    # Anchored to end to handle extensions correctly
+    file_pattern_re = re.compile(r"^(.*?)_C(\d+)_T(\d+)\.tif$", re.IGNORECASE)
 
-    BASE_NAME = match.group(1)
-    print(f"Found base name: {BASE_NAME}")
-
-    # Parse T, C, and Z limits from files
     t_vals = set()
     c_vals = set()
-    # --- MODIFICATION: Use regex for new C..._T... format ---
-    file_pattern = re.compile(f"{re.escape(BASE_NAME)}_C(\\d+)_T(\\d+).tif")
+    file_map = {}  # Map (t, c) -> Path
 
-    for f in directory.glob(f"{BASE_NAME}_C*_T*.tif"):
-        match = file_pattern.match(f.name)
+    base_name = None
+    first_file = None
+
+    print(f"Scanning {len(files)} files...")
+
+    for f in files:
+        match = file_pattern_re.match(f.name)
         if match:
-            # --- MODIFICATION: Group 1 is C, Group 2 is T ---
-            c_vals.add(int(match.group(1)))
-            t_vals.add(int(match.group(2)))
+            # Capture base name from the first valid match
+            if base_name is None:
+                base_name = match.group(1)
+                first_file = f
 
-    if not t_vals or not c_vals:
-        raise FileNotFoundError("Could not parse T or C values from filenames.")
+            # Ensure we don't mix base names (e.g. if folder has junk)
+            if match.group(1) != base_name:
+                continue
+
+            c = int(match.group(2))
+            t = int(match.group(3))
+
+            c_vals.add(c)
+            t_vals.add(t)
+            file_map[(t, c)] = f
+
+    if not file_map:
+        raise ValueError("Files found but regex failed to parse C/T values.")
+
+    print(f"Found base name: {base_name}")
 
     T_min = min(t_vals)
     T_max = max(t_vals)
     C_min = min(c_vals)
     C_max = max(c_vals)
 
-    # Use the first_file we already found to get shape
+    # Get dimensions from the first valid file
     first_stack = tifffile.imread(first_file)
-    Z_max, Y, X = first_stack.shape
-    Z_max -= 1  # Max index is shape - 1
+    if len(first_stack.shape) == 2:
+        # Handle 2D images (Z=1) gracefully
+        Z_max = 0
+        Y, X = first_stack.shape
+    else:
+        Z_max, Y, X = first_stack.shape
+        Z_max -= 1
 
     print(
         f"Data shape: T={T_min}-{T_max}, Z={Z_max + 1}, C={C_min}-{C_max}, Y={Y}, X={X}"
@@ -160,14 +170,15 @@ def load_tiff_series(directory: Path):
 
     @functools.lru_cache(maxsize=8)
     def get_stack(t, c):
-        """Loads a 3D ZYX stack for a given T and C."""
-        # --- MODIFICATION: Use new file naming format ---
-        file_path = directory / f"{BASE_NAME}_C{c:d}_T{t:03d}.tif"
-        if not file_path.exists():
-            print(f"Warning: File not found {file_path.name}")
+        """Loads a 3D ZYX stack using the pre-built file map."""
+        file_path = file_map.get((t, c))
+
+        if not file_path or not file_path.exists():
+            print(f"Warning: Frame missing for T={t}, C={c}")
             return np.zeros((Z_max + 1, Y, X), dtype=first_stack.dtype)
+
         return tifffile.imread(file_path)
 
     print("✅ OPM Data loaded.")
 
-    return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, BASE_NAME
+    return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name
