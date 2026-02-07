@@ -1,7 +1,7 @@
 function run_petakit_cropper(json_file)
 % RUN_PETAKIT_CROPPER High-performance parallel cropping (Native MATLAB)
-%   Optimized for speed using 'tiffread' from PetaKit5D if available.
-%   Falls back to optimized sequential Tiff class usage if not.
+%   Uses PetaKit5D 'readtiff' and 'writetiff' (C++ MEX) for maximum speed.
+%   Automatically initializes PetaKit via setup.m.
 
     % 0. Cleanup and Setup
     warning('off', 'all');
@@ -18,59 +18,65 @@ function run_petakit_cropper(json_file)
 
     if ~exist(outputDir, 'dir'), mkdir(outputDir); end
 
-    fprintf('🚀 Starting Crop (PetaKit5D Fast Reader)\n');
+    fprintf('🚀 Starting PetaKit5D Cropper\n');
     fprintf('   Input:  %s\n', fullBaseName);
     fprintf('   Output: %s\n', outputDir);
 
-    % Check for fast reader
-    has_fast_reader = ~isempty(which('tiffread'));
-    if has_fast_reader
-        fprintf('✅ Fast reader found: "tiffread"\n');
+    % --- 1. SETUP PETAKIT ENVIRONMENT ---
+    % As per demo, we run 'setup.m' from the root to ensure all paths (MEX, io, etc) are correct.
+    petakit_root = getenv('PETAKIT_ROOT');
+    if isempty(petakit_root), petakit_root = '/cm/shared/apps_local/petakit5d'; end
+
+    setup_script = fullfile(petakit_root, 'setup.m');
+    if exist(setup_script, 'file')
+        fprintf('🔧 Initializing PetaKit5D from: %s\n', petakit_root);
+        run(setup_script);
     else
-        fprintf('⚠️ "tiffread" not found. Falling back to native Tiff class.\n');
+        fprintf('⚠️ setup.m not found at %s. Attempting manual path add...\n', setup_script);
+        addpath(genpath(petakit_root));
     end
 
-    % 1. Map Files & Parse Metadata
-    % Optimization: Check if metadata was passed in the JSON to save time
-    use_cached_map = false;
+    % --- 2. VERIFY OPTIMIZED I/O ---
+    has_readtiff = ~isempty(which('readtiff'));
+    has_writetiff = ~isempty(which('writetiff'));
 
-    % Check if 'metadata' exists and has 'FileMap'
+    if has_readtiff
+        fprintf('✅ Optimized Reader found: "%s"\n', which('readtiff'));
+    else
+        fprintf('⚠️ "readtiff" NOT found. Fallback to slow Tiff class will be used.\n');
+    end
+
+    if has_writetiff
+        fprintf('✅ Optimized Writer found: "%s"\n', which('writetiff'));
+    else
+        fprintf('⚠️ "writetiff" NOT found. Fallback to slow imwrite will be used.\n');
+    end
+
+    % --- 3. METADATA & MAPPING ---
+    use_cached_map = false;
     if isfield(job, 'metadata') && isfield(job.metadata, 'FileMap') && ~isempty(job.metadata.FileMap)
         try
-            fprintf('📥 Found metadata in JSON ticket. Validating...\n');
-
-            % Extract Dimensions
             SizeT = job.metadata.SizeT;
             SizeZ = job.metadata.SizeZ;
             SizeC = job.metadata.SizeC;
             DimOrder = job.metadata.DimOrder;
-
-            % Extract FileMap
             FileMap = job.metadata.FileMap;
-
-            % Basic validation that it is a struct array with correct fields
-            % Note: JSON decoding might result in camelCase or different structures depending on source
             if isstruct(FileMap) && isfield(FileMap, 'path') && isfield(FileMap, 'start_idx') && isfield(FileMap, 'end_idx')
                 use_cached_map = true;
-            else
-                fprintf('⚠️ FileMap in JSON is missing required fields (path, start_idx, end_idx). Re-scanning.\n');
             end
-        catch ME
-            fprintf('⚠️ Error reading cached metadata: %s. Re-scanning.\n', ME.message);
-            use_cached_map = false;
+        catch
         end
     end
 
     if use_cached_map
-        fprintf('✅ Using cached FileMap. Skipping structure scan.\n');
+        fprintf('📥 Using cached file structure from JSON.\n');
     else
-        fprintf('🔍 Scanning file structure (this may take a moment)...\n');
+        fprintf('🔍 Scanning file structure...\n');
         [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(inputFile);
     end
+    fprintf('📊 Metadata: T=%d, Z=%d, C=%d (%s)\n', SizeT, SizeZ, SizeC, DimOrder);
 
-    fprintf('📊 Metadata: T=%d, Z=%d, C=%d\n', SizeT, SizeZ, SizeC);
-
-    % 2. Setup Parameters
+    % --- 4. PARAMETER SETUP ---
     top_roi = parse_roi_str(job.parameters.rois.top);
     bot_roi = parse_roi_str(job.parameters.rois.bottom);
     do_rotate = isfield(job.parameters, 'rotate') && job.parameters.rotate;
@@ -91,26 +97,23 @@ function run_petakit_cropper(json_file)
     fprintf(fid, '%s', jsonencode(logStruct, 'PrettyPrint', true));
     fclose(fid);
 
-    % 3. Parallel Processing Loop
+    % --- 5. PARALLEL PROCESSING LOOP ---
     pool = gcp('nocreate');
     if isempty(pool), pool = parpool('local'); end
     fprintf('🔥 Processing %d timepoints on %d workers...\n', SizeT, pool.NumWorkers);
 
     parfor t_idx = 0 : (SizeT - 1)
-        % --- A. PLAN THE READS ---
+        % A. PLAN READS (Logic for sorting disk access)
         frames_to_read = struct('global_idx', {}, 'z', {}, 'c', {});
         count = 0;
-
         for z = 0:(SizeZ-1)
             for c = 0:(SizeC-1)
-                if strcmp(DimOrder, 'XYCZT') || strcmp(DimOrder, 'Default')
-                    g_idx = (t_idx * SizeZ * SizeC) + (z * SizeC) + c;
-                elseif strcmp(DimOrder, 'XYZCT')
+                % Calculate Index based on Order
+                if strcmp(DimOrder, 'XYZCT')
                     g_idx = (t_idx * SizeZ * SizeC) + (c * SizeZ) + z;
-                else
+                else % Default XYCZT
                     g_idx = (t_idx * SizeZ * SizeC) + (z * SizeC) + c;
                 end
-
                 count = count + 1;
                 frames_to_read(count).global_idx = g_idx;
                 frames_to_read(count).z = z;
@@ -118,13 +121,12 @@ function run_petakit_cropper(json_file)
             end
         end
 
-        % --- B. SORT READS BY DISK LOCATION ---
+        % B. SORT READS (Sequential Disk Access)
         read_list = cell(count, 5);
         valid_read_count = 0;
         for i = 1:count
             g_idx = frames_to_read(i).global_idx;
             [fPath, locIdx] = get_file_for_frame(g_idx, FileMap);
-
             if ~isempty(fPath)
                 valid_read_count = valid_read_count + 1;
                 read_list{valid_read_count, 1} = fPath;
@@ -138,7 +140,7 @@ function run_petakit_cropper(json_file)
         Tbl = cell2table(read_list(1:valid_read_count, :), 'VariableNames', {'Path', 'LocIdx', 'Z', 'C', 'Global'});
         Tbl = sortrows(Tbl, {'Path', 'LocIdx'});
 
-        % --- C. PRE-ALLOCATE BUFFERS ---
+        % C. PRE-ALLOCATE BUFFERS
         h_top=0; w_top=0; h_bot=0; w_bot=0;
         if ~isempty(top_roi), h_top=top_roi(2)-top_roi(1)+1; w_top=top_roi(4)-top_roi(3)+1; end
         if ~isempty(bot_roi), h_bot=bot_roi(2)-bot_roi(1)+1; w_bot=bot_roi(4)-bot_roi(3)+1; end
@@ -153,59 +155,46 @@ function run_petakit_cropper(json_file)
 
         output_buffers = containers.Map('KeyType', 'double', 'ValueType', 'any');
 
-        % --- D. EXECUTE READS (FAST BATCH) ---
+        % D. EXECUTE READS (Using Optimized readtiff)
         uniqueFiles = unique(Tbl.Path);
-
         for uf = 1:length(uniqueFiles)
             currPath = uniqueFiles{uf};
             fileMask = strcmp(Tbl.Path, currPath);
             subTbl = Tbl(fileMask, :);
 
-            % Indices to read (1-based for tiffread usually)
+            % 1-based indices for PetaKit readtiff
             indices_to_load = subTbl.LocIdx + 1;
 
             imgs = {};
-
-            if has_fast_reader
+            if has_readtiff
                 try
-                    % PetaKit tiffread typically: tiffread(filename, indices)
-                    % Returns struct array or cell array
-                    raw_data = tiffread(currPath, indices_to_load);
+                    % PetaKit readtiff(filename, indices)
+                    raw = readtiff(currPath, indices_to_load);
 
-                    if isstruct(raw_data)
-                        % Assuming .data field
-                        imgs = {raw_data.data};
-                    elseif iscell(raw_data)
-                        imgs = raw_data;
-                    else
-                        % Maybe it returns a 3D matrix?
-                         if ndims(raw_data) == 3
-                             % Unpack 3D matrix to cell
-                             num_loaded = size(raw_data, 3);
-                             imgs = cell(1, num_loaded);
-                             for slice = 1:num_loaded
-                                 imgs{slice} = raw_data(:,:,slice);
-                             end
-                         end
+                    % Normalize output format
+                    if isstruct(raw), imgs = {raw.data};
+                    elseif iscell(raw), imgs = raw;
+                    elseif ndims(raw) == 3
+                        num_loaded = size(raw, 3);
+                        imgs = cell(1, num_loaded);
+                        for sl = 1:num_loaded, imgs{sl} = raw(:,:,sl); end
+                    elseif ismatrix(raw) && length(indices_to_load) == 1
+                        imgs = {raw};
                     end
                 catch
-                    % Fallback to slow read for this file if fast reader errors
                     imgs = fallback_read(currPath, indices_to_load);
                 end
             else
                 imgs = fallback_read(currPath, indices_to_load);
             end
 
-            % Process Loaded Images
+            % Distribute to buffers
             for k = 1:length(indices_to_load)
                 if k > length(imgs), break; end
                 img = imgs{k};
-
-                % Metadata for this frame
                 z_curr = subTbl.Z(k);
                 c_input = subTbl.C(k);
 
-                % Process Logic (Same as before)
                 outA_id = 2 * c_input;
                 outB_id = 2 * c_input + 1;
                 is_even = mod(c_input, 2) == 0;
@@ -216,9 +205,7 @@ function run_petakit_cropper(json_file)
                     else, use_roi=top_roi; H=final_h_top; W=final_w_top; end
 
                     if ~isempty(use_roi)
-                        if ~isKey(output_buffers, outA_id)
-                            output_buffers(outA_id) = zeros(H, W, SizeZ, 'uint16');
-                        end
+                        if ~isKey(output_buffers, outA_id), output_buffers(outA_id) = zeros(H, W, SizeZ, 'uint16'); end
                         crop = img(use_roi(1):use_roi(2), use_roi(3):use_roi(4));
                         if do_rotate, crop = rot90(crop); end
                         buf = output_buffers(outA_id);
@@ -233,9 +220,7 @@ function run_petakit_cropper(json_file)
                     else, use_roi=bot_roi; H=final_h_bot; W=final_w_bot; end
 
                     if ~isempty(use_roi)
-                         if ~isKey(output_buffers, outB_id)
-                            output_buffers(outB_id) = zeros(H, W, SizeZ, 'uint16');
-                        end
+                        if ~isKey(output_buffers, outB_id), output_buffers(outB_id) = zeros(H, W, SizeZ, 'uint16'); end
                         crop = img(use_roi(1):use_roi(2), use_roi(3):use_roi(4));
                         if do_rotate, crop = rot90(crop); end
                         buf = output_buffers(outB_id);
@@ -246,14 +231,24 @@ function run_petakit_cropper(json_file)
             end
         end
 
-        % --- E. WRITE OUTPUTS ---
+        % E. WRITE OUTPUTS (Using Optimized writetiff)
         keys = output_buffers.keys;
         for k = 1:length(keys)
             id = keys{k};
             stack = output_buffers(id);
             outName = sprintf('%s_C%d_T%03d.tif', cleanBaseName, id, t_idx);
             outPath = fullfile(outputDir, outName);
-            write_3d_tiff(outPath, stack);
+
+            if has_writetiff
+                try
+                    % PetaKit writetiff(data, filename)
+                    writetiff(stack, outPath);
+                catch
+                    write_3d_tiff_fallback(outPath, stack);
+                end
+            else
+                write_3d_tiff_fallback(outPath, stack);
+            end
         end
     end
     fprintf('✅ Crop Complete.\n');
@@ -262,7 +257,6 @@ end
 % --- HELPERS ---
 
 function imgs = fallback_read(fPath, indices)
-    % Optimized sequential reader using Tiff class
     imgs = cell(1, length(indices));
     try
         t = Tiff(fPath, 'r');
@@ -276,19 +270,25 @@ function imgs = fallback_read(fPath, indices)
     end
 end
 
+function write_3d_tiff_fallback(filename, stack)
+    imwrite(stack(:,:,1), filename);
+    num_z = size(stack, 3);
+    if num_z > 1
+        for k = 2:num_z
+            imwrite(stack(:,:,k), filename, 'WriteMode', 'append');
+        end
+    end
+end
+
 function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(masterFile)
     t = Tiff(masterFile, 'r');
     SizeC=1; SizeZ=1; SizeT=1; DimOrder='XYCZT';
     try
         desc = t.getTag('ImageDescription');
-        tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
-        if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
-        tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
-        if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
-        tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
-        if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
-        tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens');
-        if ~isempty(tokO), DimOrder = tokO{1}{1}; end
+        tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens'); if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
+        tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens'); if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
+        tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens'); if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
+        tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens'); if ~isempty(tokO), DimOrder = tokO{1}{1}; end
     catch
     end
     t.close();
@@ -304,29 +304,21 @@ function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(maste
         fn = d(k).name;
         isMaster = ~isempty(regexp(fn, ['^' safeBase '\.ome\.tif$'], 'once'));
         tokSib = regexp(fn, ['^' safeBase '_(\d+)\.ome\.tif$'], 'tokens');
-
         idx_suffix = -1;
-        if isMaster, idx_suffix = 0;
-        elseif ~isempty(tokSib), idx_suffix = str2double(tokSib{1}{1}); end
-
+        if isMaster, idx_suffix = 0; elseif ~isempty(tokSib), idx_suffix = str2double(tokSib{1}{1}); end
         if idx_suffix >= 0
             valid_count = valid_count + 1;
             files(valid_count).path = fullfile(d(k).folder, fn);
             files(valid_count).idx_suffix = idx_suffix;
         end
     end
-
     [~, I] = sort([files.idx_suffix]);
     files = files(I);
-
     current_start = 0;
     for k = 1:length(files)
         fPath = files(k).path;
         count = 0;
         try
-            % Check for tiffread to speed up counting?
-            % Usually ImageDescription in each file works better.
-            % But standard Tiff count is safest.
             t = Tiff(fPath, 'r');
             while true
                 count = count + 1;
@@ -360,14 +352,4 @@ function roi = parse_roi_str(s)
     clean = replace(s, {':', ','}, ' ');
     vals = sscanf(clean, '%d %d %d %d');
     if numel(vals) == 4, roi = [vals(1)+1, vals(2), vals(3)+1, vals(4)]; else, roi = []; end
-end
-
-function write_3d_tiff(filename, stack)
-    imwrite(stack(:,:,1), filename);
-    num_z = size(stack, 3);
-    if num_z > 1
-        for k = 2:num_z
-            imwrite(stack(:,:,k), filename, 'WriteMode', 'append');
-        end
-    end
 end
