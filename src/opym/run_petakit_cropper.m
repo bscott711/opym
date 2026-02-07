@@ -1,7 +1,7 @@
 function run_petakit_cropper(json_file)
 % RUN_PETAKIT_CROPPER High-performance parallel cropping (Native MATLAB)
 %   Uses PetaKit5D 'readtiff' and 'writetiff' (C++ MEX) for maximum speed.
-%   Automatically initializes PetaKit via setup.m.
+%   Features "Fast Scan" mapping to instantly handle split OME-TIFFs.
 
     % 0. Cleanup and Setup
     warning('off', 'all');
@@ -23,7 +23,6 @@ function run_petakit_cropper(json_file)
     fprintf('   Output: %s\n', outputDir);
 
     % --- 1. SETUP PETAKIT ENVIRONMENT ---
-    % As per demo, we run 'setup.m' from the root to ensure all paths (MEX, io, etc) are correct.
     petakit_root = getenv('PETAKIT_ROOT');
     if isempty(petakit_root), petakit_root = '/cm/shared/apps_local/petakit5d'; end
 
@@ -52,7 +51,7 @@ function run_petakit_cropper(json_file)
         fprintf('⚠️ "writetiff" NOT found. Fallback to slow imwrite will be used.\n');
     end
 
-    % --- 3. METADATA & MAPPING ---
+    % --- 3. METADATA & MAPPING (FAST SCAN) ---
     use_cached_map = false;
     if isfield(job, 'metadata') && isfield(job.metadata, 'FileMap') && ~isempty(job.metadata.FileMap)
         try
@@ -71,7 +70,7 @@ function run_petakit_cropper(json_file)
     if use_cached_map
         fprintf('📥 Using cached file structure from JSON.\n');
     else
-        fprintf('🔍 Scanning file structure...\n');
+        fprintf('🔍 Instant-Scanning file structure...\n');
         [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(inputFile);
     end
     fprintf('📊 Metadata: T=%d, Z=%d, C=%d (%s)\n', SizeT, SizeZ, SizeC, DimOrder);
@@ -281,14 +280,25 @@ function write_3d_tiff_fallback(filename, stack)
 end
 
 function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(masterFile)
+    % Reads metadata and uses FAST HEURISTIC (File Size) to map frames.
+
+    warning('off', 'all');
     t = Tiff(masterFile, 'r');
+
     SizeC=1; SizeZ=1; SizeT=1; DimOrder='XYCZT';
+    W=0; H=0; BPS=0; Compression=1;
+
     try
         desc = t.getTag('ImageDescription');
         tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens'); if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
         tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens'); if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
         tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens'); if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
         tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens'); if ~isempty(tokO), DimOrder = tokO{1}{1}; end
+
+        W = double(t.getTag('ImageWidth'));
+        H = double(t.getTag('ImageLength'));
+        BPS = double(t.getTag('BitsPerSample'));
+        try Compression = t.getTag('Compression'); catch, Compression=1; end
     catch
     end
     t.close();
@@ -296,7 +306,7 @@ function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(maste
     [fDir, fName, ~] = fileparts(masterFile);
     basePattern = regexprep(fName, '\.ome$', '');
     d = dir(fullfile(fDir, '*.tif'));
-    files = struct('path', {}, 'start_idx', {}, 'end_idx', {}, 'count', {}, 'idx_suffix', {});
+    files = struct('path', {}, 'start_idx', {}, 'end_idx', {}, 'count', {}, 'idx_suffix', {}, 'bytes', {});
     valid_count = 0;
     safeBase = regexptranslate('escape', basePattern);
 
@@ -310,24 +320,43 @@ function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(maste
             valid_count = valid_count + 1;
             files(valid_count).path = fullfile(d(k).folder, fn);
             files(valid_count).idx_suffix = idx_suffix;
+            files(valid_count).bytes = d(k).bytes;
         end
     end
     [~, I] = sort([files.idx_suffix]);
     files = files(I);
+
     current_start = 0;
+    bytes_per_frame = W * H * (BPS / 8);
+
     for k = 1:length(files)
         fPath = files(k).path;
         count = 0;
-        try
-            t = Tiff(fPath, 'r');
-            while true
-                count = count + 1;
-                if t.lastDirectory(), break; end
-                t.nextDirectory();
-            end
-            t.close();
-        catch
+
+        % FAST HEURISTIC
+        can_fast_scan = (Compression == 1) && (bytes_per_frame > 0);
+        if can_fast_scan
+             count = floor(files(k).bytes / bytes_per_frame);
+             if count == 0 && files(k).bytes > 1024*1024
+                 % Heuristic failed sanity check
+                 count = 0;
+             end
         end
+
+        % FALLBACK
+        if count == 0
+             try
+                 t = Tiff(fPath, 'r');
+                 while true
+                     count = count + 1;
+                     if t.lastDirectory(), break; end
+                     t.nextDirectory();
+                 end
+                 t.close();
+             catch
+             end
+        end
+
         files(k).count = count;
         files(k).start_idx = current_start;
         files(k).end_idx = current_start + count - 1;
