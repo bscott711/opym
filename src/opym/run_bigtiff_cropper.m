@@ -1,12 +1,10 @@
 function run_bigtiff_cropper(job)
 % RUN_BIGTIFF_CROPPER Reads BigTiff via XML Map, crops, and saves split channels.
 %
-% LOGIC:
-%   - Loader gets perfectly ordered frames (descrambled via XML).
-%   - We iterate Raw Channels 1-4.
-%   - Cam 1 (Raw Ch 1 & 3): Bottom=Low, Top=High
-%   - Cam 2 (Raw Ch 2 & 4): Top=Low, Bottom=High (Inverted)
-%   - FIXED: Output filenames now use 0-based time indexing (T0000 instead of T0001).
+% UPDATES:
+%   - Filenames now match the folder name (Fixes Deskew "File Not Found").
+%   - Timepoints are 0-indexed (T0000) to match Python/Napari.
+%   - Uses BigTiffFastLoader (XML Map version).
 
     % --- 1. Setup ---
     p = job.parameters;
@@ -29,16 +27,21 @@ function run_bigtiff_cropper(job)
     roiBot = parseROI(p.rois.bottom);
     doRotate = isfield(p, 'rotate') && p.rotate;
 
-    % Output Directory
+    % Determine Output Folder & Filename Prefix
+    % Logic: If job has baseName, use it. Otherwise derive from file.
     if isfield(job, 'baseName')
-        folderName = regexprep(job.baseName, '\.ome(\.tif)?$', '');
+        % Remove extension if present in the baseName string
+        cleanName = regexprep(job.baseName, '\.ome(\.tif)?$', '');
     else
-        [~, folderName] = fileparts(masterFile);
+        [~, cleanName] = fileparts(masterFile);
     end
-    outDir = fullfile(workDir, folderName);
+
+    outDir = fullfile(workDir, cleanName);
     if ~exist(outDir, 'dir'), mkdir(outDir); end
 
     fprintf('   [Cropper] Source: %s\n', masterFile);
+    fprintf('   [Cropper] Output: %s\n', outDir);
+    fprintf('   [Cropper] Naming: %s_Cxx_Txxxx.tif\n', cleanName);
 
     % --- 2. Initialize XML Loader ---
     % Suppress annoying Tiff warnings on workers
@@ -66,20 +69,17 @@ function run_bigtiff_cropper(job)
         warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
 
         % Map linear index 'k' to Raw(Channel, Time)
-        % Note: t is 1-based here (1..T) because it drives the Loader
-        [rc, t] = ind2sub([RawC, T], k);
+        % Note: t_in is 1-based (MATLAB), t_out will be 0-based (Python)
+        [rc, t_in] = ind2sub([RawC, T], k);
 
         % A. Load Frame (Loader handles descrambling automatically)
         rawStack = zeros(loader.Geometry.H, loader.Geometry.W, Z, 'uint16');
         for z = 1:Z
-            rawStack(:,:,z) = loader.getFrame(t, z, rc);
+            rawStack(:,:,z) = loader.getFrame(t_in, z, rc);
         end
 
         % B. Determine Output Channel IDs
-        % Base ID for this Raw Channel (e.g., Raw 1 -> 0, Raw 2 -> 2...)
         base_out_ch = (rc - 1) * 2;
-
-        % Logic: Odd Raw Channels are Camera 1, Even are Camera 2
         isCam1 = mod(rc, 2) ~= 0;
 
         if isCam1
@@ -92,21 +92,21 @@ function run_bigtiff_cropper(job)
             ch_Bot = base_out_ch + 1; % e.g. 3
         end
 
-        % --- WRITE OUTPUT (0-BASED TIME FIX) ---
-        % We subtract 1 from 't' so the filename starts at T0000
+        % --- CROP, ROTATE, WRITE (Dynamic Naming) ---
 
-        % C. Crop and Save BOTTOM
+        % Bottom Crop
         stackBot = rawStack(roiBot.y, roiBot.x, :);
         if doRotate, stackBot = rot90(stackBot); end
 
-        fNameBot = sprintf('img_C%02d_T%04d.tif', ch_Bot, t - 1); % <--- FIX HERE
+        % Name Format: cleanName_C00_T0000.tif
+        fNameBot = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Bot, t_in - 1);
         writetiff(stackBot, fullfile(outDir, fNameBot));
 
-        % D. Crop and Save TOP
+        % Top Crop
         stackTop = rawStack(roiTop.y, roiTop.x, :);
         if doRotate, stackTop = rot90(stackTop); end
 
-        fNameTop = sprintf('img_C%02d_T%04d.tif', ch_Top, t - 1); % <--- FIX HERE
+        fNameTop = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Top, t_in - 1);
         writetiff(stackTop, fullfile(outDir, fNameTop));
     end
     t_end = toc;
