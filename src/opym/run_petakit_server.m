@@ -1,6 +1,6 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% UPDATED: Now uses native MATLAB Parallel Cropping.
+% UPDATED: Now intelligently dispatches BigTiff vs Standard jobs.
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
@@ -12,19 +12,14 @@ else
     fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
 end
 
-% 2. Python Path (CRITICAL FIX)
-% We rely on the launcher script to export 'OPYM_PYTHON' pointing to the
-% correct executable (e.g., ~/.conda/envs/ppk5d/bin/python).
+% 2. Python Path
 pythonPath = getenv('OPYM_PYTHON');
-
 if isempty(pythonPath)
-    % Fallback: Try to use whatever 'python' is in the system PATH
     [status, cmdOut] = system('which python');
     if status == 0
         pythonPath = strtrim(cmdOut);
         fprintf('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s\n', pythonPath);
     else
-        % Non-critical error now, since cropping is pure MATLAB
         fprintf('[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.\n');
     end
 else
@@ -105,12 +100,22 @@ while true
 
         switch jobType
             case 'crop'
-                % --- CROPPING JOB (Native MATLAB Parallel) ---
-                fprintf('         Type: OPM Cropping (MATLAB Parallel)\n');
+                % --- CROPPING JOB ---
+                fprintf('         Type: OPM Cropping\n');
 
-                % Call the dedicated parallel cropper function
-                % srcPath is the full path to the JSON job file
-                run_petakit_cropper(srcPath);
+                % --- DISPATCH LOGIC (THE FIX) ---
+                % Check if the input dataDir points to an OME-TIFF file
+                isBigTiff = endsWith(job.dataDir, '.ome.tif', 'IgnoreCase', true);
+
+                if isBigTiff
+                    fprintf('         -> Mode: BigTiff Split (Parallel)\n');
+                    % Use the new specialized cropper (takes the job struct)
+                    run_bigtiff_cropper(job);
+                else
+                    fprintf('         -> Mode: Standard PetaKit Crop\n');
+                    % Use the legacy cropper (takes the JSON path)
+                    run_petakit_cropper(srcPath);
+                end
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---
