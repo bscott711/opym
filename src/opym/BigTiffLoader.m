@@ -1,177 +1,186 @@
 classdef BigTiffFastLoader < handle
-    % BIGTIFFFASTLOADER Maps and reads interleaved OME-TIFFs without slow scanning.
+    % BIGTIFFFASTLOADER Reads OME-TIFFs using the embedded XML Map.
     %
-    % Usage:
-    %   loader = BigTiffFastLoader('path/to/file.ome.tif');
-    %   img = loader.getFrame(t, z, c);
-    %   img = loader.getFrame(1, 50, 2); % 1-based indexing
+    % LOGIC:
+    %   1. Reads OME-XML from the master file header.
+    %   2. Parses <TiffData> tags to map (T,Z,C) -> (File, IFD).
+    %   3. Supports scrambled channels, multi-file splitting, and gaps.
 
     properties
         MasterFile      % Path to the master .ome.tif
-        FileMap         % Struct array of file chunks and their frame ranges
+        FileMap         % Cell array of file paths
+        FrameMap        % Struct Array or Matrix: Map{t,z,c} -> [FileIdx, LocalIFD]
         Dimensions      % Struct with fields SizeT, SizeZ, SizeC
         Geometry        % Struct with W, H, BytesPerPixel
-        TotalFrames     % Total frames found across all files
         ReaderHandle    % Function handle for the actual reading
     end
 
     methods
         function obj = BigTiffFastLoader(filePath)
-            % Constructor: Parses metadata and builds the fast map
             if ~isfile(filePath)
                 error('BigTiffFastLoader:FileNotFound', 'File not found: %s', filePath);
             end
             obj.MasterFile = filePath;
 
-            % 1. Parse Dimensions & Geometry
-            obj.parseMetadata();
+            % 1. Parse Metadata & Build Map
+            fprintf('📖 Parsing OME-XML Map (this may take 2-3 seconds)...\n');
+            obj.parseXMLMap();
 
-            % 2. Map Files (The Fast Heuristic)
-            obj.mapFiles();
+            % 2. Default Reader (User should overwrite with petakit reader)
+            obj.ReaderHandle = @(f, idx) readStdTiff(f, idx);
 
-            % 3. Define the Reader
-            % Using an anonymous function to wrap petakit5d or standard Tiff
-            % NOTE: Verify if your reader expects 0-based or 1-based index.
-            obj.ReaderHandle = @(f, idx) petakit5d.readTiff(f, idx);
-
-            fprintf('✅ Loader initialized. Found %d frames (Exp: %d).\n', ...
-                obj.TotalFrames, prod([obj.Dimensions.SizeT, obj.Dimensions.SizeZ, obj.Dimensions.SizeC]));
+            fprintf('✅ Loader initialized. Dimensions: T=%d, Z=%d, C=%d.\n', ...
+                obj.Dimensions.SizeT, obj.Dimensions.SizeZ, obj.Dimensions.SizeC);
         end
 
         function img = getFrame(obj, t, z, c)
-            % GETFRAME Retrieve a specific slice (1-based indexing)
-            % Mapping: Interleaved [Channel -> Z -> Time]
+            % GETFRAME Retrieve slice using the XML Lookup Map.
+            % Input: 1-based indices (Time, Z, Channel)
 
-            % 1. Input Validation
             if t > obj.Dimensions.SizeT || z > obj.Dimensions.SizeZ || c > obj.Dimensions.SizeC
                 error('BigTiffFastLoader:OutOfBounds', ...
-                      'Index out of bounds. Max: T=%d, Z=%d, C=%d', ...
-                      obj.Dimensions.SizeT, obj.Dimensions.SizeZ, obj.Dimensions.SizeC);
+                      'Index out of bounds. Req: T%d Z%d C%d (Max: %d %d %d)', ...
+                      t, z, c, obj.Dimensions.SizeT, obj.Dimensions.SizeZ, obj.Dimensions.SizeC);
             end
 
-            % 2. Calculate Global Linear Index (0-based for internal math)
-            % Sequence: Channel changes fastest, then Z, then Time.
-            % GlobalIdx = (t-1)*(Z*C) + (z-1)*(C) + (c-1)
+            % 1. Look up File Index and Local IFD
+            % Map is stored as (C, Z, T) for efficiency or struct
+            % We use linear indexing into the mapped arrays
 
-            sz_z = obj.Dimensions.SizeZ;
-            sz_c = obj.Dimensions.SizeC;
+            fIdx = obj.FrameMap.FileIdx(c, z, t);
+            ifd  = obj.FrameMap.IFD(c, z, t);
 
-            global_idx_0 = (t-1) * (sz_z * sz_c) + ...
-                           (z-1) * (sz_c) + ...
-                           (c-1);
-
-            % 3. Find which file contains this index
-            targetFile = [];
-            localIdx = -1;
-
-            for k = 1:length(obj.FileMap)
-                fm = obj.FileMap(k);
-                if global_idx_0 >= fm.start_idx && global_idx_0 <= fm.end_idx
-                    targetFile = fm.path;
-                    % Local index within that file (1-based for MATLAB/Tiff readers)
-                    localIdx = (global_idx_0 - fm.start_idx) + 1;
-                    break;
-                end
+            if fIdx == 0
+                error('Frame T%d Z%d C%d is defined in XML but not mapped to a file.', t, z, c);
             end
 
-            if isempty(targetFile)
-                error('BigTiffFastLoader:FrameNotFound', ...
-                      'Frame %d (T%d Z%d C%d) not found in file map.', global_idx_0, t, z, c);
-            end
+            targetFile = obj.FileMap{fIdx};
 
-            % 4. Call the external reader
+            % 2. Read
+            % Note: OME XML IFDs are 0-based. MATLAB Tiff is 1-based.
+            % We add +1 here.
             try
-                img = obj.ReaderHandle(targetFile, localIdx);
+                img = obj.ReaderHandle(targetFile, ifd + 1);
             catch ME
-                error('BigTiffFastLoader:ReadError', ...
-                      'Read failed on %s (Idx: %d): %s', targetFile, localIdx, ME.message);
+                warning(ME.identifier, '%s', ME.message);
+                rethrow(ME);
             end
         end
     end
 
     methods (Access = private)
-        function parseMetadata(obj)
-            % Reads OME-XML headers only
+        function parseXMLMap(obj)
+            % READ OME HEADER
             t = Tiff(obj.MasterFile, 'r');
             try
-                desc = t.getTag('ImageDescription');
-                % Defaults
-                obj.Dimensions.SizeC = 1;
-                obj.Dimensions.SizeZ = 1;
-                obj.Dimensions.SizeT = 1;
-
-                % Regex Parse
-                tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
-                if ~isempty(tokC), obj.Dimensions.SizeC = str2double(tokC{1}{1}); end
-
-                tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
-                if ~isempty(tokZ), obj.Dimensions.SizeZ = str2double(tokZ{1}{1}); end
-
-                tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
-                if ~isempty(tokT), obj.Dimensions.SizeT = str2double(tokT{1}{1}); end
-
-                % Geometry
-                obj.Geometry.W = double(t.getTag('ImageWidth'));
-                obj.Geometry.H = double(t.getTag('ImageLength'));
-                bps = double(t.getTag('BitsPerSample'));
-                obj.Geometry.BytesPerFrame = obj.Geometry.W * obj.Geometry.H * (bps / 8);
-
-            catch ME
-                % FIXED: Added Message Identifier as first argument
-                warning('BigTiffFastLoader:MetadataParsing', ...
-                        'Metadata parsing failed: %s', ME.message);
+                xmlStr = t.getTag('ImageDescription');
+            catch
+                error('Could not read ImageDescription tag.');
             end
             t.close();
-        end
 
-        function mapFiles(obj)
-            % Identify siblings and map ranges based on file size
-            [fDir, fName, ~] = fileparts(obj.MasterFile);
-            basePattern = regexprep(fName, '\.ome$', '');
-            d = dir(fullfile(fDir, '*.tif'));
+            % 1. PARSE DIMENSIONS
+            obj.Dimensions.SizeC = 1;
+            obj.Dimensions.SizeZ = 1;
+            obj.Dimensions.SizeT = 1;
 
-            % Find valid files
-            files = struct('path', {}, 'idx_suffix', {}, 'bytes', {});
-            safeBase = regexptranslate('escape', basePattern);
+            tok = regexp(xmlStr, 'SizeC="(\d+)"', 'tokens');
+            if ~isempty(tok), obj.Dimensions.SizeC = str2double(tok{1}{1}); end
+            tok = regexp(xmlStr, 'SizeZ="(\d+)"', 'tokens');
+            if ~isempty(tok), obj.Dimensions.SizeZ = str2double(tok{1}{1}); end
+            tok = regexp(xmlStr, 'SizeT="(\d+)"', 'tokens');
+            if ~isempty(tok), obj.Dimensions.SizeT = str2double(tok{1}{1}); end
 
-            count = 0;
-            for k = 1:length(d)
-                fn = d(k).name;
-                isMaster = ~isempty(regexp(fn, ['^' safeBase '\.ome\.tif$'], 'once'));
-                tokSib = regexp(fn, ['^' safeBase '_(\d+)\.ome\.tif$'], 'tokens');
+            % Geometry
+            tTemp = Tiff(obj.MasterFile, 'r');
+            obj.Geometry.W = double(tTemp.getTag('ImageWidth'));
+            obj.Geometry.H = double(tTemp.getTag('ImageLength'));
+            tTemp.close();
 
-                suffix = -1;
-                if isMaster, suffix = 0;
-                elseif ~isempty(tokSib), suffix = str2double(tokSib{1}{1});
-                end
+            % 2. PRE-ALLOCATE MAP
+            % We use 3D arrays for instant lookup: (C, Z, T)
+            sz = [obj.Dimensions.SizeC, obj.Dimensions.SizeZ, obj.Dimensions.SizeT];
+            obj.FrameMap.FileIdx = zeros(sz, 'uint8'); % Up to 255 files
+            obj.FrameMap.IFD     = zeros(sz, 'uint32');
 
-                if suffix >= 0
-                    count = count + 1;
-                    files(count).path = fullfile(d(k).folder, fn);
-                    files(count).idx_suffix = suffix;
-                    files(count).bytes = d(k).bytes;
-                end
+            % 3. IDENTIFY ALL FILES IN SET
+            % Find all siblings to map UUID filenames to real paths
+            [masterDir, masterName, ~] = fileparts(obj.MasterFile);
+            baseName = regexprep(masterName, '\.ome$', '');
+            d = dir(fullfile(masterDir, '*.tif'));
+
+            % Map "FileNameInXML" -> "RealFullPath"
+            nameToPath = containers.Map;
+            realFiles = {};
+
+            % Populate file list
+            for k=1:length(d)
+                % Store just the filename as key
+                nameToPath(d(k).name) = fullfile(masterDir, d(k).name);
+                % Also store sequential index for the lookup array
+                realFiles{end+1} = fullfile(masterDir, d(k).name); %#ok<AGROW>
+            end
+            obj.FileMap = realFiles;
+
+            % Create a helper to map filename string to index in obj.FileMap
+            % (Reverse lookup)
+            nameToIdx = containers.Map;
+            for k=1:length(realFiles)
+                [~, n, e] = fileparts(realFiles{k});
+                nameToIdx([n e]) = k;
             end
 
-            % Sort by suffix
-            [~, I] = sort([files.idx_suffix]);
-            files = files(I);
+            % 4. REGEX PARSE TIFFDATA
+            % Pattern: Looks for FirstC, FirstT, FirstZ, IFD, and UUID FileName
+            % Note: This handles explicit TiffData entries (PlaneCount=1)
 
-            % Map Ranges
-            current_start = 0; % 0-based tracking
-            for k = 1:length(files)
-                % The Fast Heuristic: FileSize / FrameSize
-                num_frames = floor(files(k).bytes / obj.Geometry.BytesPerFrame);
+            % We extract blocks to handle the "FileName" context
+            % Regex is complex; we assume standard OME layout:
+            % <TiffData ... IFD="X" ...> <UUID FileName="Y">...
 
-                files(k).start_idx = current_start;
-                files(k).end_idx = current_start + num_frames - 1;
-                files(k).count = num_frames;
+            % Faster approach: Extract all TiffData blocks
+            pat = '<TiffData\s+FirstC="(\d+)"\s+FirstT="(\d+)"\s+FirstZ="(\d+)"\s+IFD="(\d+)".*?>\s*<UUID\s+FileName="([^"]+)"';
+            tokens = regexp(xmlStr, pat, 'tokens');
 
-                current_start = current_start + num_frames;
+            if isempty(tokens)
+                % Try alternate ordering of attributes if first failed
+                pat = 'FirstC="(\d+)".*?FirstT="(\d+)".*?FirstZ="(\d+)".*?IFD="(\d+)".*?FileName="([^"]+)"';
+                tokens = regexp(xmlStr, pat, 'tokens');
             end
 
-            obj.FileMap = files;
-            obj.TotalFrames = current_start;
+            if isempty(tokens)
+                 error('Could not parse TiffData map. XML format might be unique.');
+            end
+
+            % 5. FILL THE MAP
+            fprintf('   Mapping %d frames...\n', length(tokens));
+
+            for k = 1:length(tokens)
+                tk = tokens{k};
+                c = str2double(tk{1}) + 1; % 1-based
+                t = str2double(tk{2}) + 1;
+                z = str2double(tk{3}) + 1;
+                ifd = str2double(tk{4});   % 0-based
+                fName = tk{5};
+
+                % Resolve File Index
+                if isKey(nameToIdx, fName)
+                    fIdx = nameToIdx(fName);
+
+                    % Update Map
+                    obj.FrameMap.FileIdx(c, z, t) = fIdx;
+                    obj.FrameMap.IFD(c, z, t)     = ifd;
+                else
+                    warning('File in XML not found on disk: %s', fName);
+                end
+            end
         end
     end
+end
+
+function img = readStdTiff(fPath, idx)
+    t = Tiff(fPath, 'r');
+    t.setDirectory(idx);
+    img = t.read();
+    t.close();
 end
