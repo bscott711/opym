@@ -40,12 +40,19 @@ function run_bigtiff_cropper(job)
     fprintf('   [Cropper] Source: %s\n', masterFile);
 
     % --- 2. Initialize XML Loader ---
+    % Suppress annoying Tiff warnings on workers
+    warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+    warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+
     pool = gcp('nocreate');
     if isempty(pool), pool = parpool(48); end
     addAttachedFiles(pool, {'BigTiffFastLoader.m'});
 
     loader = BigTiffFastLoader(masterFile);
-    loader.ReaderHandle = @(f, idx) readtiff(f, idx); % Hook PetaKit reader
+
+    % FIX: Do NOT use petakit 'readtiff', it only accepts 1 arg.
+    % We rely on the internal 'readStdTiff' set by the class constructor.
+    % loader.ReaderHandle = @(f, idx) readtiff(f, idx); <--- REMOVED
 
     T = loader.Dimensions.SizeT;
     Z = loader.Dimensions.SizeZ;
@@ -57,6 +64,9 @@ function run_bigtiff_cropper(job)
     % --- 3. Parallel Execution ---
     tic;
     parfor k = 1:num_raw_stacks
+        % Suppress warnings inside workers too
+        warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+
         % Map linear index 'k' to Raw(Channel, Time)
         [rc, t] = ind2sub([RawC, T], k);
 
