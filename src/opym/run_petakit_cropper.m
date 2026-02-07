@@ -1,34 +1,76 @@
 function run_petakit_cropper(json_file)
-% RUN_PETAKIT_CROPPER High-performance parallel cropping for PetaKit5D
-%   Refactored to handle Micro-Manager "Split" OME-TIFFs (multiple 4GB files).
-%   Output: 3D Stacks [Base]_C[c]_T[t].tif matching notebook channel logic.
+% RUN_PETAKIT_CROPPER High-performance parallel cropping (Native MATLAB)
+%   Optimized for speed using 'tiffread' from PetaKit5D if available.
+%   Falls back to optimized sequential Tiff class usage if not.
 
-    % 0. Suppress annoying TIFF warnings globally
-    warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-    warning('off', 'MATLAB:tifflib:TIFFReadDirectory:libraryWarning');
+    % 0. Cleanup and Setup
+    warning('off', 'all');
 
-    % 1. Parse Job JSON
     if ~isfile(json_file), error('JSON not found: %s', json_file); end
-
     fid = fopen(json_file, 'r');
-    str = char(fread(fid, inf)');
+    job = jsondecode(char(fread(fid, inf)'));
     fclose(fid);
-    job = jsondecode(str);
 
     inputFile = job.dataDir;
-
-    % --- FIX 1: Directory Naming (Strip .ome extension if present) ---
     [dataRoot, fullBaseName, ~] = fileparts(inputFile);
     cleanBaseName = regexprep(fullBaseName, '\.ome$', '');
     outputDir = fullfile(dataRoot, [cleanBaseName, '_cropped']);
 
     if ~exist(outputDir, 'dir'), mkdir(outputDir); end
 
-    fprintf('🚀 Starting Parallel Crop (Split-File Support)\n');
-    fprintf('   Input Base: %s\n', fullBaseName);
-    fprintf('   Output:     %s\n', outputDir);
+    fprintf('🚀 Starting Crop (PetaKit5D Fast Reader)\n');
+    fprintf('   Input:  %s\n', fullBaseName);
+    fprintf('   Output: %s\n', outputDir);
 
-    % 2. Parse Parameters
+    % Check for fast reader
+    has_fast_reader = ~isempty(which('tiffread'));
+    if has_fast_reader
+        fprintf('✅ Fast reader found: "tiffread"\n');
+    else
+        fprintf('⚠️ "tiffread" not found. Falling back to native Tiff class.\n');
+    end
+
+    % 1. Map Files & Parse Metadata
+    % Optimization: Check if metadata was passed in the JSON to save time
+    use_cached_map = false;
+
+    % Check if 'metadata' exists and has 'FileMap'
+    if isfield(job, 'metadata') && isfield(job.metadata, 'FileMap') && ~isempty(job.metadata.FileMap)
+        try
+            fprintf('📥 Found metadata in JSON ticket. Validating...\n');
+
+            % Extract Dimensions
+            SizeT = job.metadata.SizeT;
+            SizeZ = job.metadata.SizeZ;
+            SizeC = job.metadata.SizeC;
+            DimOrder = job.metadata.DimOrder;
+
+            % Extract FileMap
+            FileMap = job.metadata.FileMap;
+
+            % Basic validation that it is a struct array with correct fields
+            % Note: JSON decoding might result in camelCase or different structures depending on source
+            if isstruct(FileMap) && isfield(FileMap, 'path') && isfield(FileMap, 'start_idx') && isfield(FileMap, 'end_idx')
+                use_cached_map = true;
+            else
+                fprintf('⚠️ FileMap in JSON is missing required fields (path, start_idx, end_idx). Re-scanning.\n');
+            end
+        catch ME
+            fprintf('⚠️ Error reading cached metadata: %s. Re-scanning.\n', ME.message);
+            use_cached_map = false;
+        end
+    end
+
+    if use_cached_map
+        fprintf('✅ Using cached FileMap. Skipping structure scan.\n');
+    else
+        fprintf('🔍 Scanning file structure (this may take a moment)...\n');
+        [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(inputFile);
+    end
+
+    fprintf('📊 Metadata: T=%d, Z=%d, C=%d\n', SizeT, SizeZ, SizeC);
+
+    % 2. Setup Parameters
     top_roi = parse_roi_str(job.parameters.rois.top);
     bot_roi = parse_roi_str(job.parameters.rois.bottom);
     do_rotate = isfield(job.parameters, 'rotate') && job.parameters.rotate;
@@ -36,271 +78,288 @@ function run_petakit_cropper(json_file)
     req_channels = [];
     if isfield(job.parameters, 'channels')
         req_channels = job.parameters.channels;
+        if iscell(req_channels), req_channels = cell2mat(req_channels); end
     end
 
-    % --- Map Multi-Part Files ---
-    FileMap = map_multipage_tiff_files(inputFile);
-
-    if isempty(FileMap)
-        error('❌ CRITICAL: No matching TIFF files found for %s', inputFile);
-    end
-
-    % Total physical frames available across all files
-    total_physical_frames = FileMap(end).end_idx + 1;
-
-    % 3. Read Metadata (SizeZ, SizeC, SizeT, DimensionOrder)
-    t = Tiff(inputFile, 'r');
-    SizeC = 1; SizeZ = 1; SizeT = 1;
-    DimOrder = 'XYCZT'; % Default to interleaved
-
-    try
-        desc = t.getTag('ImageDescription');
-        tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
-        tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
-        tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
-        tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens');
-
-        if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
-        if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
-        if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
-        if ~isempty(tokO), DimOrder = tokO{1}{1}; end
-    catch
-        % Warning suppression handles this
-    end
-    t.close();
-
-    fprintf('📊 Metadata: T=%d, Z=%d, C=%d (Total Expected: %d)\n', SizeT, SizeZ, SizeC, SizeT*SizeZ*SizeC);
-    fprintf('📊 Order:    %s\n', DimOrder);
-
-    if total_physical_frames < (SizeT * SizeZ * SizeC)
-        fprintf('⚠️ WARNING: Dataset truncated. Missing %d frames.\n', (SizeT*SizeZ*SizeC) - total_physical_frames);
-    end
-
-    % Write Processing Log
+    % Write Log
     logStruct = struct();
     logStruct.original_file = inputFile;
     logStruct.timestamp = char(datetime('now'));
-    logStruct.dimensions = struct('SizeT', SizeT, 'SizeZ', SizeZ, 'SizeC', SizeC);
-    logStruct.actual_frames = total_physical_frames;
-    logStruct.rois = job.parameters.rois;
-    logStruct.rotate = do_rotate;
-    logStruct.channel_mapping = 'Even Input(0,2): C(2n)=Bot, C(2n+1)=Top; Odd Input(1,3): C(2n)=Top, C(2n+1)=Bot';
-
+    logStruct.metadata = struct('SizeT', SizeT, 'SizeZ', SizeZ, 'SizeC', SizeC);
+    logStruct.parameters = job.parameters;
     fid = fopen(fullfile(outputDir, [cleanBaseName, '_processing_log.json']), 'w');
     fprintf(fid, '%s', jsonencode(logStruct, 'PrettyPrint', true));
     fclose(fid);
 
-    % 4. Build Job List (Flattened T * InputC)
-    jobs = [];
-    for t_idx = 0 : (SizeT - 1)
-        for c_idx = 0 : (SizeC - 1)
-            % Check if this input channel is needed for any requested output
-            % Logic: Input C maps to Outputs (2*C) and (2*C+1)
-            out1 = 2 * c_idx;
-            out2 = 2 * c_idx + 1;
+    % 3. Parallel Processing Loop
+    pool = gcp('nocreate');
+    if isempty(pool), pool = parpool('local'); end
+    fprintf('🔥 Processing %d timepoints on %d workers...\n', SizeT, pool.NumWorkers);
 
-            if ~isempty(req_channels)
-                % If neither derived output is requested, skip this input
-                if ~ismember(out1, req_channels) && ~ismember(out2, req_channels)
-                    continue;
+    parfor t_idx = 0 : (SizeT - 1)
+        % --- A. PLAN THE READS ---
+        frames_to_read = struct('global_idx', {}, 'z', {}, 'c', {});
+        count = 0;
+
+        for z = 0:(SizeZ-1)
+            for c = 0:(SizeC-1)
+                if strcmp(DimOrder, 'XYCZT') || strcmp(DimOrder, 'Default')
+                    g_idx = (t_idx * SizeZ * SizeC) + (z * SizeC) + c;
+                elseif strcmp(DimOrder, 'XYZCT')
+                    g_idx = (t_idx * SizeZ * SizeC) + (c * SizeZ) + z;
+                else
+                    g_idx = (t_idx * SizeZ * SizeC) + (z * SizeC) + c;
                 end
+
+                count = count + 1;
+                frames_to_read(count).global_idx = g_idx;
+                frames_to_read(count).z = z;
+                frames_to_read(count).c = c;
             end
-            jobs = [jobs; t_idx, c_idx]; %#ok<AGROW>
         end
-    end
 
-    num_jobs = size(jobs, 1);
-    fprintf('🔥 Processing %d 3D Stacks on %d workers...\n', num_jobs, gcp('nocreate').NumWorkers);
+        % --- B. SORT READS BY DISK LOCATION ---
+        read_list = cell(count, 5);
+        valid_read_count = 0;
+        for i = 1:count
+            g_idx = frames_to_read(i).global_idx;
+            [fPath, locIdx] = get_file_for_frame(g_idx, FileMap);
 
-    % 5. Execute Parallel 3D Stacks
-    parfor i = 1:num_jobs
-        % --- FIX: Nuclear option for warnings inside worker ---
-        % We manually handle errors, so we don't need Tiff lib warnings spamming us
-        warning('off', 'all');
+            if ~isempty(fPath)
+                valid_read_count = valid_read_count + 1;
+                read_list{valid_read_count, 1} = fPath;
+                read_list{valid_read_count, 2} = locIdx;
+                read_list{valid_read_count, 3} = frames_to_read(i).z;
+                read_list{valid_read_count, 4} = frames_to_read(i).c;
+            end
+        end
 
-        t0 = jobs(i, 1);
-        c0 = jobs(i, 2); % Input channel index
+        if valid_read_count == 0, continue; end
+        Tbl = cell2table(read_list(1:valid_read_count, :), 'VariableNames', {'Path', 'LocIdx', 'Z', 'C', 'Global'});
+        Tbl = sortrows(Tbl, {'Path', 'LocIdx'});
 
-        % --- Channel Mapping Logic ---
-        % Even Inputs (0, 2): Bot -> Output 2*c0, Top -> Output 2*c0+1
-        % Odd Inputs (1, 3):  Top -> Output 2*c0, Bot -> Output 2*c0+1
-        is_even_input = (mod(c0, 2) == 0);
+        % --- C. PRE-ALLOCATE BUFFERS ---
+        h_top=0; w_top=0; h_bot=0; w_bot=0;
+        if ~isempty(top_roi), h_top=top_roi(2)-top_roi(1)+1; w_top=top_roi(4)-top_roi(3)+1; end
+        if ~isempty(bot_roi), h_bot=bot_roi(2)-bot_roi(1)+1; w_bot=bot_roi(4)-bot_roi(3)+1; end
 
-        % Structure to hold active outputs for this pass
-        outputs_to_process = struct('id', {}, 'roi', {});
-
-        idA = 2 * c0;
-        idB = 2 * c0 + 1;
-
-        if is_even_input
-            % A=Bot, B=Top
-            outputs_to_process(end+1) = struct('id', idA, 'roi', bot_roi);
-            outputs_to_process(end+1) = struct('id', idB, 'roi', top_roi);
+        if do_rotate
+            final_h_top = w_top; final_w_top = h_top;
+            final_h_bot = w_bot; final_w_bot = h_bot;
         else
-            % A=Top, B=Bot
-            outputs_to_process(end+1) = struct('id', idA, 'roi', top_roi);
-            outputs_to_process(end+1) = struct('id', idB, 'roi', bot_roi);
+            final_h_top = h_top; final_w_top = w_top;
+            final_h_bot = h_bot; final_w_bot = w_bot;
         end
 
-        % Filter: Remove outputs not requested or with invalid ROIs
-        active_outputs = [];
-        for k = 1:length(outputs_to_process)
-            op = outputs_to_process(k);
-            if (isempty(req_channels) || ismember(op.id, req_channels)) && ~isempty(op.roi)
-                % Pre-allocate stack in struct
-                h = op.roi(2) - op.roi(1) + 1;
-                w = op.roi(4) - op.roi(3) + 1;
-                if do_rotate
-                    op.stack = zeros(w, h, SizeZ, 'uint16');
-                else
-                    op.stack = zeros(h, w, SizeZ, 'uint16');
-                end
-                active_outputs = [active_outputs, op]; %#ok<AGROW>
-            end
-        end
+        output_buffers = containers.Map('KeyType', 'double', 'ValueType', 'any');
 
-        if isempty(active_outputs)
-            continue;
-        end
+        % --- D. EXECUTE READS (FAST BATCH) ---
+        uniqueFiles = unique(Tbl.Path);
 
-        try
-            % We keep track of the currently open Tiff to minimize fopen/fclose
-            current_file_path = '';
-            lt = [];
+        for uf = 1:length(uniqueFiles)
+            currPath = uniqueFiles{uf};
+            fileMask = strcmp(Tbl.Path, currPath);
+            subTbl = Tbl(fileMask, :);
 
-            for z0 = 0 : (SizeZ - 1)
-                % 1. Global Index Calculation (Based on DimensionOrder)
-                % Default XYCZT (Interleaved): T * (Z*C) + z * C + c
-                % Alternate XYZCT (Sequential): T * (Z*C) + c * Z + z
+            % Indices to read (1-based for tiffread usually)
+            indices_to_load = subTbl.LocIdx + 1;
 
-                % Standard Interleaved is most common for OPM
-                if contains(DimOrder, 'XYCZT')
-                    global_idx = (t0 * SizeZ * SizeC) + (z0 * SizeC) + c0;
-                else
-                    % Fallback to Sequential (XYZCT)
-                    global_idx = (t0 * SizeZ * SizeC) + (c0 * SizeZ) + z0;
-                end
+            imgs = {};
 
-                % 2. Resolve File
-                [fPath, locIdx] = get_file_for_frame(global_idx, FileMap);
-
-                if isempty(fPath)
-                    continue; % Frame missing
-                end
-
-                % 3. Switch file
-                if ~strcmp(fPath, current_file_path)
-                    if ~isempty(lt), lt.close(); end
-                    lt = Tiff(fPath, 'r');
-                    current_file_path = fPath;
-                end
-
-                % 4. Read
+            if has_fast_reader
                 try
-                    lt.setDirectory(locIdx + 1);
-                    img = lt.read();
+                    % PetaKit tiffread typically: tiffread(filename, indices)
+                    % Returns struct array or cell array
+                    raw_data = tiffread(currPath, indices_to_load);
 
-                    % 5. Crop for all active outputs
-                    for k = 1:length(active_outputs)
-                        roi = active_outputs(k).roi;
-                        crop = img(roi(1):roi(2), roi(3):roi(4));
-                        if do_rotate, crop = rot90(crop); end
-                        active_outputs(k).stack(:,:,z0+1) = crop;
+                    if isstruct(raw_data)
+                        % Assuming .data field
+                        imgs = {raw_data.data};
+                    elseif iscell(raw_data)
+                        imgs = raw_data;
+                    else
+                        % Maybe it returns a 3D matrix?
+                         if ndims(raw_data) == 3
+                             % Unpack 3D matrix to cell
+                             num_loaded = size(raw_data, 3);
+                             imgs = cell(1, num_loaded);
+                             for slice = 1:num_loaded
+                                 imgs{slice} = raw_data(:,:,slice);
+                             end
+                         end
                     end
                 catch
-                    continue; % Silent fail for bad frame
+                    % Fallback to slow read for this file if fast reader errors
+                    imgs = fallback_read(currPath, indices_to_load);
+                end
+            else
+                imgs = fallback_read(currPath, indices_to_load);
+            end
+
+            % Process Loaded Images
+            for k = 1:length(indices_to_load)
+                if k > length(imgs), break; end
+                img = imgs{k};
+
+                % Metadata for this frame
+                z_curr = subTbl.Z(k);
+                c_input = subTbl.C(k);
+
+                % Process Logic (Same as before)
+                outA_id = 2 * c_input;
+                outB_id = 2 * c_input + 1;
+                is_even = mod(c_input, 2) == 0;
+
+                % Output A
+                if isempty(req_channels) || ismember(outA_id, req_channels)
+                    if is_even, use_roi=bot_roi; H=final_h_bot; W=final_w_bot;
+                    else, use_roi=top_roi; H=final_h_top; W=final_w_top; end
+
+                    if ~isempty(use_roi)
+                        if ~isKey(output_buffers, outA_id)
+                            output_buffers(outA_id) = zeros(H, W, SizeZ, 'uint16');
+                        end
+                        crop = img(use_roi(1):use_roi(2), use_roi(3):use_roi(4));
+                        if do_rotate, crop = rot90(crop); end
+                        buf = output_buffers(outA_id);
+                        buf(:,:,z_curr+1) = crop;
+                        output_buffers(outA_id) = buf;
+                    end
+                end
+
+                % Output B
+                if isempty(req_channels) || ismember(outB_id, req_channels)
+                    if is_even, use_roi=top_roi; H=final_h_top; W=final_w_top;
+                    else, use_roi=bot_roi; H=final_h_bot; W=final_w_bot; end
+
+                    if ~isempty(use_roi)
+                         if ~isKey(output_buffers, outB_id)
+                            output_buffers(outB_id) = zeros(H, W, SizeZ, 'uint16');
+                        end
+                        crop = img(use_roi(1):use_roi(2), use_roi(3):use_roi(4));
+                        if do_rotate, crop = rot90(crop); end
+                        buf = output_buffers(outB_id);
+                        buf(:,:,z_curr+1) = crop;
+                        output_buffers(outB_id) = buf;
+                    end
                 end
             end
+        end
 
-            if ~isempty(lt), lt.close(); end
-
-            % Write Outputs
-            for k = 1:length(active_outputs)
-                % Format: CleanBaseName_C#_T###.tif (No _bot/_top)
-                % Allows downstream processing to just read C number
-                outName = sprintf('%s_C%d_T%03d.tif', cleanBaseName, active_outputs(k).id, t0);
-                outPath = fullfile(outputDir, outName);
-                write_3d_tiff(outPath, active_outputs(k).stack);
-            end
-
-        catch ME
-            fprintf('❌ Error T=%d C=%d: %s\n', t0, c0, ME.message);
-            if ~isempty(lt), close(lt); end
+        % --- E. WRITE OUTPUTS ---
+        keys = output_buffers.keys;
+        for k = 1:length(keys)
+            id = keys{k};
+            stack = output_buffers(id);
+            outName = sprintf('%s_C%d_T%03d.tif', cleanBaseName, id, t_idx);
+            outPath = fullfile(outputDir, outName);
+            write_3d_tiff(outPath, stack);
         end
     end
-
-    fprintf('✅ Parallel Crop Complete.\n');
+    fprintf('✅ Crop Complete.\n');
 end
 
-% --- HELPER FUNCTIONS ---
+% --- HELPERS ---
 
-function FileMap = map_multipage_tiff_files(masterFile)
-    % Suppress ALL warnings in helper to avoid spam during mapping
-    warning('off', 'all');
+function imgs = fallback_read(fPath, indices)
+    % Optimized sequential reader using Tiff class
+    imgs = cell(1, length(indices));
+    try
+        t = Tiff(fPath, 'r');
+        for i = 1:length(indices)
+            t.setDirectory(indices(i));
+            imgs{i} = t.read();
+        end
+        t.close();
+    catch
+        if exist('t', 'var'), close(t); end
+    end
+end
+
+function [FileMap, SizeT, SizeZ, SizeC, DimOrder] = map_ome_tiff_structure(masterFile)
+    t = Tiff(masterFile, 'r');
+    SizeC=1; SizeZ=1; SizeT=1; DimOrder='XYCZT';
+    try
+        desc = t.getTag('ImageDescription');
+        tokC = regexp(desc, 'SizeC="(\d+)"', 'tokens');
+        if ~isempty(tokC), SizeC = str2double(tokC{1}{1}); end
+        tokZ = regexp(desc, 'SizeZ="(\d+)"', 'tokens');
+        if ~isempty(tokZ), SizeZ = str2double(tokZ{1}{1}); end
+        tokT = regexp(desc, 'SizeT="(\d+)"', 'tokens');
+        if ~isempty(tokT), SizeT = str2double(tokT{1}{1}); end
+        tokO = regexp(desc, 'DimensionOrder="([^"]+)"', 'tokens');
+        if ~isempty(tokO), DimOrder = tokO{1}{1}; end
+    catch
+    end
+    t.close();
 
     [fDir, fName, ~] = fileparts(masterFile);
     basePattern = regexprep(fName, '\.ome$', '');
-
-    d = dir(fullfile(fDir, ['*.tif']));
-
-    fileList = {};
-    indices = [];
-
+    d = dir(fullfile(fDir, '*.tif'));
+    files = struct('path', {}, 'start_idx', {}, 'end_idx', {}, 'count', {}, 'idx_suffix', {});
+    valid_count = 0;
     safeBase = regexptranslate('escape', basePattern);
-    patMaster = ['^' safeBase '\.ome\.tif$'];
-    patSibling = ['^' safeBase '_(\d+)\.ome\.tif$'];
 
     for k = 1:length(d)
-        thisName = d(k).name;
-        if ~isempty(regexp(thisName, patMaster, 'once'))
-            fileList{end+1} = fullfile(d(k).folder, thisName);
-            indices(end+1) = 0;
-            continue;
-        end
-        tok = regexp(thisName, patSibling, 'tokens');
-        if ~isempty(tok)
-            idx = str2double(tok{1}{1});
-            fileList{end+1} = fullfile(d(k).folder, thisName);
-            indices(end+1) = idx;
+        fn = d(k).name;
+        isMaster = ~isempty(regexp(fn, ['^' safeBase '\.ome\.tif$'], 'once'));
+        tokSib = regexp(fn, ['^' safeBase '_(\d+)\.ome\.tif$'], 'tokens');
+
+        idx_suffix = -1;
+        if isMaster, idx_suffix = 0;
+        elseif ~isempty(tokSib), idx_suffix = str2double(tokSib{1}{1}); end
+
+        if idx_suffix >= 0
+            valid_count = valid_count + 1;
+            files(valid_count).path = fullfile(d(k).folder, fn);
+            files(valid_count).idx_suffix = idx_suffix;
         end
     end
 
-    [~, sortIdx] = sort(indices);
-    sortedFiles = fileList(sortIdx);
+    [~, I] = sort([files.idx_suffix]);
+    files = files(I);
 
-    FileMap = struct('path', {}, 'start_idx', {}, 'end_idx', {});
-    current_global_start = 0;
-
-    fprintf('   Mapping files...\n');
-    for k = 1:length(sortedFiles)
-        fPath = sortedFiles{k};
-        t = Tiff(fPath, 'r');
-        num_frames = 0;
-        while true
-            num_frames = num_frames + 1;
-            if t.lastDirectory(), break; end
-            try t.nextDirectory(); catch, break; end
+    current_start = 0;
+    for k = 1:length(files)
+        fPath = files(k).path;
+        count = 0;
+        try
+            % Check for tiffread to speed up counting?
+            % Usually ImageDescription in each file works better.
+            % But standard Tiff count is safest.
+            t = Tiff(fPath, 'r');
+            while true
+                count = count + 1;
+                if t.lastDirectory(), break; end
+                t.nextDirectory();
+            end
+            t.close();
+        catch
         end
-        t.close();
-
-        FileMap(k).path = fPath;
-        FileMap(k).start_idx = current_global_start;
-        FileMap(k).end_idx = current_global_start + num_frames - 1;
-        [~, n, e] = fileparts(fPath);
-        fprintf('     [%d] %s%s -> Frames %d to %d\n', k, n, e, FileMap(k).start_idx, FileMap(k).end_idx);
-        current_global_start = current_global_start + num_frames;
+        files(k).count = count;
+        files(k).start_idx = current_start;
+        files(k).end_idx = current_start + count - 1;
+        current_start = current_start + count;
     end
+    FileMap = files;
 end
 
-function [fPath, locIdx] = get_file_for_frame(globalIdx, FileMap)
+function [fPath, locIdx] = get_file_for_frame(gIdx, FileMap)
     fPath = ''; locIdx = 0;
     for k = 1:length(FileMap)
-        if globalIdx >= FileMap(k).start_idx && globalIdx <= FileMap(k).end_idx
+        if gIdx >= FileMap(k).start_idx && gIdx <= FileMap(k).end_idx
             fPath = FileMap(k).path;
-            locIdx = globalIdx - FileMap(k).start_idx;
+            locIdx = gIdx - FileMap(k).start_idx;
             return;
         end
     end
+end
+
+function roi = parse_roi_str(s)
+    if isempty(s) || strcmp(s, 'null'), roi = []; return; end
+    clean = replace(s, {':', ','}, ' ');
+    vals = sscanf(clean, '%d %d %d %d');
+    if numel(vals) == 4, roi = [vals(1)+1, vals(2), vals(3)+1, vals(4)]; else, roi = []; end
 end
 
 function write_3d_tiff(filename, stack)
@@ -310,16 +369,5 @@ function write_3d_tiff(filename, stack)
         for k = 2:num_z
             imwrite(stack(:,:,k), filename, 'WriteMode', 'append');
         end
-    end
-end
-
-function roi = parse_roi_str(s)
-    if isempty(s) || strcmp(s, 'null'), roi = []; return; end
-    clean = replace(s, {':', ','}, ' ');
-    vals = sscanf(clean, '%d %d %d %d');
-    if numel(vals) == 4
-        roi = [vals(1)+1, vals(2), vals(3)+1, vals(4)];
-    else
-        roi = [];
     end
 end
