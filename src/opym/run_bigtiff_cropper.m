@@ -6,7 +6,7 @@ function run_bigtiff_cropper(job)
 %   - OME Injection: Writes full OME-XML *only* in the first frame header.
 %   - 0-Based Indexing: Output files are T0000 compatible.
 %   - FIXED: Naming uses 'BaseName_Cxx' instead of 'img_Cxx'.
-%   - FIXED: Robust path resolution for BigTiffFastLoader.
+%   - FIXED: Robust path resolution for BigTiffLoader.
 
     % --- 1. Setup ---
     p = job.parameters;
@@ -69,14 +69,14 @@ function run_bigtiff_cropper(job)
 
     % --- PATH FIX START ---
     [scriptDir, ~, ~] = fileparts(mfilename('fullpath'));
-    loaderPath = fullfile(scriptDir, 'BigTiffFastLoader.m');
+    loaderPath = fullfile(scriptDir, 'BigTiffLoader.m');
     if ~exist(loaderPath, 'file')
-        error('Could not locate BigTiffFastLoader.m at: %s', loaderPath);
+        error('Could not locate BigTiffLoader.m at: %s', loaderPath);
     end
     addAttachedFiles(pool, {loaderPath});
     % --- PATH FIX END ---
 
-    loader = BigTiffFastLoader(masterFile);
+    loader = BigTiffLoader(masterFile);
 
     % Extract Voxel Size
     if isprop(loader, 'VoxelSize')
