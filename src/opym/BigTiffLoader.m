@@ -1,11 +1,7 @@
 classdef BigTiffFastLoader < handle
     % BIGTIFFFASTLOADER Reads OME-TIFFs using the embedded XML Map.
     %
-    % LOGIC:
-    %   1. Reads OME-XML from the master file header.
-    %   2. Parses <TiffData> tags to map (T,Z,C) -> (File, IFD).
-    %   3. Automatically handles hardware scrambling and multi-file splits.
-    %   4. QUIET MODE: Suppresses custom tag warnings from the Tiff library.
+    % UPDATED: Aggressive warning suppression for Tiff constructor.
 
     properties
         MasterFile      % Path to the master .ome.tif
@@ -13,6 +9,7 @@ classdef BigTiffFastLoader < handle
         FrameMap        % Struct containing FileIdx and IFD arrays
         Dimensions      % Struct with fields SizeT, SizeZ, SizeC
         Geometry        % Struct with W, H, BytesPerPixel
+        VoxelSize       % Struct with x, y, z (in microns)
         ReaderHandle    % Function handle for the actual reading
     end
 
@@ -60,7 +57,8 @@ classdef BigTiffFastLoader < handle
                 idx = double(ifd) + 1;
                 img = obj.ReaderHandle(targetFile, idx);
             catch ME
-                warning(ME.identifier, '%s', ME.message);
+                % If we fail, try to print just the message, not the stack
+                warning('Read failed on %s (IFD %d): %s', targetFile, ifd, ME.message);
                 rethrow(ME);
             end
         end
@@ -68,9 +66,8 @@ classdef BigTiffFastLoader < handle
 
     methods (Access = private)
         function parseXMLMap(obj)
-            % SUPPRESS WARNINGS during metadata read
-            wState1 = warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-            wState2 = warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+            % SUPPRESS ALL WARNINGS during metadata read (Nuclear Option)
+            wState = warning('off', 'all');
 
             try
                 % READ OME HEADER
@@ -78,9 +75,19 @@ classdef BigTiffFastLoader < handle
                 try
                     xmlStr = t.getTag('ImageDescription');
                 catch
-                    error('Could not read ImageDescription tag.');
+                    % Sometimes the tag ID is different?
+                    % Try looking for any string tag if standard fails
+                    warning('Could not read ImageDescription directly.');
+                    xmlStr = '';
                 end
                 t.close();
+
+                % Restore warnings immediately
+                warning(wState);
+
+                if isempty(xmlStr)
+                    error('XML Header is empty.');
+                end
 
                 % 1. PARSE DIMENSIONS
                 obj.Dimensions.SizeC = 1;
@@ -94,18 +101,32 @@ classdef BigTiffFastLoader < handle
                 tok = regexp(xmlStr, 'SizeT="(\d+)"', 'tokens');
                 if ~isempty(tok), obj.Dimensions.SizeT = str2double(tok{1}{1}); end
 
-                % Geometry
+                % 2. PARSE VOXEL SIZE
+                obj.VoxelSize = struct('x', 0.1, 'y', 0.1, 'z', 1.0, 'unit', 'µm');
+
+                tokX = regexp(xmlStr, 'PhysicalSizeX="([\d\.]+)"', 'tokens');
+                if ~isempty(tokX), obj.VoxelSize.x = str2double(tokX{1}{1}); end
+
+                tokY = regexp(xmlStr, 'PhysicalSizeY="([\d\.]+)"', 'tokens');
+                if ~isempty(tokY), obj.VoxelSize.y = str2double(tokY{1}{1}); end
+
+                tokZ = regexp(xmlStr, 'PhysicalSizeZ="([\d\.]+)"', 'tokens');
+                if ~isempty(tokZ), obj.VoxelSize.z = str2double(tokZ{1}{1}); end
+
+                % Geometry (Suppress here too)
+                warning('off', 'all');
                 tTemp = Tiff(obj.MasterFile, 'r');
                 obj.Geometry.W = double(tTemp.getTag('ImageWidth'));
                 obj.Geometry.H = double(tTemp.getTag('ImageLength'));
                 tTemp.close();
+                warning(wState);
 
-                % 2. PRE-ALLOCATE MAP
+                % 3. PRE-ALLOCATE MAP
                 sz = [obj.Dimensions.SizeC, obj.Dimensions.SizeZ, obj.Dimensions.SizeT];
-                obj.FrameMap.FileIdx = zeros(sz, 'uint8');
+                obj.FrameMap.FileIdx = zeros(sz, 'uint32');
                 obj.FrameMap.IFD     = zeros(sz, 'uint32');
 
-                % 3. IDENTIFY ALL FILES
+                % 4. IDENTIFY ALL FILES
                 [masterDir, masterName, ~] = fileparts(obj.MasterFile);
                 d = dir(fullfile(masterDir, '*.tif'));
 
@@ -124,7 +145,7 @@ classdef BigTiffFastLoader < handle
                     nameToIdx([n e]) = k;
                 end
 
-                % 4. REGEX PARSE TIFFDATA
+                % 5. REGEX PARSE TIFFDATA
                 pat = 'FirstC="(\d+)".*?FirstT="(\d+)".*?FirstZ="(\d+)".*?IFD="(\d+)".*?FileName="([^"]+)"';
                 tokens = regexp(xmlStr, pat, 'tokens');
 
@@ -136,10 +157,10 @@ classdef BigTiffFastLoader < handle
 
                 for k = 1:length(tokens)
                     tk = tokens{k};
-                    c = str2double(tk{1}) + 1; % 1-based
+                    c = str2double(tk{1}) + 1;
                     t = str2double(tk{2}) + 1;
                     z = str2double(tk{3}) + 1;
-                    ifd = str2double(tk{4});   % 0-based
+                    ifd = str2double(tk{4});
                     fName = tk{5};
 
                     if isKey(nameToIdx, fName)
@@ -147,28 +168,26 @@ classdef BigTiffFastLoader < handle
                         obj.FrameMap.FileIdx(c, z, t) = fIdx;
                         obj.FrameMap.IFD(c, z, t)     = ifd;
                     else
-                        warning('File in XML not found on disk: %s', fName);
+                        % warning('File in XML not found on disk: %s', fName);
                     end
                 end
 
             catch ME
-                % Restore warnings on error
-                warning(wState1);
-                warning(wState2);
+                warning(wState); % Always restore warnings
                 rethrow(ME);
             end
 
-            % Restore warnings after success (optional)
-            warning(wState1);
-            warning(wState2);
+            warning(wState);
         end
     end
 end
 
 function img = readStdTiff(fPath, idx)
-    % SILENCE WARNINGS for each read operation
-    wState1 = warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-    wState2 = warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+    % NUCLEAR OPTION: Suppress ALL warnings during Tiff access
+    % This is required because the Tiff constructor itself triggers warnings
+    % before we can disable specific IDs.
+
+    wState = warning('off', 'all');
 
     try
         t = Tiff(fPath, 'r');
@@ -176,10 +195,9 @@ function img = readStdTiff(fPath, idx)
         img = t.read();
         t.close();
     catch ME
-        warning(wState1);
+        warning(wState); % Restore
         rethrow(ME);
     end
 
-    warning(wState1);
-    warning(wState2);
+    warning(wState); % Restore
 end

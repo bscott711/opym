@@ -1,15 +1,17 @@
 %% run_petakit_server.m
 % A persistent server that watches a directory for JSON job files.
-% UPDATED: Now intelligently dispatches BigTiff vs Standard jobs.
+% FEATURES:
+%   - Intelligently dispatches BigTiff vs Standard jobs.
+%   - Forces log flushing for real-time monitoring.
 
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
 petakit_source_path = getenv('PETAKIT_ROOT');
 if isempty(petakit_source_path)
     petakit_source_path = '/cm/shared/apps_local/petakit5d';
-    fprintf('[Server] Warning: PETAKIT_ROOT not set. Using default: %s\n', petakit_source_path);
+    logMsg('[Server] Warning: PETAKIT_ROOT not set. Using default: %s', petakit_source_path);
 else
-    fprintf('[Server] Using PetaKit path: %s\n', petakit_source_path);
+    logMsg('[Server] Using PetaKit path: %s', petakit_source_path);
 end
 
 % 2. Python Path
@@ -18,15 +20,15 @@ if isempty(pythonPath)
     [status, cmdOut] = system('which python');
     if status == 0
         pythonPath = strtrim(cmdOut);
-        fprintf('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s\n', pythonPath);
+        logMsg('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s', pythonPath);
     else
-        fprintf('[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.\n');
+        logMsg('[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.');
     end
 else
     if ~exist(pythonPath, 'file')
-        fprintf('[Server] ❌ CRITICAL: The path in OPYM_PYTHON does not exist:\n   %s\n', pythonPath);
+        logMsg('[Server] ❌ CRITICAL: The path in OPYM_PYTHON does not exist:\n   %s', pythonPath);
     else
-        fprintf('[Server] Using Python: %s\n', pythonPath);
+        logMsg('[Server] Using Python: %s', pythonPath);
     end
 end
 
@@ -64,11 +66,11 @@ if isempty(pool) || pool.NumWorkers ~= numCPUs
         delete(pool);
         parpool('local', numCPUs);
     catch
-        fprintf('[Server] Warning: Could not start parpool. Continuing...\n');
+        logMsg('[Server] Warning: Could not start parpool. Continuing...');
     end
 end
 
-fprintf('[Server] Ready. Watching: %s\n', queue_dir);
+logMsg('[Server] Ready. Watching: %s', queue_dir);
 
 % --- MAIN SERVER LOOP ----------------------------------------------------
 while true
@@ -82,7 +84,7 @@ while true
     currentFile = jobFiles(1).name;
     srcPath = fullfile(queue_dir, currentFile);
 
-    fprintf('[Server] >>> Processing job: %s\n', currentFile);
+    logMsg('[Server] >>> Processing job: %s', currentFile);
 
     try
         fid = fopen(srcPath);
@@ -101,25 +103,24 @@ while true
         switch jobType
             case 'crop'
                 % --- CROPPING JOB ---
-                fprintf('         Type: OPM Cropping\n');
+                logMsg('         Type: OPM Cropping');
 
-                % --- DISPATCH LOGIC (THE FIX) ---
-                % Check if the input dataDir points to an OME-TIFF file
+                % Check if BigTiff
                 isBigTiff = endsWith(job.dataDir, '.ome.tif', 'IgnoreCase', true);
 
                 if isBigTiff
-                    fprintf('         -> Mode: BigTiff Split (Parallel)\n');
-                    % Use the new specialized cropper (takes the job struct)
+                    logMsg('         -> Mode: BigTiff Split (Parallel)');
+                    % Calls the new BigTiff cropper (Requires 'job' struct)
                     run_bigtiff_cropper(job);
                 else
-                    fprintf('         -> Mode: Standard PetaKit Crop\n');
-                    % Use the legacy cropper (takes the JSON path)
+                    logMsg('         -> Mode: Standard PetaKit Crop');
+                    % Calls the legacy cropper (Requires 'path' string)
                     run_petakit_cropper(srcPath);
                 end
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---
-                fprintf('         Type: Deconvolution\n');
+                logMsg('         Type: Deconvolution');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
@@ -150,7 +151,7 @@ while true
 
             otherwise
                 % --- DESKEW/ROTATE JOB ---
-                fprintf('         Type: Deskew/Rotate\n');
+                logMsg('         Type: Deskew/Rotate');
                 val_xyPixelSize = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz          = safelyGetParam(p, 'z_step_um', 1.0);
                 val_skewAngle   = safelyGetParam(p, 'sheet_angle_deg', 31.8);
@@ -182,10 +183,10 @@ while true
         end
 
         movefile(srcPath, fullfile(done_dir, currentFile));
-        fprintf('[Server] <<< Finished: %s\n', currentFile);
+        logMsg('[Server] <<< Finished: %s', currentFile);
 
     catch ME
-        fprintf('[Server] !!! ERROR on %s: %s\n', currentFile, ME.message);
+        logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
         movefile(srcPath, fullfile(fail_dir, currentFile));
         errLog = fullfile(fail_dir, [currentFile '.log']);
         fid = fopen(errLog, 'w');
@@ -203,4 +204,11 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
     else
         val = defaultValue;
     end
+end
+
+% --- HELPER: Forced Flushing Log ---
+function logMsg(fmt, varargin)
+    % Prints to stdout (1) and pauses briefly to force buffer flush
+    fprintf(1, [fmt '\n'], varargin{:});
+    pause(0.05);
 end
