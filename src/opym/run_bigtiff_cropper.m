@@ -1,10 +1,12 @@
 function run_bigtiff_cropper(job)
-% RUN_BIGTIFF_CROPPER Reads BigTiff, crops, copies sidecars, and writes valid OME-TIFFs.
+% RUN_BIGTIFF_CROPPER Reads BigTiff, crops, copies sidecars, and writes OME-TIFFs.
 %
 % FEATURES:
 %   - Sidecar Preservation: Copies txt/json/xml metadata to output.
 %   - OME Injection: Writes full OME-XML *only* in the first frame header.
 %   - 0-Based Indexing: Output files are T0000 compatible.
+%   - FIXED: Naming uses 'BaseName_Cxx' instead of 'img_Cxx'.
+%   - FIXED: Robust path resolution for BigTiffFastLoader.
 
     % --- 1. Setup ---
     p = job.parameters;
@@ -42,21 +44,16 @@ function run_bigtiff_cropper(job)
 
     % --- 2. METADATA RECOVERY (Sidecar Copy) ---
     fprintf('   [Metadata] Scanning for sidecar files (txt, json, xml)...\n');
-    % Look for common metadata files in the source directory
-    sidecars = [dir(fullfile(workDir, '*.txt')); ...
-                dir(fullfile(workDir, '*.json')); ...
-                dir(fullfile(workDir, '*.xml'))];
+    sidecars = [dir(fullfile(workDir, '*.txt')); dir(fullfile(workDir, '*.json')); dir(fullfile(workDir, '*.xml'))];
 
     countSide = 0;
     for k = 1:length(sidecars)
         fName = sidecars(k).name;
-        % Skip the master OME-TIFF itself and directories
         if contains(fName, '.ome.tif', 'IgnoreCase', true) || sidecars(k).isdir, continue; end
 
         srcSide = fullfile(workDir, fName);
         dstSide = fullfile(outDir, fName);
 
-        % Copy if it doesn't exist
         if ~exist(dstSide, 'file')
             copyfile(srcSide, dstSide);
             countSide = countSide + 1;
@@ -65,20 +62,26 @@ function run_bigtiff_cropper(job)
     fprintf('      -> Copied %d sidecar files.\n', countSide);
 
     % --- 3. Initialize Loader ---
-    warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
-    warning('off', 'MATLAB:imagesci:tifftagsread:expectedTagDataFormat');
+    warning('off', 'all'); % Nuclear suppression for initial load
 
     pool = gcp('nocreate');
     if isempty(pool), pool = parpool(48); end
-    addAttachedFiles(pool, {'BigTiffFastLoader.m'});
+
+    % --- PATH FIX START ---
+    [scriptDir, ~, ~] = fileparts(mfilename('fullpath'));
+    loaderPath = fullfile(scriptDir, 'BigTiffFastLoader.m');
+    if ~exist(loaderPath, 'file')
+        error('Could not locate BigTiffFastLoader.m at: %s', loaderPath);
+    end
+    addAttachedFiles(pool, {loaderPath});
+    % --- PATH FIX END ---
 
     loader = BigTiffFastLoader(masterFile);
 
-    % Extract Voxel Size (Requires updated BigTiffFastLoader)
+    % Extract Voxel Size
     if isprop(loader, 'VoxelSize')
         vox = loader.VoxelSize;
     else
-        % Fallback if class not updated
         vox = struct('x', 0.1, 'y', 0.1, 'z', 1.0, 'unit', 'µm');
     end
     fprintf('   [Metadata] Voxel Size: %.3f x %.3f x %.3f %s\n', vox.x, vox.y, vox.z, vox.unit);
@@ -93,7 +96,7 @@ function run_bigtiff_cropper(job)
     % --- 4. Parallel Execution ---
     tic;
     parfor k = 1:num_raw_stacks
-        warning('off', 'MATLAB:imagesci:Tiff:libraryWarning');
+        warning('off', 'all');
 
         [rc, t_in] = ind2sub([RawC, T], k);
 
@@ -146,10 +149,8 @@ function write_ome_tiff_stack(stack, fpath, vox, c, t)
     [~, fName, ext] = fileparts(fpath);
     fileName = [fName, ext];
 
-    % 1. Construct Minimal OME-XML
+    % Minimal OME-XML
     uuid = char(java.util.UUID.randomUUID());
-
-    % Note: TiffData PlaneCount=Z tells reader this file holds the whole stack
     xmlStr = sprintf([...
         '<?xml version="1.0" encoding="UTF-8"?>' ...
         '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" ' ...
@@ -168,35 +169,30 @@ function write_ome_tiff_stack(stack, fpath, vox, c, t)
         '</OME>'], ...
         fName, W, H, Z, vox.x, vox.y, vox.z, vox.unit, vox.unit, vox.unit, c, Z, fileName, uuid);
 
-    % 2. Setup Tags
     tObj = Tiff(fpath, 'w');
-
     tagStruct.ImageLength = H;
     tagStruct.ImageWidth = W;
     tagStruct.Photometric = Tiff.Photometric.MinIsBlack;
     tagStruct.BitsPerSample = 16;
     tagStruct.SamplesPerPixel = 1;
-    tagStruct.RowsPerStrip = H; % 1 strip per image is efficient for reading
+    tagStruct.RowsPerStrip = H;
     tagStruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
     tagStruct.Software = 'Opym PetaKit Cropper';
     tagStruct.Compression = Tiff.Compression.None;
 
-    % --- FRAME 1: Write WITH Metadata ---
+    % FRAME 1: With Metadata
     tagStruct.ImageDescription = xmlStr;
     tObj.setTag(tagStruct);
     tObj.write(stack(:,:,1));
 
-    % --- FRAMES 2..Z: Write WITHOUT Metadata ---
+    % FRAMES 2..Z: Without Metadata
     if Z > 1
-        % Remove the heavy XML for subsequent frames
         tagStruct = rmfield(tagStruct, 'ImageDescription');
-
         for k = 2:Z
-            tObj.writeDirectory(); % Create next IFD
+            tObj.writeDirectory();
             tObj.setTag(tagStruct);
             tObj.write(stack(:,:,k));
         end
     end
-
     tObj.close();
 end
