@@ -1,5 +1,5 @@
-classdef BigTiffFastLoader < handle
-    % BIGTIFFFASTLOADER Reads OME-TIFFs using the embedded XML Map.
+classdef BigTiffLoader < handle
+    % BigTiffLoader Reads OME-TIFFs using the embedded XML Map.
     %
     % UPDATED: Aggressive warning suppression for Tiff constructor.
 
@@ -14,9 +14,9 @@ classdef BigTiffFastLoader < handle
     end
 
     methods
-        function obj = BigTiffFastLoader(filePath)
+        function obj = BigTiffLoader(filePath)
             if ~isfile(filePath)
-                error('BigTiffFastLoader:FileNotFound', 'File not found: %s', filePath);
+                error('BigTiffLoader:FileNotFound', 'File not found: %s', filePath);
             end
             obj.MasterFile = filePath;
 
@@ -36,7 +36,7 @@ classdef BigTiffFastLoader < handle
             % Input: 1-based indices (Time, Z, Channel)
 
             if t > obj.Dimensions.SizeT || z > obj.Dimensions.SizeZ || c > obj.Dimensions.SizeC
-                error('BigTiffFastLoader:OutOfBounds', ...
+                error('BigTiffLoader:OutOfBounds', ...
                       'Index out of bounds. Req: T%d Z%d C%d (Max: %d %d %d)', ...
                       t, z, c, obj.Dimensions.SizeT, obj.Dimensions.SizeZ, obj.Dimensions.SizeC);
             end
