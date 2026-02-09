@@ -215,3 +215,59 @@ def load_tiff_series(directory: Path):
     print("✅ OPM Data loaded.")
 
     return get_stack, T_min, T_max, C_min, C_max, Z_max, Y, X, base_name
+
+
+def find_dsr_directory(
+    explicit_path: Path | None = None, search_root: Path = Path(".")
+) -> Path:
+    """
+    Locates the Deskewed-Rotated (DSR) output directory.
+
+    Args:
+        explicit_path: Known path from previous processing steps.
+        search_root: Where to search if explicit_path is missing.
+
+    Returns:
+        Path object pointing to the DSR directory.
+
+    Raises:
+        FileNotFoundError: If no valid DSR directory is found.
+    """
+    # 1. Check explicit path
+    if explicit_path is not None:
+        candidate = explicit_path / "DSR"
+        if candidate.exists():
+            return candidate
+
+    # 2. Search locally
+    found_dsrs = sorted(
+        list(search_root.glob("*/DSR")), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+
+    if found_dsrs:
+        return found_dsrs[0]
+
+    raise FileNotFoundError(
+        "Could not auto-detect any 'DSR' folders. "
+        "Please ensure the Deskew job completed successfully."
+    )
+
+
+def get_channel_count(file_path: Path) -> int:
+    """
+    Detects the number of channels in an OME-TIFF file.
+    Returns 4 by default if detection fails.
+    """
+    try:
+        import tifffile
+
+        with tifffile.TiffFile(file_path) as tif:
+            shape = tif.series[0].shape
+            # (T, C, Z, Y, X) or (C, Z, Y, X)
+            if len(shape) == 5:
+                return shape[2]  # Adjust index based on your specific axis order
+            elif len(shape) == 4:
+                return shape[1]
+    except Exception:  # nosec
+        pass
+    return 4

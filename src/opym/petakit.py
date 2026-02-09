@@ -235,3 +235,60 @@ def monitor_job_background(job_path: Path, status_label: widgets.Label):
 
     t = threading.Thread(target=_poll, daemon=True)
     t.start()
+
+
+def submit_crop_and_save_sidecar(
+    file_path: Path,
+    top_roi: tuple[slice, slice],
+    bottom_roi: tuple[slice, slice],
+    channels: list[int],
+    output_format: str,
+    rotate: bool,
+) -> tuple[Path, Path]:
+    """
+    Submits a crop job and immediately saves the settings sidecar
+    to the destination folder.
+
+    Returns:
+        tuple[Path, Path]: (job_ticket_path, output_directory_path)
+    """
+    # 1. Submit the job
+    job_path = submit_remote_crop_job(
+        base_file=file_path,
+        top_roi=top_roi,
+        bottom_roi=bottom_roi,
+        channels=channels,
+        output_format=output_format,
+        rotate=rotate,
+    )
+
+    # 2. Determine and create output directory
+    name = file_path.name
+    if name.endswith(".ome.tif"):
+        clean_name = name[:-8]
+    elif name.endswith(".tif"):
+        clean_name = name[:-4]
+    else:
+        clean_name = file_path.stem
+
+    output_dir = file_path.parent / clean_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 3. Create JSON Sidecar
+    sidecar = output_dir / "petakit_settings.json"
+
+    settings = {
+        "source_file": str(file_path.name),
+        "rois": {
+            "top": _tuple_to_cli_string(_roi_to_tuple(top_roi)),
+            "bottom": _tuple_to_cli_string(_roi_to_tuple(bottom_roi)),
+        },
+        "channels": channels,
+        "rotate": rotate,
+        "format": output_format,
+    }
+
+    with open(sidecar, "w") as f:
+        json.dump(settings, f, indent=4)
+
+    return job_path, output_dir
