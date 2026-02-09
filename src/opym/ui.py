@@ -1,3 +1,4 @@
+# Ruff style: Compliant
 """
 opym.ui - Reusable UI components for Jupyter Notebooks.
 """
@@ -10,17 +11,17 @@ from .utils import OutputFormat
 def create_crop_settings_ui(
     n_channels: int,
 ) -> tuple[
-    widgets.Accordion, dict[int, widgets.Checkbox], widgets.Dropdown, widgets.Checkbox
+    widgets.VBox, dict[int, widgets.Checkbox], widgets.Dropdown, widgets.Checkbox
 ]:
     """
-    Generates the Accordion UI for channel selection and output format configuration.
+    Generates the UI for channel selection and output format configuration.
 
     Args:
         n_channels (int): Total number of channels in the source file.
 
     Returns:
         Tuple containing:
-            - The main Accordion widget (to display).
+            - The main container widget (VBox) to display.
             - A dictionary mapping channel IDs to their Checkbox widgets.
             - The OutputFormat Dropdown widget.
             - The Rotation Checkbox widget.
@@ -73,13 +74,23 @@ def create_crop_settings_ui(
 
     rot_widget = widgets.Checkbox(value=True, description="Rotate 90° CCW")
 
-    # 3. Assemble Accordion
+    # 3. Assemble UI (Vertical Layout instead of Accordion)
     settings_box = widgets.VBox([fmt_widget, rot_widget])
     channels_box = widgets.VBox(ui_rows)
 
-    ui = widgets.Accordion(children=[channels_box, settings_box])
-    ui.set_title(0, "Channel Selection")
-    ui.set_title(1, "Advanced Output Settings")
+    # Create explicit headers since we removed the Accordion titles
+    header_channels = widgets.HTML("<h3>Channel Selection</h3>")
+    header_settings = widgets.HTML("<h3>Advanced Output Settings</h3>")
+
+    ui = widgets.VBox(
+        [
+            header_channels,
+            channels_box,
+            widgets.HTML("<hr>"),  # Visual separator
+            header_settings,
+            settings_box,
+        ]
+    )
 
     return ui, checks, fmt_widget, rot_widget
 
