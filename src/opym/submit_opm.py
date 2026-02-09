@@ -4,6 +4,8 @@ Lightweight OPM Job Submitter for Login Nodes.
 Zero dependencies (Standard Lib only).
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import re

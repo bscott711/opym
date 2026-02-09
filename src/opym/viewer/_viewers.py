@@ -3,6 +3,8 @@
 Interactive ipywidgets viewers for OPM data.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
 
 import ipywidgets as widgets

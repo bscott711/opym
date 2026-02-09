@@ -3,6 +3,8 @@
 Interactive ROI selection tools using matplotlib.
 """
 
+from __future__ import annotations
+
 from typing import cast
 
 import matplotlib.patches as patches

@@ -3,6 +3,8 @@
 opym: OPM Cropper Package
 """
 
+from __future__ import annotations
+
 # Expose the main functions for library use (e.g., in notebooks)
 from .core import process_dataset, run_processing_job
 from .dataloader import (

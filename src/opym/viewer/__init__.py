@@ -3,6 +3,8 @@
 opym.viewer: Interactive viewers, ROI selectors, and MIP tools.
 """
 
+from __future__ import annotations
+
 from ._mip import create_mip
 from ._selectors import (
     ROISelector,
