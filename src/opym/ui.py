@@ -57,7 +57,8 @@ def create_crop_settings_ui(
         ui_rows.append(
             widgets.VBox(
                 [
-                    widgets.Label(f"<b>Excitation Group {exc + 1}</b>"),
+                    # FIX: Removed <b> tags (Label does not support HTML)
+                    widgets.Label(f"Excitation Group {exc + 1}"),
                     widgets.HBox(row_widgets[:2]),
                     widgets.HBox(row_widgets[2:]),
                 ]
@@ -74,19 +75,19 @@ def create_crop_settings_ui(
 
     rot_widget = widgets.Checkbox(value=True, description="Rotate 90° CCW")
 
-    # 3. Assemble UI (Vertical Layout instead of Accordion)
+    # 3. Assemble UI (Vertical Layout)
     settings_box = widgets.VBox([fmt_widget, rot_widget])
     channels_box = widgets.VBox(ui_rows)
 
-    # Create explicit headers since we removed the Accordion titles
-    header_channels = widgets.HTML("<h3>Channel Selection</h3>")
-    header_settings = widgets.HTML("<h3>Advanced Output Settings</h3>")
+    # FIX: Switched from HTML to Label for consistency
+    header_channels = widgets.Label("Channel Selection")
+    header_settings = widgets.Label("Advanced Output Settings")
 
     ui = widgets.VBox(
         [
             header_channels,
             channels_box,
-            widgets.HTML("<hr>"),  # Visual separator
+            # FIX: Removed the <hr> (horizontal rule) widget
             header_settings,
             settings_box,
         ]
