@@ -5,7 +5,7 @@ Interactive ROI selection tools using matplotlib.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
@@ -30,7 +30,21 @@ class ROISelector:
         self.vmax = vmax
         self.roi_slices: list[tuple[slice, slice]] = []
         self.first_roi_dims: tuple[int, int] | None = None
+
+        # Create the figure
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
+
+        # --- FIX: Cast to Any to silence Pylance errors ---
+        # "toolbar_visible" and "header_visible" are dynamic attributes specific
+        # to the ipympl backend. We cast to Any so the type checker ignores them.
+        canvas = cast(Any, self.fig.canvas)
+
+        if hasattr(canvas, "toolbar_visible"):
+            canvas.toolbar_visible = False
+        if hasattr(canvas, "header_visible"):
+            canvas.header_visible = False
+        # --------------------------------------------------
+
         self.fig.suptitle("Select TOP ROI, then BOTTOM ROI")
         print("--- 📝 INSTRUCTIONS ---")
         print("1. Click and drag to draw a box around the TOP (cyan) ROI.")
@@ -46,7 +60,8 @@ class ROISelector:
         self.selector = RectangleSelector(
             self.ax,
             self.on_select,
-            useblit=True,
+            # useblit=False is more stable with ipympl updates and prevents ghosting
+            useblit=False,
             button=[MouseButton.LEFT],
             minspanx=5,
             minspany=5,
