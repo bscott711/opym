@@ -3,6 +3,8 @@
 Utilities for interacting with the PetaKit job queue system.
 """
 
+from __future__ import annotations
+
 import json
 import re
 import threading

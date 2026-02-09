@@ -4,6 +4,8 @@ Core OPM Cropper processing functions.
 Streams from a 5D OME-TIF virtual zarr stack into the specified output format.
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 from pathlib import Path

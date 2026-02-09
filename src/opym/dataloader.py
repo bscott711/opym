@@ -4,6 +4,8 @@ Data loading utilities for the opym viewer.
 Parses a directory of 3D TIFFs to prepare them for viewing.
 """
 
+from __future__ import annotations
+
 import functools
 import re
 from pathlib import Path

@@ -3,6 +3,8 @@
 Command-Line Interface (CLI) for OPM Cropper.
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path

@@ -3,6 +3,8 @@
 Handles Micro-Manager metadata parsing and processing log generation.
 """
 
+from __future__ import annotations
+
 import json
 import sys
 from datetime import datetime
