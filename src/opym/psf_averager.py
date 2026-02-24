@@ -168,15 +168,27 @@ class PSFAverager:
                 if self.strict_mask_check.value:
                     vol_clean[~mask] = 0.0
 
-                # 4. Center of Mass
+                # 4. Find Alignment Point (Peak-Weighted Center of Mass)
                 if np.sum(vol_clean) == 0:
                     print(f"⚠️ Skipped {f.name} (Empty after cleaning)")
                     continue
 
-                com_tuple = ndi.center_of_mass(vol_clean)
+                # Raise signal to 4th power to suppress skewed OPM tails.
+                # This finds the exact sub-pixel coordinate of the core.
+                peak_weighted = vol_clean**4
+
+                if np.sum(peak_weighted) == 0:
+                    continue
+
+                com_tuple = ndi.center_of_mass(peak_weighted)
                 if not isinstance(com_tuple, tuple):
                     continue
+
                 com = np.array(com_tuple)
+
+                # Soften the edges of individual crops to hide shifting seams
+                if self.taper_slider.value > 0:
+                    vol_clean = self.taper_vol(vol_clean, self.taper_slider.value)
 
                 # 5. Embed & Shift
                 canvas = np.zeros(target_shape, dtype=np.float32)
