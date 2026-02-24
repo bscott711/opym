@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import ipywidgets as widgets
@@ -16,14 +17,20 @@ class DeconvolutionViewer:
     synchronized slice views and orthogonal projections.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, start_path: str | Path = "/mmfs2/scratch/SDSMT.LOCAL/bscott/DataUpload"
+    ) -> None:
         self.raw_vol: np.ndarray | None = None
         self.decon_vol: np.ndarray | None = None
-        self._init_ui()
+        self._init_ui(start_path)
 
-    def _init_ui(self) -> None:
-        self.fc_raw = FileChooser(title="<b>Select Raw Volume:</b>")
-        self.fc_decon = FileChooser(title="<b>Select Deconvolved Volume:</b>")
+    def _init_ui(self, start_path: str | Path) -> None:
+        self.fc_raw = FileChooser(
+            path=str(start_path), title="<b>Select Raw Volume:</b>"
+        )
+        self.fc_decon = FileChooser(
+            path=str(start_path), title="<b>Select Deconvolved Volume:</b>"
+        )
 
         self.btn_load = widgets.Button(
             description="Load & Compare",
