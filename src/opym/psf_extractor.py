@@ -286,33 +286,44 @@ class PSFExtractor:
         disp_x, disp_y = int(event.xdata), int(event.ydata)
         h, w = self.stack.shape[1], self.stack.shape[2]
 
-        data_x, data_y = self.transform_point_inverse(disp_x, disp_y, (h, w), self.rot)
+        click_x, click_y = self.transform_point_inverse(
+            disp_x, disp_y, (h, w), self.rot
+        )  # noqa: E501
 
         xy_half = self.crop_xy_input.value // 2
         z_half = self.crop_z_input.value // 2
 
-        # Enforce strict symmetry. Reject clicks that force an asymmetrical crop.
+        # 1. Define a local search window around the rough click
+        sx1, sx2 = max(0, click_x - xy_half), min(w, click_x + xy_half)
+        sy1, sy2 = max(0, click_y - xy_half), min(h, click_y + xy_half)
+
+        search_vol = self.stack[:, sy1:sy2, sx1:sx2]
+        if search_vol.size == 0:
+            return
+
+        # 2. Find the exact 3D local maximum within the search window
+        peak_z, peak_y_loc, peak_x_loc = np.unravel_index(
+            np.argmax(search_vol), search_vol.shape
+        )
+        peak_x = sx1 + peak_x_loc
+        peak_y = sy1 + peak_y_loc
+
+        # 3. Enforce strict symmetry around the *refined* peak
         if (
-            data_x - xy_half < 0
-            or data_x + xy_half >= w
-            or data_y - xy_half < 0
-            or data_y + xy_half >= h
+            peak_x - xy_half < 0
+            or peak_x + xy_half >= w
+            or peak_y - xy_half < 0
+            or peak_y + xy_half >= h
+            or peak_z - z_half < 0
+            or peak_z + z_half >= self.stack.shape[0]
         ):
             with self.log_output:
-                print("⚠️ Bead too close to XY edge. Skipped to maintain symmetry.")
+                print("⚠️ Refined bead center too close to edge. Skipped.")
             return
 
-        z_profile = self.stack[:, data_y, data_x]
-        z_center = int(np.argmax(z_profile))
-
-        if z_center - z_half < 0 or z_center + z_half >= self.stack.shape[0]:
-            with self.log_output:
-                print("⚠️ Bead too close to Z edge. Skipped to maintain symmetry.")
-            return
-
-        x1, x2 = data_x - xy_half, data_x + xy_half
-        y1, y2 = data_y - xy_half, data_y + xy_half
-        z1, z2 = z_center - z_half, z_center + z_half
+        x1, x2 = peak_x - xy_half, peak_x + xy_half
+        y1, y2 = peak_y - xy_half, peak_y + xy_half
+        z1, z2 = peak_z - z_half, peak_z + z_half
 
         raw_vol = self.stack[z1:z2, y1:y2, x1:x2]
         if raw_vol.size == 0:
@@ -332,18 +343,20 @@ class PSFExtractor:
         tifffile.imwrite(save_path, final_vol)
 
         with self.log_output:
-            print(f"✅ Saved #{ctr}: {fname} (Center Z={z_center})")
+            msg = f"✅ Saved #{ctr}: {fname} (Peak: X={peak_x}, Y={peak_y}, Z={peak_z})"
+            print(msg)
 
         self.done_rois.append((x1, x2, y1, y2))
 
-        sx1, sy1 = self.transform_point_forward(x1, y1, (h, w), self.rot)
-        sx2, sy2 = self.transform_point_forward(x2, y2, (h, w), self.rot)
+        # Draw the box using the refined coordinates so the visual feedback snaps
+        rx1, ry1 = self.transform_point_forward(x1, y1, (h, w), self.rot)
+        rx2, ry2 = self.transform_point_forward(x2, y2, (h, w), self.rot)
         if self.ax is not None and self.fig is not None:
             self.ax.add_patch(
                 patches.Rectangle(
-                    (min(sx1, sx2), min(sy1, sy2)),
-                    abs(sx2 - sx1),
-                    abs(sy2 - sy1),
+                    (min(rx1, rx2), min(ry1, ry2)),
+                    abs(rx2 - rx1),
+                    abs(ry2 - ry1),
                     linewidth=1,
                     edgecolor="red",
                     facecolor="none",
