@@ -277,6 +277,12 @@ class PSFExtractor:
         if self.stack is None or self.dsr_path is None or event.inaxes != self.ax:
             return
 
+        # Ignore clicks if the user is using the Pan or Zoom tools
+        if self.fig is not None:
+            toolbar = getattr(self.fig.canvas, "toolbar", None)
+            if toolbar is not None and getattr(toolbar, "mode", "") != "":
+                return
+
         disp_x, disp_y = int(event.xdata), int(event.ydata)
         h, w = self.stack.shape[1], self.stack.shape[2]
 
