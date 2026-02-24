@@ -113,10 +113,12 @@ class PSFAverager:
             p = Path(self.folder_chooser.selected)
 
             all_tifs = sorted(list(p.glob("*.tif")) + list(p.glob("*.tiff")))
+            # Update this list comprehension to explicitly require "Bead" in the name
             bead_files = [
                 f
                 for f in all_tifs
-                if "Master" not in f.name
+                if "Bead" in f.name
+                and "Master" not in f.name
                 and "Avg" not in f.name
                 and "_mask" not in f.name
             ]
