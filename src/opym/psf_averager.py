@@ -157,33 +157,31 @@ class PSFAverager:
                     mask = self.get_fallback_mask(vol)
                     mask_source = "AUTO"
 
-                # 2. Subtract BG
+                # 2. Subtract BG (Use mean so noise fluctuates evenly around 0)
                 bg_pixels = vol[~mask]
-                # Cast np.median to float to satisfy the type checker
-                bg_val = float(np.median(bg_pixels)) if len(bg_pixels) > 0 else 0.0
+                bg_val = float(np.mean(bg_pixels)) if len(bg_pixels) > 0 else 0.0
                 vol_clean = vol - bg_val
-                vol_clean[vol_clean < 0] = 0
+
+                # Create a strictly positive copy just for Peak/COM finding
+                vol_pos = np.clip(vol_clean, 0, None)
 
                 # 3. STRICT MASKING (The Cookie Cutter)
                 if self.strict_mask_check.value:
                     vol_clean[~mask] = 0.0
+                    vol_pos[~mask] = 0.0
 
                 # 4. Find Alignment Point (Peak-Weighted Center of Mass)
-                if np.sum(vol_clean) == 0:
+                if np.sum(vol_pos) == 0:
                     print(f"⚠️ Skipped {f.name} (Empty after cleaning)")
                     continue
 
-                # Raise signal to 4th power to suppress skewed OPM tails.
-                # This finds the exact sub-pixel coordinate of the core.
-                peak_weighted = vol_clean**4
-
+                peak_weighted = vol_pos**4
                 if np.sum(peak_weighted) == 0:
                     continue
 
                 com_tuple = ndi.center_of_mass(peak_weighted)
                 if not isinstance(com_tuple, tuple):
                     continue
-
                 com = np.array(com_tuple)
 
                 # Soften the edges of individual crops to hide shifting seams
@@ -203,12 +201,8 @@ class PSFAverager:
                 com_canvas = com + np.array([z_off, y_off, x_off])
                 shift_vec = center_target - com_canvas
 
+                # Shift the canvas (preserving negative noise fluctuations)
                 aligned = ndi.shift(canvas, shift_vec, order=3, prefilter=True)
-                aligned[aligned < 0] = 0
-
-                # Normalize Peak
-                if np.max(aligned) > 0:
-                    aligned /= np.max(aligned)
                 aligned_sum += aligned
                 used_count += 1
 
@@ -220,7 +214,10 @@ class PSFAverager:
             # Final Average
             master_psf = aligned_sum / used_count
 
-            # Taper
+            # NOW we clip the perfectly averaged noise floor to 0
+            master_psf[master_psf < 0] = 0
+
+            # Taper Final Volume
             if self.taper_slider.value > 0:
                 master_psf = self.taper_vol(
                     master_psf, fraction=self.taper_slider.value
