@@ -208,7 +208,8 @@ while true
                         'masterCompute', true, ...
                         'cpusPerTask', numCPUs ...
                     );
-                end
+                end % End if/else for PSF
+        end % End switch jobType (Crucial: Must be BEFORE the main loop's catch)
 
         movefile(srcPath, fullfile(done_dir, currentFile));
         logMsg('[Server] <<< Finished: %s', currentFile);
