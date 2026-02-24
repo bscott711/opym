@@ -154,15 +154,25 @@ class DeconvolutionViewer:
         self.dsr_vol = np.squeeze(dsr_raw) if dsr_raw.ndim > 3 else dsr_raw
         self.decon_vol = np.squeeze(decon_raw) if decon_raw.ndim > 3 else decon_raw
 
-        # Prevent crashing if the dimensions don't match
+        # --- NEW: Center-Crop to Align Shapes ---
         if self.dsr_vol.shape != self.decon_vol.shape:
+            min_z = min(self.dsr_vol.shape[0], self.decon_vol.shape[0])
+            min_y = min(self.dsr_vol.shape[1], self.decon_vol.shape[1])
+            min_x = min(self.dsr_vol.shape[2], self.decon_vol.shape[2])
+
+            def crop_center(img: np.ndarray, tz: int, ty: int, tx: int) -> np.ndarray:
+                z, y, x = img.shape
+                sz = (z - tz) // 2
+                sy = (y - ty) // 2
+                sx = (x - tx) // 2
+                return img[sz : sz + tz, sy : sy + ty, sx : sx + tx]
+
+            self.dsr_vol = crop_center(self.dsr_vol, min_z, min_y, min_x)
+            self.decon_vol = crop_center(self.decon_vol, min_z, min_y, min_x)
+
             with self.out_plot:
                 clear_output(wait=True)
-                print(
-                    f"⚠️ Shape mismatch: DSR {self.dsr_vol.shape} "
-                    f"vs Decon {self.decon_vol.shape}"
-                )
-            return
+                print(f"ℹ️ Shapes aligned by center-cropping to: {self.dsr_vol.shape}")
 
         # Update controls
         z_depth = self.dsr_vol.shape[0]
