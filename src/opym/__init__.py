@@ -46,6 +46,9 @@ from .viewer import (
     visualize_alignment,
 )
 
+# New PSF and Decon Widgets
+from .widgets import DeconvolutionViewer, PSFAverager, PSFExtractor
+
 __all__ = [
     "process_dataset",
     "run_processing_job",
@@ -79,4 +82,8 @@ __all__ = [
     "create_deskew_ui",
     "get_channel_count",
     "submit_crop_and_save_sidecar",
+    # Public API for new widgets
+    "PSFExtractor",
+    "PSFAverager",
+    "DeconvolutionViewer",
 ]
