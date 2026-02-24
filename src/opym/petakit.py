@@ -87,41 +87,29 @@ def submit_remote_deskew_job(
     ds_dir_name: str = "DS",
     dsr_dir_name: str = "DSR",
     queue_dir: Path = QUEUE_DIR,
+    psf_path: str | Path | None = None,  # New parameter
+    n_iters: int | None = None,  # New parameter
 ) -> Path:
     """
-    Creates a JSON job ticket for Deskew/Rotate.
-
-    INTELLIGENT PATH HANDLING:
-    If input_target is a file (e.g., 'Data.ome.tif'), it automatically
-    redirects to the folder ('Data') where the cropped files live.
+    Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
 
     # --- PATH REDIRECTION LOGIC ---
     if input_target.is_file():
-        # Strip extension to find the folder (e.g. 'Data.ome.tif' -> 'Data')
         folder_name = input_target.name
         if folder_name.lower().endswith(".ome.tif"):
             folder_name = folder_name[:-8]
         elif folder_name.lower().endswith(".tif"):
             folder_name = folder_name[:-4]
 
-        # Redirect target to the folder next to the file
         potential_dir = input_target.parent / folder_name
         if potential_dir.exists():
-            print(
-                f"-> Redirecting input from file '{input_target.name}' "
-                f"to folder '{folder_name}'"
-            )
             input_target = potential_dir
         else:
-            # Fallback: Check for legacy folder
             legacy_dir = input_target.parent / "processed_tiff_series_split"
             if legacy_dir.exists():
-                print(
-                    "   -> Redirecting to legacy folder 'processed_tiff_series_split'"
-                )
                 input_target = legacy_dir
 
     if not input_target.exists():
@@ -129,20 +117,29 @@ def submit_remote_deskew_job(
 
     base_name = input_target.name
 
+    # Build parameters dictionary
+    params = {
+        "ds_dir_name": ds_dir_name,
+        "dsr_dir_name": dsr_dir_name,
+        "deskew": deskew,
+        "rotate": rotate,
+        "interp_method": interp_method,
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+    }
+
+    # Add deconvolution parameters if a PSF is provided
+    if psf_path:
+        params["run_decon"] = True
+        params["psf_path"] = str(psf_path)
+        params["decon_iter"] = n_iters if n_iters is not None else 10
+
     payload = {
         "jobType": "deskew",
         "dataDir": str(input_target),
-        "baseName": f"{base_name}*",  # Wildcard for PetaKit regex
-        "parameters": {
-            "ds_dir_name": ds_dir_name,
-            "dsr_dir_name": dsr_dir_name,
-            "deskew": deskew,
-            "rotate": rotate,
-            "interp_method": interp_method,
-            "xy_pixel_size": xy_pixel_size,
-            "z_step_um": z_step_um,
-            "sheet_angle_deg": sheet_angle_deg,
-        },
+        "baseName": f"{base_name}*",
+        "parameters": params,
     }
 
     return _write_ticket(payload, base_name, "DESKEW", queue_dir)
