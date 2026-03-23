@@ -220,11 +220,9 @@ def monitor_job_background(job_path: Path, status_label: widgets.Label):
             elapsed = int(time.time() - start_time)
             if completed_path.exists():
                 status_label.value = f"✅ Job Finished! ({elapsed}s)"
-                status_label.style.background = "#e6fffa"
                 break
             if failed_path.exists():
                 status_label.value = f"❌ Job Failed. ({elapsed}s)"
-                status_label.style.background = "#ffe6e6"
                 break
 
             status_label.value = f"⏳ Running... (Elapsed: {elapsed}s)"
@@ -236,8 +234,8 @@ def monitor_job_background(job_path: Path, status_label: widgets.Label):
 
 def submit_crop_and_save_sidecar(
     file_path: Path,
-    top_roi: tuple[slice, slice],
-    bottom_roi: tuple[slice, slice],
+    top_roi: tuple[slice, slice] | None,
+    bottom_roi: tuple[slice, slice] | None,
     channels: list[int],
     output_format: str,
     rotate: bool,
@@ -271,15 +269,18 @@ def submit_crop_and_save_sidecar(
     output_dir = file_path.parent / clean_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Create JSON Sidecar
+    # 3. Create JSON Sidecar (Safely handling None ROIs)
     sidecar = output_dir / "petakit_settings.json"
+
+    rois = {}
+    if top_roi:
+        rois["top"] = _tuple_to_cli_string(_roi_to_tuple(top_roi))
+    if bottom_roi:
+        rois["bottom"] = _tuple_to_cli_string(_roi_to_tuple(bottom_roi))
 
     settings = {
         "source_file": str(file_path.name),
-        "rois": {
-            "top": _tuple_to_cli_string(_roi_to_tuple(top_roi)),
-            "bottom": _tuple_to_cli_string(_roi_to_tuple(bottom_roi)),
-        },
+        "rois": rois,
         "channels": channels,
         "rotate": rotate,
         "format": output_format,
