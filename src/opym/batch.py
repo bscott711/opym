@@ -36,21 +36,37 @@ def run_batch_cropping(
     rotate = settings["rotate"]
     fmt = settings["format"]
 
-    # Helper to parse string slice "0:100" -> slice(0, 100)
-    def _parse_roi(s: str) -> tuple[slice, slice]:
-        parts = s.split(",")
-        y_parts = [int(v) for v in parts[0].split(":")]
-        x_parts = [int(v) for v in parts[1].split(":")]
-        return (slice(y_parts[0], y_parts[1]), slice(x_parts[0], x_parts[1]))
+    # Helper to parse ROI data into slices safely for Pylance
+    def _parse_roi(s: str | list | None) -> tuple[slice, slice] | None:
+        if not s:
+            return None
 
-    top_roi = _parse_roi(settings["rois"]["top"])
-    bot_roi = _parse_roi(settings["rois"]["bottom"])
+        # Handle string format: "0:100,0:100"
+        if isinstance(s, str):
+            y_str, x_str = s.split(",")
+        # Handle list format: ["0:100", "0:100"]
+        elif isinstance(s, list) and len(s) >= 2:
+            y_str, x_str = str(s), str(s)
+        else:
+            return None
+
+        y_parts = [int(v) for v in y_str.split(":")]
+        x_parts = [int(v) for v in x_str.split(":")]
+        return slice(y_parts, y_parts), slice(x_parts, x_parts)
+
+    top_roi = _parse_roi(settings["rois"].get("top"))
+    bot_roi = _parse_roi(settings["rois"].get("bottom"))
 
     # Deskew Defaults
     ds = settings.get("deskew", {})
     default_angle = float(ds.get("sheet_angle_deg", 31.8))
     default_pixel = float(ds.get("xy_pixel_size", 0.136))
     default_z = float(ds.get("z_step_um", 1.0))
+
+    # Deconvolution Defaults
+    decon = settings.get("deconvolution")
+    psf_file = decon.get("psf_source") if decon else None
+    n_iters = decon.get("iterations") if decon else None
 
     # Store active jobs: (filename, crop_ticket_path, deskew_ticket_path)
     active_jobs: list[tuple[str, Path, Path]] = []
@@ -98,6 +114,8 @@ def run_batch_cropping(
                     sheet_angle_deg=default_angle,
                     deskew=True,
                     rotate=True,
+                    psf_path=psf_file,
+                    n_iters=n_iters,
                 )
 
                 active_jobs.append((file_path.name, crop_ticket, deskew_ticket))
