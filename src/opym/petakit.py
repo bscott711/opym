@@ -87,8 +87,9 @@ def submit_remote_deskew_job(
     ds_dir_name: str = "DS",
     dsr_dir_name: str = "DSR",
     queue_dir: Path = QUEUE_DIR,
-    psf_path: str | Path | None = None,  # New parameter
-    n_iters: int | None = None,  # New parameter
+    psf_path: str | Path | None = None,
+    n_iters: int | None = None,
+    channel_patterns: list[str] | None = None,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -127,6 +128,7 @@ def submit_remote_deskew_job(
         "xy_pixel_size": xy_pixel_size,
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
+        "channel_patterns": channel_patterns,
     }
 
     # Add deconvolution parameters if a PSF is provided

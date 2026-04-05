@@ -79,6 +79,14 @@ def main():
     # ROI (Optional): xmin xmax ymin ymax
     parser.add_argument("--roi", type=int, nargs=4, help="Crop: xmin xmax ymin ymax")
 
+    # Channels (Optional): CamA,CamB
+    parser.add_argument(
+        "--chans",
+        type=str,
+        default=None,
+        help="Channel patterns (comma-separated, e.g. CamA,CamB)",
+    )
+
     # Deconvolution
     parser.add_argument(
         "--psf", type=str, default=None, help="Path to PSF file (Enables Decon)"
@@ -102,7 +110,12 @@ def main():
             z_step = DEFAULTS["z"]
             print(f"Warning: Could not auto-detect Z-step. Using default: {z_step}")
 
-    # 3. Determine Base Name (Smart Naming Fix)
+    # 3. Determine Channel Patterns
+    channel_patterns = None
+    if args.chans:
+        channel_patterns = [c.strip() for c in args.chans.split(",")]
+
+    # 4. Determine Base Name (Smart Naming Fix)
     # If the folder is named 'processed_tiff_series_split'
     # grab the parent name instead.
     if args.input_dir.name == "processed_tiff_series_split":
@@ -110,7 +123,7 @@ def main():
     else:
         base_name = args.input_dir.name
 
-    # 4. Construct Payload
+    # 5. Construct Payload
     payload = {
         "jobType": "deskew",
         "dataDir": str(args.input_dir.resolve()),
@@ -121,6 +134,7 @@ def main():
             "sheet_angle_deg": args.angle,
             "deskew": True,
             "rotate": True,
+            "channel_patterns": channel_patterns,
             # Pass ROI if present
             "crop_box": args.roi if args.roi else None,
             # Decon args
