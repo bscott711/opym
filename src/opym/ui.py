@@ -97,11 +97,12 @@ def create_crop_settings_ui(
 
 
 def create_deskew_ui(
-    detected_z: float = 1.0, default_angle: float = 31.8, default_pixel: float = 0.136
+    detected_z: float = 1.0, default_angle: float = 122.0, default_pixel: float = 0.136
 ) -> tuple[
     widgets.FloatText,
     widgets.FloatText,
     widgets.FloatText,
+    widgets.Text,
     widgets.Button,
     widgets.Label,
     widgets.Output,
@@ -120,14 +121,21 @@ def create_deskew_ui(
         value=default_pixel, description="XY Pixel (µm):", step=0.001, style=style
     )
 
+    w_chans = widgets.Text(
+        value="CamA, CamB",
+        description="Chans (CSV):",
+        placeholder="CamA, CamB",
+        style=style,
+    )
+
     run_btn = widgets.Button(
         description="Submit Deskew & Update JSON",
         button_style="success",
         icon="play",
-        layout=widgets.Layout(width="50%"),
+        layout=widgets.Layout(width="100%"),
     )
 
     status_label = widgets.Label(value="Ready to submit.")
     output_area = widgets.Output()
 
-    return w_z, w_angle, w_px, run_btn, status_label, output_area
+    return w_z, w_angle, w_px, w_chans, run_btn, status_label, output_area
