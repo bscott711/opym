@@ -97,7 +97,7 @@ def create_crop_settings_ui(
 
 
 def create_deskew_ui(
-    detected_z: float = 1.0, default_angle: float = 122.0, default_pixel: float = 0.136
+    detected_z: float = 1.0, default_angle: float = 32.0, default_pixel: float = 0.136
 ) -> tuple[
     widgets.FloatText,
     widgets.FloatText,
