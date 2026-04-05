@@ -161,7 +161,7 @@ while true
                 % 1. Extract Shared Parameters
                 val_xy        = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz        = safelyGetParam(p, 'z_step_um', 1.0);
-                val_ang       = safelyGetParam(p, 'sheet_angle_deg', 31.8);
+                val_ang       = safelyGetParam(p, 'sheet_angle_deg', 32.0);
                 val_chans     = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 if ischar(val_chans) || isstring(val_chans)
                     val_chans = {val_chans};

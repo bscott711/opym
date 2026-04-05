@@ -106,3 +106,25 @@ def parse_roi_string(roi_str: str) -> tuple[slice, slice]:
     x_start, x_stop = map(int, x_str.strip().split(":"))
 
     return (slice(y_start, y_stop), slice(x_start, x_stop))
+
+
+def scan_channel_patterns(directory: Path) -> str:
+    """
+    Scans a directory for unique channel identifiers (e.g., _C00, _C01).
+    Returns a comma-separated string for UI pre-filling.
+    """
+    if not directory.is_dir():
+        return ""
+
+    patterns = set()
+    # Looking for _C followed by digits (standard for deinterlaced OPM)
+    # or Cam[AB] (Standard for PetaKit/LLSM)
+    file_re = re.compile(r".*?(_C\d+|Cam[AB]).*?", re.IGNORECASE)
+
+    for f in directory.glob("*.tif"):
+        match = file_re.search(f.name)
+        if match:
+            patterns.add(match.group(1))
+
+    # Return as CSV string
+    return ", ".join(sorted(list(patterns)))

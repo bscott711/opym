@@ -80,7 +80,7 @@ def submit_remote_deskew_job(
     input_target: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 31.8,
+    sheet_angle_deg: float = 32.0,
     deskew: bool = True,
     rotate: bool = True,
     interp_method: str = "cubic",
@@ -152,7 +152,7 @@ def run_petakit_processing(
     processed_dir_path: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 31.8,
+    sheet_angle_deg: float = 32.0,
     deskew: bool = True,
     rotate: bool = True,
 ) -> Path:
