@@ -14,7 +14,7 @@ from .dataloader import (
     load_llsm_tiff_series,
     load_tiff_series,
 )
-from .metadata import create_processing_log, parse_timestamps
+from .metadata import create_processing_log, parse_timestamps, parse_z_step
 from .petakit import (
     monitor_job_background,
     run_petakit_processing,
@@ -37,6 +37,7 @@ from .utils import (
     derive_paths,
     detect_microscopy_data_type,
     parse_roi_string,
+    scan_channel_patterns,
 )
 from .viewer import (
     composite_viewer,
@@ -82,6 +83,8 @@ __all__ = [
     "create_deskew_ui",
     "get_channel_count",
     "submit_crop_and_save_sidecar",
+    "parse_z_step",
+    "scan_channel_patterns",
     # Public API for new widgets
     "PSFExtractor",
     "PSFAverager",
