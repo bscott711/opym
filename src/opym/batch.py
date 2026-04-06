@@ -59,7 +59,7 @@ def run_batch_cropping(
 
     # Deskew Defaults
     ds = settings.get("deskew", {})
-    default_angle = float(ds.get("sheet_angle_deg", 31.8))
+    default_angle = float(ds.get("sheet_angle_deg", 32.0))
     default_pixel = float(ds.get("xy_pixel_size", 0.136))
     default_z = float(ds.get("z_step_um", 1.0))
 

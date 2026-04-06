@@ -19,7 +19,7 @@ QUEUE_DIR = Path.home() / "petakit_jobs" / "queue"
 
 # Default Physics Parameters (Fallback if metadata fails)
 DEFAULTS = {
-    "angle": 122.0,  # 90 + 32
+    "angle": 32.0,
     "xy": 0.136,
     "z": 1.0,
     "iter": 10,
