@@ -123,8 +123,80 @@ def load_tiff_series(directory: Path):
     files = sorted(list(directory.glob("*_C*_T*.tif")))
 
     if not files:
+        # Check for Raw OME-TIFF files (Micro-Manager)
+        ome_files = sorted(list(directory.glob("*.ome.tif")))
+        if ome_files:
+            print("Detected raw OME-TIFF data format.")
+            import zarr
+
+            # Find the base file (usually without _1, _2 suffixes)
+            base_file = None
+            for f in ome_files:
+                if not re.search(r"_\d+\.ome\.tif$", f.name):
+                    base_file = f
+                    break
+
+            if not base_file:
+                base_file = ome_files[0]
+
+            print(f"Opening {base_file.name} as lazy Zarr array...")
+            try:
+                store = tifffile.TiffFile(base_file).series[0].aszarr()
+                lazy_data = zarr.open_array(store, mode="r")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to open OME-TIFF series from {base_file}: {e}"
+                )
+
+            shape = lazy_data.shape
+            ndim = lazy_data.ndim
+
+            if ndim == 4:  # ZCYX
+                print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
+                T_dim = 1
+                Z_dim, C_dim, Y_dim, X_dim = shape
+            elif ndim == 5:  # TZCXY
+                print(f"  Info: 5D data detected (shape {shape}).")
+                T_dim, Z_dim, C_dim, Y_dim, X_dim = shape
+            else:
+                raise ValueError(
+                    f"Unsupported data shape: {shape}. "
+                    "Expected 4D (ZCYX) or 5D (TZCXY)."
+                )
+
+            T_min, T_max = 0, T_dim - 1
+            C_min, C_max = 0, C_dim - 1
+            Z_max = Z_dim - 1
+            base_name_parsed = base_file.name.replace(".ome.tif", "")
+
+            print(
+                f"Data shape: T={T_min}-{T_max}, Z={Z_max + 1}, "
+                f"C={C_min}-{C_max}, Y={Y_dim}, X={X_dim}"
+            )
+
+            @functools.lru_cache(maxsize=8)
+            def get_stack_ome(t, c):
+                if ndim == 5:
+                    return np.asarray(lazy_data[t, :, c, :, :])
+                else:
+                    return np.asarray(lazy_data[:, c, :, :])
+
+            print("✅ RAW OME-TIFF Data loaded.")
+            return (
+                get_stack_ome,
+                T_min,
+                T_max,
+                C_min,
+                C_max,
+                Z_max,
+                Y_dim,
+                X_dim,
+                base_name_parsed,
+            )
+
         raise FileNotFoundError(
-            f"No compatible TIFF files (e.g., '*_Cxx_Txxxx.tif') found in {directory}"
+            f"No compatible TIFF files ('*_Cxx_Txxxx.tif' or '*.ome.tif') "
+            f"found in {directory}"
         )
 
     # 2. Flexible Regex
