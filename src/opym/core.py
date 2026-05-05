@@ -160,8 +160,8 @@ def process_dataset(
                         # Iterate over excitations (pairs of cameras)
                         for exc in range(n_excitations):
                             # Calculate input channel indices for this excitation
-                            cam0_idx = exc * 2
-                            cam1_idx = exc * 2 + 1
+                            cam0_idx = exc
+                            cam1_idx = exc + n_excitations
 
                             # Base output index (e.g., 0 for Exc0, 4 for Exc1)
                             out_base = exc * 4
