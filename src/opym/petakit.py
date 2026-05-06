@@ -90,9 +90,19 @@ def submit_remote_deskew_job(
     psf_path: str | Path | None = None,
     n_iters: int | None = None,
     channel_patterns: list[str] | None = None,
+    input_axis_order: str = "zyx",  # ✅ NEW: Default to standard TIFF order
+    output_axis_order: str = "zyx",  # ✅ NEW: Default to standard TIFF order
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
+
+    Parameters
+    ----------
+    input_axis_order : str, default 'zyx'
+        Axis order of input data. Options: 'zyx', 'yxz', 'xyz', etc.
+        'zyx' = standard TIFF stack (Z-slices, Y-rows, X-columns)
+    output_axis_order : str, default 'zyx'
+        Desired axis order of output data.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
@@ -129,6 +139,8 @@ def submit_remote_deskew_job(
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
         "channel_patterns": channel_patterns,
+        "input_axis_order": input_axis_order,  # ✅ NEW
+        "output_axis_order": output_axis_order,  # ✅ NEW
     }
 
     # Add deconvolution parameters if a PSF is provided
