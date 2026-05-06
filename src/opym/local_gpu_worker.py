@@ -74,4 +74,4 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
 
 if __name__ == "__main__":
     # 300 seconds = 5 minutes of idle time before releasing the GPU
-    process_queue(idle_timeout_sec=300)
+    process_queue(idle_timeout_sec=3600)
