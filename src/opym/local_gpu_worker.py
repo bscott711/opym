@@ -12,6 +12,9 @@ import subprocess  # nosec B404
 import time
 from pathlib import Path
 
+# Dynamically locate the opym installation directory
+OPYM_DIR = Path(__file__).parent.resolve()
+
 PETAKIT_JOBS_DIR = Path.home() / "petakit_jobs"
 QUEUE_DIR = PETAKIT_JOBS_DIR / "queue"
 
@@ -47,6 +50,8 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
                 cmd = [
                     "matlab",
                     "-nodisplay",
+                    "-sd",  # Tell Matlab to set its startup directory
+                    str(OPYM_DIR),  # Point it directly to the opym package folder
                     "-batch",
                     "run_petakit_server",
                 ]
