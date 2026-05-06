@@ -7,89 +7,102 @@
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
 petakit_source_path = getenv('PETAKIT_ROOT');
-if isempty(petakit_source_path)
-    petakit_source_path = '/cm/shared/apps_local/petakit5d';
-    logMsg('[Server] Warning: PETAKIT_ROOT not set. Using default: %s', petakit_source_path);
+if isempty (petakit_source_path)
+  petakit_source_path = '/cm/shared/apps_local/petakit5d';
+logMsg('[Server] Warning: PETAKIT_ROOT not set. Using default: %s',
+       petakit_source_path);
+else logMsg('[Server] Using PetaKit path: %s', petakit_source_path);
+end
+
+    % 2. Python Path pythonPath = getenv('OPYM_PYTHON');
+if isempty (pythonPath)
+  [ status, cmdOut ] = system('which python');
+if status
+  == 0 pythonPath = strtrim(cmdOut);
+logMsg('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s',
+       pythonPath);
+else logMsg(
+    '[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.');
+end else if ~exist(pythonPath, 'file') logMsg(
+    '[Server] ❌ CRITICAL: The path in OPYM_PYTHON does not exist:\n   %s',
+    pythonPath);
+else logMsg('[Server] Using Python: %s', pythonPath);
+end end
+
+    base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
+
+% -- -DYNAMIC CPU
+         DETECTION-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -envCPUs =
+    getenv('SLURM_CPUS_PER_TASK');
+if
+  ~isempty(envCPUs) numCPUs = str2double(envCPUs);
 else
-    logMsg('[Server] Using PetaKit path: %s', petakit_source_path);
+  numCPUs = 24;
 end
 
-% 2. Python Path
-pythonPath = getenv('OPYM_PYTHON');
-if isempty(pythonPath)
-    [status, cmdOut] = system('which python');
-    if status == 0
-        pythonPath = strtrim(cmdOut);
-        logMsg('[Server] ⚠️ OPYM_PYTHON not set. Falling back to system python: %s', pythonPath);
-    else
-        logMsg('[Server] ⚠️ Warning: OPYM_PYTHON not set and no python found in PATH.');
-    end
+    % Setup Directories queue_dir = fullfile(base_queue_dir, 'queue');
+done_dir = fullfile(base_queue_dir, 'completed');
+fail_dir = fullfile(base_queue_dir, 'failed');
+
+if
+  ~exist(queue_dir, 'dir'), mkdir(queue_dir);
+end if ~exist(done_dir, 'dir'), mkdir(done_dir);
+end if ~exist(fail_dir, 'dir'), mkdir(fail_dir);
+end
+
+    %
+    -- -INITIALIZATION-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --if ~exist(
+        'XR_deskew_rotate_data_wrapper',
+        'file') if exist (fullfile(petakit_source_path, 'setup.m'), 'file')
+           run(fullfile(petakit_source_path, 'setup.m'));
+else warning('Could not find PetaKit setup.m. Decon/Deskew may fail.');
+end end
+
+    pool = gcp('nocreate');
+if isempty (pool)
+  || pool.NumWorkers ~= numCPUs try delete (pool);
+parpool('local', numCPUs);
+catch logMsg('[Server] Warning: Could not start parpool. Continuing...');
+end end
+
+    logMsg('[Server] Ready. Watching: %s', queue_dir);
+
+% -- -MAIN SERVER
+         LOOP-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --envTimeout =
+    getenv('PETAKIT_IDLE_TIMEOUT');
+if
+  ~isempty(envTimeout) idleTimeoutSec = str2double(envTimeout);
 else
-    if ~exist(pythonPath, 'file')
-        logMsg('[Server] ❌ CRITICAL: The path in OPYM_PYTHON does not exist:\n   %s', pythonPath);
-    else
-        logMsg('[Server] Using Python: %s', pythonPath);
-    end
+  idleTimeoutSec = 300;
+% Default to 5 minutes end idleTimer = 0;
+
+while
+  true jobFiles = dir(fullfile(queue_dir, '*.json'));
+
+if isempty (jobFiles)
+  pause(2);
+idleTimer = idleTimer + 2;
+
+if idleTimeoutSec
+  > 0 &&
+      idleTimer >=
+          idleTimeoutSec logMsg(
+              '[Server] Idle timeout (%d s) reached. Shutting down to release GPUs.',
+              idleTimeoutSec);
+break;
+% Exits the while loop, allowing Matlab to close end continue;
 end
 
-base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
+    % Reset the timer the moment we find work idleTimer = 0;
 
-% --- DYNAMIC CPU DETECTION -----------------------------------------------
-envCPUs = getenv('SLURM_CPUS_PER_TASK');
-if ~isempty(envCPUs)
-    numCPUs = str2double(envCPUs);
-else
-    numCPUs = 24;
-end
+currentFile = jobFiles(1).name;
+srcPath = fullfile(queue_dir, currentFile);
 
-% Setup Directories
-queue_dir = fullfile(base_queue_dir, 'queue');
-done_dir  = fullfile(base_queue_dir, 'completed');
-fail_dir  = fullfile(base_queue_dir, 'failed');
+logMsg('[Server] >>> Processing job: %s', currentFile);
 
-if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
-if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
-if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
-
-% --- INITIALIZATION ------------------------------------------------------
-if ~exist('XR_deskew_rotate_data_wrapper', 'file')
-    if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
-        run(fullfile(petakit_source_path, 'setup.m'));
-    else
-        warning('Could not find PetaKit setup.m. Decon/Deskew may fail.');
-    end
-end
-
-pool = gcp('nocreate');
-if isempty(pool) || pool.NumWorkers ~= numCPUs
-    try
-        delete(pool);
-        parpool('local', numCPUs);
-    catch
-        logMsg('[Server] Warning: Could not start parpool. Continuing...');
-    end
-end
-
-logMsg('[Server] Ready. Watching: %s', queue_dir);
-
-% --- MAIN SERVER LOOP ----------------------------------------------------
-while true
-    jobFiles = dir(fullfile(queue_dir, '*.json'));
-
-    if isempty(jobFiles)
-        pause(2);
-        continue;
-    end
-
-    currentFile = jobFiles(1).name;
-    srcPath = fullfile(queue_dir, currentFile);
-
-    logMsg('[Server] >>> Processing job: %s', currentFile);
-
-    try
-        fid = fopen(srcPath);
-        raw = fread(fid, inf);
-        fclose(fid);
+try fid = fopen(srcPath);
+raw = fread(fid, inf);
+fclose(fid);
         job = jsondecode(char(raw'));
 
         if isfield(job, 'parameters')
