@@ -5,6 +5,8 @@
 %   - Forces log flushing for real-time monitoring.
 %   - Auto-shutdown timeout for releasing GPU resources.
 
+% Lock this script's directory into the MATLAB path so we don't lose it if a job uses cd()
+addpath(fileparts(mfilename('fullpath')));
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
 petakit_source_path = getenv('PETAKIT_ROOT');
