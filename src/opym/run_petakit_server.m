@@ -7,6 +7,7 @@
 
 % Lock this script's directory into the MATLAB path so we don't lose it if a job uses cd()
 addpath(fileparts(mfilename('fullpath')));
+
 % --- SYSTEM CONFIGURATION ------------------------------------------------
 % 1. PetaKit Path
 petakit_source_path = getenv('PETAKIT_ROOT');
@@ -199,6 +200,10 @@ while true
                 val_dsDir     = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir    = safelyGetParam(p, 'dsr_dir_name', 'DSR');
 
+                % ✅ NEW: Axis Order Parameters (Extract snake_case from JSON)
+                val_inputAxis  = safelyGetParam(p, 'input_axis_order', 'zyx');
+                val_outputAxis = safelyGetParam(p, 'output_axis_order', 'zyx');
+
                 % 2. Execution logic
                 current_input_dir = job.dataDir;
 
@@ -223,7 +228,7 @@ while true
                         'dz', val_dz, ...
                         'skewAngle', val_ang, ...
                         'skewed', true, ...
-                        'GPUJob', false, ... % Defaulting to CPU for stability (as per original code)
+                        'GPUJob', false, ... % Defaulting to CPU for stability
                         'save16bit', true, ...
                         'resultDirName', deconDirName, ...
                         'parseCluster', false, ...
@@ -251,6 +256,8 @@ while true
                         'dz', val_dz, ...
                         'skewAngle', val_ang, ...
                         'interpMethod', val_interp, ...
+                        'inputAxisOrder', val_inputAxis, ...  % ✅ NEW: Pass extracted value
+                        'outputAxisOrder', val_outputAxis, ... % ✅ NEW: Pass extracted value
                         'save16bit', true, ...
                         'save3DStack', true, ...
                         'saveMIP', true, ...
@@ -260,7 +267,7 @@ while true
                         'cpusPerTask', numCPUs ...
                     );
                 end
-        end % End switch jobType (Crucial: Must be BEFORE the main loop's catch)
+        end % End switch jobType
 
         movefile(srcPath, fullfile(done_dir, currentFile));
         logMsg('[Server] <<< Finished: %s', currentFile);
