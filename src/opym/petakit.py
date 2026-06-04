@@ -90,19 +90,34 @@ def submit_remote_deskew_job(
     psf_path: str | Path | None = None,
     n_iters: int | None = None,
     channel_patterns: list[str] | None = None,
-    input_axis_order: str = "zyx",  # ✅ NEW: Default to standard TIFF order
-    output_axis_order: str = "zyx",  # ✅ NEW: Default to standard TIFF order
+    input_axis_order: str = "yxz",
+    output_axis_order: str = "yxz",
+    objective_scan: bool = False,
+    z_stage_scan: bool = False,
+    reverse: bool = False,
+    gpu_decon: bool = False,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
 
     Parameters
     ----------
-    input_axis_order : str, default 'zyx'
-        Axis order of input data. Options: 'zyx', 'yxz', 'xyz', etc.
-        'zyx' = standard TIFF stack (Z-slices, Y-rows, X-columns)
-    output_axis_order : str, default 'zyx'
+    input_axis_order : str, default 'yxz'
+        Axis order of input data. Must match PetaKit5D conventions.
+        'yxz' = MATLAB cropper output (rows=Y, cols=X, planes=Z).
+    output_axis_order : str, default 'yxz'
         Desired axis order of output data.
+    objective_scan : bool, default False
+        True if the objective moves during scanning. For standard galvo-
+        scanned OPM this should be False.
+    z_stage_scan : bool, default False
+        True if the sample stage physically moves in Z during acquisition.
+        For standard galvo-scanned OPM this should be False.
+    reverse : bool, default False
+        Reverse the shear direction along the Z axis.
+    gpu_decon : bool, default False
+        Use GPU for deconvolution (requires CUDA-capable GPU on the
+        processing node).
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
@@ -139,8 +154,11 @@ def submit_remote_deskew_job(
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
         "channel_patterns": channel_patterns,
-        "input_axis_order": input_axis_order,  # ✅ NEW
-        "output_axis_order": output_axis_order,  # ✅ NEW
+        "input_axis_order": input_axis_order,
+        "output_axis_order": output_axis_order,
+        "objective_scan": objective_scan,
+        "z_stage_scan": z_stage_scan,
+        "reverse": reverse,
     }
 
     # Add deconvolution parameters if a PSF is provided
@@ -148,6 +166,7 @@ def submit_remote_deskew_job(
         params["run_decon"] = True
         params["psf_path"] = str(psf_path)
         params["decon_iter"] = n_iters if n_iters is not None else 10
+        params["gpu_decon"] = gpu_decon
 
     payload = {
         "jobType": "deskew",
