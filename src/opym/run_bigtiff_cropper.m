@@ -93,12 +93,22 @@ function run_bigtiff_cropper(job)
     num_raw_stacks = T * RawC;
     fprintf('   [Cropper] Processing %d Raw Stacks -> %d Output Channels\n', num_raw_stacks, RawC*2);
 
+    req_timepoints = [];
+    if isfield(p, 'timepoints') && ~isempty(p.timepoints)
+        req_timepoints = p.timepoints;
+        if iscell(req_timepoints), req_timepoints = cell2mat(req_timepoints); end
+    end
+
     % --- 4. Parallel Execution ---
     tic;
     parfor k = 1:num_raw_stacks
         warning('off', 'all');
 
         [rc, t_in] = ind2sub([RawC, T], k);
+
+        if ~isempty(req_timepoints) && ~ismember(t_in, req_timepoints)
+            continue;
+        end
 
         % A. Load Frame
         rawStack = zeros(loader.Geometry.H, loader.Geometry.W, Z, 'uint16');

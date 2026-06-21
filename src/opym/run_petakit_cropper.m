@@ -55,12 +55,22 @@ function run_petakit_cropper(json_file)
         if iscell(req_channels), req_channels = cell2mat(req_channels); end
     end
 
+    req_timepoints = [];
+    if isfield(job.parameters, 'timepoints') && ~isempty(job.parameters.timepoints)
+        req_timepoints = job.parameters.timepoints;
+        if iscell(req_timepoints), req_timepoints = cell2mat(req_timepoints); end
+    end
+
     % 5. Processing Loop
     pool = gcp('nocreate');
     if isempty(pool), pool = parpool('local'); end
 
     parfor t_idx = 0 : (SizeT - 1)
         warning('off', 'all');
+
+        if ~isempty(req_timepoints) && ~ismember(t_idx + 1, req_timepoints)
+            continue;
+        end
 
         % A. Map frames for this timepoint
         % (Simplified mapping logic for standard XYCZT)

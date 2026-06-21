@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess  # nosec B404
 import time
+import shutil
 from pathlib import Path
 
 # Dynamically locate the opym installation directory
@@ -47,8 +48,9 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
             if any(QUEUE_DIR.glob("*.json")):
                 print("\n🚀 Jobs detected. Spinning up PetaKit Matlab Server...")
 
+                matlab_exe = shutil.which("matlab") or "/mmfs2/cm/shared/apps_local/matlab/R2024B/bin/matlab"
                 cmd = [
-                    "matlab",
+                    matlab_exe,
                     "-nodisplay",
                     "-sd",  # Tell Matlab to set its startup directory
                     str(OPYM_DIR),  # Point it directly to the opym package folder

@@ -30,6 +30,7 @@ def submit_remote_crop_job(
     top_roi: tuple[slice, slice] | None,
     bottom_roi: tuple[slice, slice] | None,
     channels: list[int] | None = None,
+    timepoints: list[int] | None = None,
     output_format: str = "tiff-series",
     rotate: bool = True,
     queue_dir: Path = QUEUE_DIR,
@@ -63,6 +64,7 @@ def submit_remote_crop_job(
         "parameters": {
             "rois": rois,
             "channels": channels,
+            "timepoints": timepoints,
             "rotate": rotate,
             "format": output_format,
         },
@@ -80,7 +82,7 @@ def submit_remote_deskew_job(
     input_target: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 32.0,
+    sheet_angle_deg: float = 30.0,
     deskew: bool = True,
     rotate: bool = True,
     interp_method: str = "cubic",
@@ -94,8 +96,9 @@ def submit_remote_deskew_job(
     output_axis_order: str = "yxz",
     objective_scan: bool = False,
     z_stage_scan: bool = False,
-    reverse: bool = False,
+    reverse: bool = True,
     gpu_decon: bool = False,
+    crop_was_rotated: bool = False,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -105,6 +108,8 @@ def submit_remote_deskew_job(
     input_axis_order : str, default 'yxz'
         Axis order of input data. Must match PetaKit5D conventions.
         'yxz' = MATLAB cropper output (rows=Y, cols=X, planes=Z).
+        Automatically set to 'xyz' if crop_was_rotated=True, because
+        rot90 in MATLAB transposes dim1/dim2 (Y↔X).
     output_axis_order : str, default 'yxz'
         Desired axis order of output data.
     objective_scan : bool, default False
@@ -118,9 +123,19 @@ def submit_remote_deskew_job(
     gpu_decon : bool, default False
         Use GPU for deconvolution (requires CUDA-capable GPU on the
         processing node).
+    crop_was_rotated : bool, default False
+        If True, the crop step applied rot90 to match LLSM visual
+        orientation. This swaps Y↔X in the output TIFFs, so
+        input_axis_order is auto-corrected to 'xyz'.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
+
+    # PetaKit5D's default 'yxz' shears the 2nd dimension (X).
+    # Since the galvo sweeps in the depth-Z plane, the coverslip (Y) is the invariant axis.
+    # Therefore, we MUST shear the X axis. So 'yxz' is mathematically perfect.
+    input_axis_order = "yxz"
+    output_axis_order = "yxz"
 
     # --- PATH REDIRECTION LOGIC ---
     if input_target.is_file():
@@ -183,7 +198,7 @@ def run_petakit_processing(
     processed_dir_path: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 32.0,
+    sheet_angle_deg: float = 30.0,
     deskew: bool = True,
     rotate: bool = True,
 ) -> Path:
@@ -286,6 +301,7 @@ def submit_crop_and_save_sidecar(
         top_roi=top_roi,
         bottom_roi=bottom_roi,
         channels=channels,
+        timepoints=None,  # Adjust if you want this wrapper to support it
         output_format=output_format,
         rotate=rotate,
     )
