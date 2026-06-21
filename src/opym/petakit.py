@@ -33,6 +33,9 @@ def submit_remote_crop_job(
     timepoints: list[int] | None = None,
     output_format: str = "tiff-series",
     rotate: bool = True,
+    z_step_um: float | None = None,
+    xy_pixel_size: float | None = None,
+    test_mode: bool = False,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -57,6 +60,9 @@ def submit_remote_crop_job(
     elif base_name.lower().endswith(".tif"):
         base_name = base_name[:-4]
 
+    if test_mode:
+        base_name = f"{base_name}_test"
+
     payload = {
         "jobType": "crop",
         "dataDir": str(base_file),
@@ -69,6 +75,11 @@ def submit_remote_crop_job(
             "format": output_format,
         },
     }
+
+    if z_step_um is not None:
+        payload["parameters"]["z_step_um"] = z_step_um
+    if xy_pixel_size is not None:
+        payload["parameters"]["xy_pixel_size"] = xy_pixel_size
 
     job_file = _write_ticket(payload, base_name, "CROP", queue_dir)
 
@@ -191,6 +202,53 @@ def submit_remote_deskew_job(
     }
 
     return _write_ticket(payload, base_name, "DESKEW", queue_dir)
+
+
+def submit_remote_decon_job(
+    input_target: Path,
+    psf_paths: list[str] | str | Path,
+    iterations: int = 10,
+    gpu_job: bool = True,
+    skewed: bool = True,
+    result_dir_name: str = "Decon",
+    channel_patterns: list[str] | None = None,
+    queue_dir: Path = QUEUE_DIR,
+) -> Path:
+    """
+    Creates a JSON job ticket for standalone Deconvolution.
+    """
+    _ensure_directories()
+    input_target = Path(input_target).resolve()
+
+    if not input_target.exists():
+        raise FileNotFoundError(f"Input directory not found: {input_target}")
+
+    base_name = input_target.name
+
+    params = {
+        "result_dir_name": result_dir_name,
+        "iterations": iterations,
+        "gpu_job": gpu_job,
+        "skewed": skewed,
+        "save_16bit": True,
+    }
+
+    if channel_patterns:
+        params["channel_patterns"] = channel_patterns
+
+    if isinstance(psf_paths, (str, Path)):
+        params["psf_paths"] = [str(psf_paths)]
+    else:
+        params["psf_paths"] = [str(p) for p in psf_paths]
+
+    payload = {
+        "jobType": "decon",
+        "dataDir": str(input_target),
+        "baseName": f"{base_name}*",
+        "parameters": params,
+    }
+
+    return _write_ticket(payload, base_name, "DECON", queue_dir)
 
 
 # --- BACKWARD COMPATIBILITY ALIASES ---

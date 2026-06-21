@@ -144,7 +144,7 @@ while true
                 % --- DECONVOLUTION JOB ---
                 logMsg('         Type: Deconvolution');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
-                val_chans  = safelyGetParam(p, 'channel_patterns', {});
+                val_chans  = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
                 val_iter   = safelyGetParam(p, 'iterations', 10);
                 val_gpu    = safelyGetParam(p, 'gpu_job', true);
@@ -284,6 +284,14 @@ while true
         movefile(srcPath, fullfile(done_dir, currentFile));
         logMsg('[Server] <<< Finished: %s', currentFile);
 
+        % --- FREE GPU MEMORY ---
+        try
+            for g = 1:gpuDeviceCount
+                reset(gpuDevice(g));
+            end
+        catch
+        end
+
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
         movefile(srcPath, fullfile(fail_dir, currentFile));
@@ -291,6 +299,14 @@ while true
         fid = fopen(errLog, 'w');
         fprintf(fid, '%s\n', getReport(ME));
         fclose(fid);
+
+        % --- FREE GPU MEMORY ---
+        try
+            for g = 1:gpuDeviceCount
+                reset(gpuDevice(g));
+            end
+        catch
+        end
     end
 end
 

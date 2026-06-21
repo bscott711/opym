@@ -84,6 +84,16 @@ function run_bigtiff_cropper(job)
     else
         vox = struct('x', 0.1, 'y', 0.1, 'z', 1.0, 'unit', 'µm');
     end
+
+    % --- OVERRIDE METADATA IF PROVIDED IN TICKET ---
+    if isfield(p, 'xy_pixel_size') && ~isempty(p.xy_pixel_size)
+        vox.x = p.xy_pixel_size;
+        vox.y = p.xy_pixel_size;
+    end
+    if isfield(p, 'z_step_um') && ~isempty(p.z_step_um)
+        vox.z = p.z_step_um;
+    end
+
     fprintf('   [Metadata] Voxel Size: %.3f x %.3f x %.3f %s\n', vox.x, vox.y, vox.z, vox.unit);
 
     T = loader.Dimensions.SizeT;
