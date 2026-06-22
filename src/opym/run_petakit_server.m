@@ -65,6 +65,23 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
 end
 addpath(fullfile(fileparts(mfilename('fullpath')), 'patches'));
 
+% --- GPU BINDING ---------------------------------------------------------
+envGPU = getenv('PETAKIT_GPU_ID');
+if ~isempty(envGPU)
+    targetGpu = str2double(envGPU);
+else
+    targetGpu = 1; % Default to first GPU
+end
+
+try
+    warning('off', 'parallel:gpu:device:DeviceLibsNeedsRecompiling');
+    g = gpuDevice(targetGpu);
+    logMsg('[Server] 🎮 Locked to GPU %d: %s (Available vRAM: %.1f GB)', g.Index, g.Name, g.AvailableMemory / 1e9);
+catch e
+    logMsg('[Server] ❌ Failed to lock GPU %d: %s', targetGpu, e.message);
+end
+
+% --- PARPOOL INITIALIZATION ----------------------------------------------
 pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     try
@@ -88,6 +105,11 @@ idleTimer = 0;
 
 while true
     jobFiles = dir(fullfile(queue_dir, '*.json'));
+    
+    % Filter out hidden or locked files (e.g. .active_...)
+    if ~isempty(jobFiles)
+        jobFiles = jobFiles(~startsWith({jobFiles.name}, '.'));
+    end
 
     if isempty(jobFiles)
         pause(2);
@@ -105,11 +127,19 @@ while true
 
     currentFile = jobFiles(1).name;
     srcPath = fullfile(queue_dir, currentFile);
+    activePath = fullfile(queue_dir, ['.active_' currentFile]);
+
+    % Atomic file lock (prevents both GPUs from grabbing same job)
+    [status, ~] = movefile(srcPath, activePath);
+    if status == 0
+        pause(rand() * 1.5);
+        continue;
+    end
 
     logMsg('[Server] >>> Processing job: %s', currentFile);
 
     try
-        fid = fopen(srcPath);
+        fid = fopen(activePath);
         raw = fread(fid, inf);
         fclose(fid);
         job = jsondecode(char(raw'));
@@ -149,7 +179,7 @@ while true
                 val_iter   = safelyGetParam(p, 'iterations', 10);
                 val_gpu    = safelyGetParam(p, 'gpu_job', true);
                 val_skewed = safelyGetParam(p, 'skewed', true);
-                val_method = safelyGetParam(p, 'rl_method', 'simplified');
+                val_method = safelyGetParam(p, 'rl_method', 'omw');
                 val_16bit  = safelyGetParam(p, 'save_16bit', true);
 
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
@@ -183,7 +213,7 @@ while true
                 % 1. Extract Shared Parameters
                 val_xy        = safelyGetParam(p, 'xy_pixel_size', 0.136);
                 val_dz        = safelyGetParam(p, 'z_step_um', 1.0);
-                val_ang       = safelyGetParam(p, 'sheet_angle_deg', 32.0);
+                val_ang       = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_chans     = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 if ischar(val_chans) || isstring(val_chans)
                     val_chans = {val_chans};
@@ -198,6 +228,7 @@ while true
                 val_deskew    = safelyGetParam(p, 'deskew', true);
                 val_rotate    = safelyGetParam(p, 'rotate', true);
                 val_interp    = safelyGetParam(p, 'interp_method', 'cubic');
+                val_method    = safelyGetParam(p, 'rl_method', 'omw');
                 val_dsDir     = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir    = safelyGetParam(p, 'dsr_dir_name', 'DSR');
 
@@ -232,6 +263,7 @@ while true
                         'skewAngle', val_ang, ...
                         'skewed', true, ...
                         'GPUJob', val_gpuDecon, ...
+                        'RLMethod', val_method, ...
                         'save16bit', true, ...
                         'resultDirName', deconDirName, ...
                         'parseCluster', false, ...
@@ -281,7 +313,7 @@ while true
                 end
         end % End switch jobType
 
-        movefile(srcPath, fullfile(done_dir, currentFile));
+        movefile(activePath, fullfile(done_dir, currentFile));
         logMsg('[Server] <<< Finished: %s', currentFile);
 
         % --- FREE GPU MEMORY ---
@@ -294,7 +326,7 @@ while true
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
-        movefile(srcPath, fullfile(fail_dir, currentFile));
+        movefile(activePath, fullfile(fail_dir, currentFile));
         errLog = fullfile(fail_dir, [currentFile '.log']);
         fid = fopen(errLog, 'w');
         fprintf(fid, '%s\n', getReport(ME));

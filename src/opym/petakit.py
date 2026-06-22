@@ -36,6 +36,8 @@ def submit_remote_crop_job(
     z_step_um: float | None = None,
     xy_pixel_size: float | None = None,
     test_mode: bool = False,
+    exposure_mode: str = "Single Exposure (All Lasers)",
+    active_channels: list[str] | None = None,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -73,6 +75,8 @@ def submit_remote_crop_job(
             "timepoints": timepoints,
             "rotate": rotate,
             "format": output_format,
+            "exposure_mode": exposure_mode,
+            "active_channels": active_channels,
         },
     }
 
@@ -93,7 +97,7 @@ def submit_remote_deskew_job(
     input_target: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 30.0,
+    sheet_angle_deg: float = 60.0,
     deskew: bool = True,
     rotate: bool = True,
     interp_method: str = "cubic",
@@ -212,6 +216,7 @@ def submit_remote_decon_job(
     skewed: bool = True,
     result_dir_name: str = "Decon",
     channel_patterns: list[str] | None = None,
+    rl_method: str = "omw",
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -230,6 +235,7 @@ def submit_remote_decon_job(
         "iterations": iterations,
         "gpu_job": gpu_job,
         "skewed": skewed,
+        "rl_method": rl_method,
         "save_16bit": True,
     }
 
@@ -256,7 +262,7 @@ def run_petakit_processing(
     processed_dir_path: Path,
     z_step_um: float,
     xy_pixel_size: float = 0.136,
-    sheet_angle_deg: float = 30.0,
+    sheet_angle_deg: float = 60.0,
     deskew: bool = True,
     rotate: bool = True,
 ) -> Path:
