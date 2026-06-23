@@ -1,0 +1,16 @@
+function run_gpu_pipeline_async(activePath, done_dir, fail_dir, val_shm, outFn, psfFn, varargin)
+    try
+        run_gpu_pipeline(val_shm, outFn, psfFn, varargin{:});
+        [~, fname, ext] = fileparts(activePath);
+        finalName = strrep([fname ext], '.active_', '');
+        movefile(activePath, fullfile(done_dir, finalName));
+    catch ME
+        [~, fname, ext] = fileparts(activePath);
+        finalName = strrep([fname ext], '.active_', '');
+        movefile(activePath, fullfile(fail_dir, finalName));
+        errLog = fullfile(fail_dir, [strrep(fname, '.active_', '') '.log']);
+        fid = fopen(errLog, 'w');
+        fprintf(fid, '%s\n', getReport(ME));
+        fclose(fid);
+    end
+end
