@@ -62,6 +62,50 @@ classdef BigTiffLoader < handle
                 rethrow(ME);
             end
         end
+        function stack = getStack(obj, t, c)
+            % GETSTACK Retrieve an entire Z-stack efficiently by reusing the Tiff object.
+            Z = obj.Dimensions.SizeZ;
+            stack = zeros(obj.Geometry.H, obj.Geometry.W, Z, 'uint16');
+            
+            wState = warning('off', 'all');
+            currentFile = '';
+            tObj = [];
+            
+            try
+                for z = 1:Z
+                    fIdx = obj.FrameMap.FileIdx(c, z, t);
+                    ifd  = obj.FrameMap.IFD(c, z, t);
+                    
+                    if fIdx == 0
+                        error('Frame T%d Z%d C%d is defined in XML but not mapped to a file.', t, z, c);
+                    end
+                    
+                    targetFile = obj.FileMap{fIdx};
+                    
+                    if ~strcmp(targetFile, currentFile)
+                        if ~isempty(tObj)
+                            tObj.close();
+                        end
+                        tObj = Tiff(targetFile, 'r');
+                        currentFile = targetFile;
+                    end
+                    
+                    tObj.setDirectory(double(ifd) + 1);
+                    stack(:,:,z) = tObj.read();
+                end
+                
+                if ~isempty(tObj)
+                    tObj.close();
+                end
+            catch ME
+                if ~isempty(tObj)
+                    tObj.close();
+                end
+                warning(wState);
+                rethrow(ME);
+            end
+            warning(wState);
+        end
     end
 
     methods (Access = private)

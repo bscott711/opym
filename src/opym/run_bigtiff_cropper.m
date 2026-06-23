@@ -25,9 +25,21 @@ function run_bigtiff_cropper(job)
     end
 
     % Parse ROIs
-    roiTop = parseROI(p.rois.top);
-    roiBot = parseROI(p.rois.bottom);
+    hasTop = isfield(p.rois, 'top') && ~isempty(p.rois.top);
+    if hasTop
+        roiTop = parseROI(p.rois.top);
+    else
+        roiTop = struct('y', [], 'x', [], 'h', 0, 'w', 0);
+    end
+
+    hasBot = isfield(p.rois, 'bottom') && ~isempty(p.rois.bottom);
+    if hasBot
+        roiBot = parseROI(p.rois.bottom);
+    else
+        roiBot = struct('y', [], 'x', [], 'h', 0, 'w', 0);
+    end
     doRotate = isfield(p, 'rotate') && p.rotate;
+    expMode = safelyGetParam(p, 'exposure_mode', 'Single Exposure (All Lasers)');
 
     % Output Directory & Naming
     if isfield(job, 'baseName')
@@ -65,7 +77,11 @@ function run_bigtiff_cropper(job)
     warning('off', 'all'); % Nuclear suppression for initial load
 
     pool = gcp('nocreate');
-    if isempty(pool), pool = parpool(48); end
+    if isempty(pool)
+        pc = parcluster('local');
+        pc.NumWorkers = 48;
+        pool = parpool(pc, 48);
+    end
 
     % --- PATH FIX START ---
     [scriptDir, ~, ~] = fileparts(mfilename('fullpath'));
@@ -108,6 +124,12 @@ function run_bigtiff_cropper(job)
         req_timepoints = p.timepoints;
         if iscell(req_timepoints), req_timepoints = cell2mat(req_timepoints); end
     end
+    
+    active_channels = {};
+    if isfield(p, 'active_channels') && ~isempty(p.active_channels)
+        active_channels = p.active_channels;
+        if ischar(active_channels), active_channels = {active_channels}; end
+    end
 
     % --- 4. Parallel Execution ---
     tic;
@@ -121,34 +143,51 @@ function run_bigtiff_cropper(job)
         end
 
         % A. Load Frame
-        rawStack = zeros(loader.Geometry.H, loader.Geometry.W, Z, 'uint16');
-        for z = 1:Z
-            rawStack(:,:,z) = loader.getFrame(t_in, z, rc);
-        end
+        rawStack = loader.getStack(t_in, rc);
 
-        % B. Determine Channels
+        % B. Determine Channels & Names
         base_out_ch = (rc - 1) * 2;
         isCam1 = mod(rc, 2) ~= 0;
 
         if isCam1
             ch_Bot = base_out_ch;
             ch_Top = base_out_ch + 1;
+            name_Bot = 'Calcein_Violet';
+            name_Top = 'GFP';
         else
             ch_Top = base_out_ch;
             ch_Bot = base_out_ch + 1;
+            name_Top = 'mScarlet';
+            name_Bot = 'CF647';
         end
 
         % C. Write BOTTOM
-        stackBot = rawStack(roiBot.y, roiBot.x, :);
-        if doRotate, stackBot = rot90(stackBot); end
-        fNameBot = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Bot, t_in - 1);
-        write_ome_tiff_stack(stackBot, fullfile(outDir, fNameBot), vox, ch_Bot, t_in-1);
+        if hasBot
+            if isempty(active_channels) || any(strcmp(active_channels, name_Bot))
+                stackBot = rawStack(roiBot.y, roiBot.x, :);
+                if doRotate, stackBot = rot90(stackBot); end
+                if contains(expMode, 'Single Exposure')
+                    fNameBot = sprintf('%s_%s_T%04d.tif', cleanName, name_Bot, t_in - 1);
+                else
+                    fNameBot = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Bot, t_in - 1);
+                end
+                write_ome_tiff_stack(stackBot, fullfile(outDir, fNameBot), vox, ch_Bot, t_in-1);
+            end
+        end
 
         % D. Write TOP
-        stackTop = rawStack(roiTop.y, roiTop.x, :);
-        if doRotate, stackTop = rot90(stackTop); end
-        fNameTop = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Top, t_in - 1);
-        write_ome_tiff_stack(stackTop, fullfile(outDir, fNameTop), vox, ch_Top, t_in-1);
+        if hasTop
+            if isempty(active_channels) || any(strcmp(active_channels, name_Top))
+                stackTop = rawStack(roiTop.y, roiTop.x, :);
+                if doRotate, stackTop = rot90(stackTop); end
+                if contains(expMode, 'Single Exposure')
+                    fNameTop = sprintf('%s_%s_T%04d.tif', cleanName, name_Top, t_in - 1);
+                else
+                    fNameTop = sprintf('%s_C%02d_T%04d.tif', cleanName, ch_Top, t_in - 1);
+                end
+                write_ome_tiff_stack(stackTop, fullfile(outDir, fNameTop), vox, ch_Top, t_in-1);
+            end
+        end
     end
     t_end = toc;
 
@@ -215,4 +254,12 @@ function write_ome_tiff_stack(stack, fpath, vox, c, t)
         end
     end
     tObj.close();
+end
+
+function val = safelyGetParam(st, field, defVal)
+    if isfield(st, field) && ~isempty(st.(field))
+        val = st.(field);
+    else
+        val = defVal;
+    end
 end

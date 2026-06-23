@@ -36,7 +36,16 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     The Matlab server handles the jobs and shuts itself down after `idle_timeout_sec`.
     """
     _ensure_directories()
-    print(f"👀 Watchdog listening on {QUEUE_DIR}...")
+    
+    print("=" * 60)
+    print(" 🚀 OPYM PetaKit GPU Watchdog Initialized")
+    print("=" * 60)
+    print(f" 📂 Queue Directory: {QUEUE_DIR}")
+    print(f" ⏱️  Idle Timeout:    {idle_timeout_sec} seconds")
+    print(f" 🔍 Polling Rate:    Every {poll_interval} seconds")
+    print(f" 🔧 Backend Script:  {OPYM_DIR}/run_petakit_server.m")
+    print("=" * 60)
+    print("👀 Listening for incoming jobs...\n")
 
     # Pass the timeout to Matlab via environment variables
     env = os.environ.copy()
@@ -48,19 +57,29 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
             if any(QUEUE_DIR.glob("*.json")):
                 print("\n🚀 Jobs detected. Spinning up PetaKit Matlab Server...")
 
-                matlab_exe = shutil.which("matlab") or "/mmfs2/cm/shared/apps_local/matlab/R2024B/bin/matlab"
-                cmd = [
-                    matlab_exe,
-                    "-nodisplay",
-                    "-sd",  # Tell Matlab to set its startup directory
-                    str(OPYM_DIR),  # Point it directly to the opym package folder
-                    "-batch",
-                    "run_petakit_server",
-                ]
+                env1 = env.copy()
+                env1["PETAKIT_GPU_ID"] = "1"
+                env1["CUDA_VISIBLE_DEVICES"] = "0"
+                
+                env2 = env.copy()
+                env2["PETAKIT_GPU_ID"] = "1"  # Must be 1 because it only sees one GPU now!
+                env2["CUDA_VISIBLE_DEVICES"] = "1"
 
-                # This will block until the Matlab script completes
-                # its queue AND its timeout
-                subprocess.run(cmd, env=env, check=True)  # nosec B603
+                # Use bash to load the matlab module so licensing works correctly
+                cmd_str = f"module load matlab/R2024b && matlab -nodisplay -sd {OPYM_DIR} -batch run_petakit_server"
+                
+                cmd = ["bash", "-c", cmd_str]
+
+                print("➡️  Launching Server 1 on GPU 1...")
+                p1 = subprocess.Popen(cmd, env=env1)
+                
+                print("➡️  Launching Server 2 on GPU 2...")
+                p2 = subprocess.Popen(cmd, env=env2)
+
+                # This will block until both Matlab scripts complete
+                # their queues AND their timeouts
+                p1.wait()
+                p2.wait()
 
                 print(
                     f"🛑 Matlab server spun down after {idle_timeout_sec}s "
