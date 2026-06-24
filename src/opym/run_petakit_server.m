@@ -86,10 +86,16 @@ pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     try
         delete(pool);
-        parpool('local', numCPUs);
+        pool = parpool('local', numCPUs);
     catch
         logMsg('[Server] Warning: Could not start parpool. Continuing...');
     end
+end
+
+% Prevent the pool from shutting down after 30 minutes of inactivity
+pool = gcp('nocreate');
+if ~isempty(pool)
+    pool.IdleTimeout = Inf;
 end
 
 logMsg('[Server] Ready. Watching: %s', queue_dir);
@@ -169,6 +175,42 @@ while true
                     % Calls the legacy cropper (Requires 'path' string)
                     run_petakit_cropper(srcPath);
                 end
+
+            case 'pipeline'
+                % --- UNIFIED GPU PIPELINE JOB ---
+                logMsg('         Type: Unified GPU Pipeline (RAM Disk)');
+                val_shm    = safelyGetParam(p, 'shm_path', '');
+                val_psfs   = safelyGetParam(p, 'psf_paths', {});
+                val_xyPix  = safelyGetParam(p, 'xy_pixel_size', 0.136);
+                val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
+                val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
+                val_interp = safelyGetParam(p, 'interp_method', 'cubic');
+                val_iter   = safelyGetParam(p, 'iterations', 10);
+                
+                if isempty(val_shm)
+                    error('No /dev/shm/ path provided for pipeline job.');
+                end
+                
+                % outputFn corresponds to dataDir / baseName (which will be a TIF)
+                % The ticket provides dataDir as the target directory (e.g. cell_1/Bot)
+                % and baseName as the file name (e.g. cell_MMStack_Pos0_T0000_C0_bot.tif)
+                outFn = fullfile(job.dataDir, job.baseName);
+                
+                % Ensure array is correct
+                if iscell(val_psfs) && ~isempty(val_psfs)
+                    psfFn = val_psfs{1};
+                elseif isstring(val_psfs) || ischar(val_psfs)
+                    psfFn = val_psfs;
+                else
+                    psfFn = '';
+                end
+                
+                f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, ...
+                    'xyPixelSize', val_xyPix, ...
+                    'z_step_um', val_zStep, ...
+                    'DeconIter', val_iter, ...
+                    'SkewAngle', val_angle, ...
+                    'interpMethod', val_interp);
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---
@@ -313,31 +355,37 @@ while true
                 end
         end % End switch jobType
 
-        movefile(activePath, fullfile(done_dir, currentFile));
-        logMsg('[Server] <<< Finished: %s', currentFile);
+        if ~strcmp(jobType, 'pipeline')
+            movefile(activePath, fullfile(done_dir, currentFile));
+            logMsg('[Server] <<< Finished: %s', currentFile);
 
-        % --- FREE GPU MEMORY ---
-        try
-            for g = 1:gpuDeviceCount
-                reset(gpuDevice(g));
+            % --- FREE GPU MEMORY ---
+            try
+                for g = 1:gpuDeviceCount
+                    reset(gpuDevice(g));
+                end
+            catch
             end
-        catch
+        else
+            logMsg('[Server] <<< Dispatched %s to background worker.', currentFile);
         end
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
-        movefile(activePath, fullfile(fail_dir, currentFile));
-        errLog = fullfile(fail_dir, [currentFile '.log']);
-        fid = fopen(errLog, 'w');
-        fprintf(fid, '%s\n', getReport(ME));
-        fclose(fid);
+        if ~strcmp(jobType, 'pipeline')
+            movefile(activePath, fullfile(fail_dir, currentFile));
+            errLog = fullfile(fail_dir, [currentFile '.log']);
+            fid = fopen(errLog, 'w');
+            fprintf(fid, '%s\n', getReport(ME));
+            fclose(fid);
 
-        % --- FREE GPU MEMORY ---
-        try
-            for g = 1:gpuDeviceCount
-                reset(gpuDevice(g));
+            % --- FREE GPU MEMORY ---
+            try
+                for g = 1:gpuDeviceCount
+                    reset(gpuDevice(g));
+                end
+            catch
             end
-        catch
         end
     end
 end

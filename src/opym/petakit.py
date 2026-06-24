@@ -242,11 +242,6 @@ def submit_remote_decon_job(
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
 
-    if isinstance(psf_paths, (str, Path)):
-        params["psf_paths"] = [str(psf_paths)]
-    else:
-        params["psf_paths"] = [str(p) for p in psf_paths]
-
     payload = {
         "jobType": "decon",
         "dataDir": str(input_target),
@@ -255,6 +250,60 @@ def submit_remote_decon_job(
     }
 
     return _write_ticket(payload, base_name, "DECON", queue_dir)
+
+
+def submit_pipeline_job(
+    output_file: Path,
+    shm_path: Path,
+    psf_paths: list[str] | str | Path,
+    z_step_um: float,
+    xy_pixel_size: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+    interp_method: str = "cubic",
+    iterations: int = 10,
+    rl_method: str = "omw",
+    channel_patterns: list[str] | None = None,
+    z_crop_end: int | None = None,
+    queue_dir: Path = QUEUE_DIR,
+) -> Path:
+    """
+    Creates a JSON job ticket for the unified GPU pipeline.
+    This job instructs MATLAB to load the temporary file from /dev/shm/,
+    perform Decon -> DSR -> Z-Trim on the GPU, and save the final result to output_file.
+    """
+    _ensure_directories()
+    output_file = Path(output_file).resolve()
+    data_dir = output_file.parent
+    base_name = output_file.name
+
+    params = {
+        "shm_path": str(shm_path),
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+        "interp_method": interp_method,
+        "iterations": iterations,
+        "rl_method": rl_method,
+    }
+    if z_crop_end is not None:
+        params["z_crop_end"] = int(z_crop_end)
+
+    if channel_patterns:
+        params["channel_patterns"] = channel_patterns
+
+    if isinstance(psf_paths, (str, Path)):
+        params["psf_paths"] = [str(psf_paths)]
+    else:
+        params["psf_paths"] = [str(p) for p in psf_paths]
+
+    payload = {
+        "jobType": "pipeline",
+        "dataDir": str(data_dir),
+        "baseName": base_name,
+        "parameters": params,
+    }
+
+    return _write_ticket(payload, base_name, "PIPELINE", queue_dir)
 
 
 # --- BACKWARD COMPATIBILITY ALIASES ---

@@ -1,8 +1,10 @@
 function run_gpu_pipeline_async(activePath, done_dir, fail_dir, val_shm, outFn, psfFn, varargin)
     try
-        run_gpu_pipeline(val_shm, outFn, psfFn, varargin{:});
-        [~, fname, ext] = fileparts(activePath);
-        finalName = strrep([fname ext], '.active_', '');
+        [~, fname, ext] = fileparts(outFn);
+        shm_outFn = fullfile('/dev/shm/opym_jobs', [fname ext '_final']);
+        run_gpu_pipeline(val_shm, shm_outFn, psfFn, varargin{:});
+        [~, jobfname, jobext] = fileparts(activePath);
+        finalName = strrep([jobfname jobext], '.active_', '');
         movefile(activePath, fullfile(done_dir, finalName));
     catch ME
         [~, fname, ext] = fileparts(activePath);
