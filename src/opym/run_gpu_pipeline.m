@@ -21,7 +21,7 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     ip.addParameter('dzPSF', 0.1, @isnumeric);
     
     % Decon params
-    ip.addParameter('DeconIter', 10, @isnumeric);
+    ip.addParameter('DeconIter', 25, @isnumeric);
     ip.addParameter('RLMethod', 'simple', @ischar);
     ip.addParameter('Background', 100, @isnumeric);
     ip.addParameter('wienerAlpha', 0.005, @isnumeric);
