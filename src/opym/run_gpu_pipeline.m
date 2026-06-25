@@ -22,6 +22,7 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     
     % Decon params
     ip.addParameter('DeconIter', 10, @isnumeric);
+    ip.addParameter('RLMethod', 'simple', @ischar);
     ip.addParameter('Background', 100, @isnumeric);
     ip.addParameter('wienerAlpha', 0.005, @isnumeric);
     ip.addParameter('OTFCumThresh', 0.9, @isnumeric);
@@ -72,10 +73,9 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     % To match user's RLMethod='omw', we should generate it or use simplified. 
     % Let's use simplified for maximum speed and simplicity if no backprojector exists,
     % or we can use omw if we generate it. Let's use 'simplified' as fallback.
-    RLMethod = 'simplified';
     
     %% 3. GPU TRANSFER & DECONVOLUTION
-    fprintf('[GPU_Pipeline] Starting %s Deconvolution (%d iters) on GPU...\n', RLMethod, pr.DeconIter);
+    fprintf('[GPU_Pipeline] Starting %s Deconvolution (%d iters) on GPU...\n', pr.RLMethod, pr.DeconIter);
     
     % decon_lucy_function automatically handles gpuArray transfer if useGPU=true
     [deconvolved, err_mat, iter_run] = decon_lucy_function(...

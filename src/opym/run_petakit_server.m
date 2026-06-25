@@ -195,7 +195,13 @@ while true
                 val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
-                val_iter   = safelyGetParam(p, 'iterations', 10);
+                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter   = safelyGetParam(p, 'iterations', default_iter);
                 val_zarr   = safelyGetParam(p, 'save_zarr', true);
                 val_debug  = safelyGetParam(p, 'debug', false);
                 
@@ -221,6 +227,7 @@ while true
                     'xyPixelSize', val_xyPix, ...
                     'z_step_um', val_zStep, ...
                     'DeconIter', val_iter, ...
+                    'RLMethod', val_method, ...
                     'SkewAngle', val_angle, ...
                     'interpMethod', val_interp, ...
                     'saveZarr', val_zarr, ...
@@ -232,10 +239,15 @@ while true
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
-                val_iter   = safelyGetParam(p, 'iterations', 10);
+                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter   = safelyGetParam(p, 'iterations', default_iter);
                 val_gpu    = safelyGetParam(p, 'gpu_job', true);
                 val_skewed = safelyGetParam(p, 'skewed', true);
-                val_method = safelyGetParam(p, 'rl_method', 'omw');
                 val_16bit  = safelyGetParam(p, 'save_16bit', true);
 
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
@@ -278,13 +290,17 @@ while true
                 % Decon Params
                 val_psfPath   = safelyGetParam(p, 'psf_path', '');
                 val_runDecon  = safelyGetParam(p, 'run_decon', ~isempty(val_psfPath));
-                val_iter      = safelyGetParam(p, 'decon_iter', 10);
-
                 % Deskew/Rotate Params
                 val_deskew    = safelyGetParam(p, 'deskew', true);
                 val_rotate    = safelyGetParam(p, 'rotate', true);
                 val_interp    = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method    = safelyGetParam(p, 'rl_method', 'omw');
+                val_method    = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter      = safelyGetParam(p, 'decon_iter', default_iter);
                 val_dsDir     = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir    = safelyGetParam(p, 'dsr_dir_name', 'DSR');
 

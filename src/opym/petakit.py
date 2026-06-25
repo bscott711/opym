@@ -193,11 +193,11 @@ def submit_remote_deskew_job(
         "reverse": reverse,
     }
 
-    # Add deconvolution parameters if a PSF is provided
     if psf_path:
         params["run_decon"] = True
         params["psf_path"] = str(psf_path)
-        params["decon_iter"] = n_iters if n_iters is not None else 10
+        params["decon_iter"] = n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
+        params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
 
     payload = {
@@ -213,12 +213,12 @@ def submit_remote_deskew_job(
 def submit_remote_decon_job(
     input_target: Path,
     psf_paths: list[str] | str | Path,
-    iterations: int = 10,
+    iterations: int | None = None,
     gpu_job: bool = True,
     skewed: bool = True,
     result_dir_name: str = "Decon",
     channel_patterns: list[str] | None = None,
-    rl_method: str = "omw",
+    rl_method: str = "simple",
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -234,7 +234,7 @@ def submit_remote_decon_job(
 
     params = {
         "result_dir_name": result_dir_name,
-        "iterations": iterations,
+        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
         "gpu_job": gpu_job,
         "skewed": skewed,
         "rl_method": rl_method,
@@ -262,8 +262,8 @@ def submit_pipeline_job(
     xy_pixel_size: float = 0.136,
     sheet_angle_deg: float = 60.0,
     interp_method: str = "cubic",
-    iterations: int = 10,
-    rl_method: str = "omw",
+    iterations: int | None = None,
+    rl_method: str = "simple",
     channel_patterns: list[str] | None = None,
     z_crop_end: int | None = None,
     save_zarr: bool = True,
@@ -286,7 +286,7 @@ def submit_pipeline_job(
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
         "interp_method": interp_method,
-        "iterations": iterations,
+        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
         "rl_method": rl_method,
         "save_zarr": save_zarr,
         "debug": debug,
