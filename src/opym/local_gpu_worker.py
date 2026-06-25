@@ -97,6 +97,9 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
         print("\n🛑 Watchdog gracefully shut down.")
 
 
-if __name__ == "__main__":
+def main():
     # 300 seconds = 5 minutes of idle time before releasing the GPU
     process_queue(idle_timeout_sec=3600)
+
+if __name__ == "__main__":
+    main()
