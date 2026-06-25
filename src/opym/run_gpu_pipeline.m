@@ -33,20 +33,38 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     ip.addParameter('Reverse', true, @islogical);
     ip.addParameter('objectiveScan', false, @islogical);
     ip.addParameter('save16bit', true, @islogical);
+    ip.addParameter('debug', false, @islogical);
     
     ip.parse(shm_path, outputFn, PSFfn, varargin{:});
     pr = ip.Results;
-    
+
     %% 1. LOAD FROM RAM DISK (FAST)
+    % Initialize true MATLAB Profiler
+    if pr.debug
+        profile on -history -timer real
+    end
+    
     fprintf('[GPU_Pipeline] Reading temporary ROI from %s...\n', shm_path);
-    t_load = tic;
-    rawdata = readtiff(shm_path); % Reads from /dev/shm instantly
-    fprintf('[GPU_Pipeline] Loaded %dx%dx%d in %.2fs\n', size(rawdata,1), size(rawdata,2), size(rawdata,3), toc(t_load));
+    if endsWith(shm_path, '.zarr')
+        rawdata = readzarr(shm_path);
+    else
+        rawdata = readtiff(shm_path); % Backward compat
+    end
+    fprintf('[GPU_Pipeline] Loaded %dx%dx%d\n', size(rawdata,1), size(rawdata,2), size(rawdata,3));
     
     %% 2. PREPARE PSF
-    psf = single(readtiff(PSFfn));
-    % Normalize
-    psf = psf ./ sum(psf(:));
+    persistent cached_psf
+    persistent cached_psf_fn
+    
+    if isempty(cached_psf) || ~strcmp(cached_psf_fn, PSFfn)
+        psf = single(readtiff(PSFfn));
+        % Normalize
+        psf = psf ./ sum(psf(:));
+        cached_psf = psf;
+        cached_psf_fn = PSFfn;
+    else
+        psf = cached_psf;
+    end
     
     % Back projector (simplification for omw)
     % In a true pipeline we should generate this once. For now we use the raw PSF as back projector 
@@ -58,7 +76,6 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     
     %% 3. GPU TRANSFER & DECONVOLUTION
     fprintf('[GPU_Pipeline] Starting %s Deconvolution (%d iters) on GPU...\n', RLMethod, pr.DeconIter);
-    t_decon = tic;
     
     % decon_lucy_function automatically handles gpuArray transfer if useGPU=true
     [deconvolved, err_mat, iter_run] = decon_lucy_function(...
@@ -68,12 +85,11 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
         'save16bit', pr.save16bit, ...
         'debug', false);
         
-    fprintf('[GPU_Pipeline] Deconvolution completed in %.2fs\n', toc(t_decon));
+    fprintf('[GPU_Pipeline] Deconvolution completed\n');
     clear rawdata psf; % Free up memory
     
     %% 4. GPU DESKEW & ROTATE (Linear Interpolation)
     fprintf('[GPU_Pipeline] Starting Deskew & Rotate on GPU...\n');
-    t_dsr = tic;
     
     % Force linear for GPU compatibility
     interp = pr.interpMethod;
@@ -82,6 +98,7 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
         interp = 'linear';
     end
     
+    % Keep on GPU for DSR as requested!
     dsr_gpu = deskewRotateFrame3D(deconvolved, abs(pr.SkewAngle), pr.z_step_um, pr.xyPixelSize, ...
         'reverse', pr.Reverse, ...
         'Crop', true, ...
@@ -90,44 +107,90 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
         'gpuProcess', true, ... 
         'save16bit', pr.save16bit);
         
-    fprintf('[GPU_Pipeline] DSR completed in %.2fs\n', toc(t_dsr));
+    fprintf('[GPU_Pipeline] DSR completed\n');
     clear deconvolved;
     
-    %% 4.5 GATHER BACK TO CPU
-    dsr_cpu = gather(dsr_gpu);
-    clear dsr_gpu;
+    %% 4.5 BLOCK-SAVE TO ZARR (GPU→CPU in Z-slabs, overlapped with I/O)
+    fprintf('[GPU_Pipeline] Block-saving to Zarr...\n');
     
-    %% 6. GATHER AND SAVE
-    fprintf('[GPU_Pipeline] Saving to %s...\n', outputFn);
-    t_save = tic;
-    
-    final_vol = dsr_cpu;
-    clear dsr_cpu;
-    
+    % Apply Z-trim while still on GPU (avoid gathering trimmed slices)
     if isfield(pr, 'z_crop_end') && ~isempty(pr.z_crop_end)
         trim_idx = double(pr.z_crop_end);
-        if trim_idx < size(final_vol, 3)
-            fprintf('[GPU_Pipeline] Applying predefined Z-Trim: 1 to %d\n', trim_idx);
-            final_vol = final_vol(:, :, 1:trim_idx);
+        if trim_idx < size(dsr_gpu, 3)
+            fprintf('[GPU_Pipeline] Applying Z-Trim: 1 to %d (on GPU)\n', trim_idx);
+            dsr_gpu = dsr_gpu(:, :, 1:trim_idx);
         end
     end
     
-    if pr.save16bit
-        final_vol = uint16(final_vol);
-    end
-    
-    % Ensure target directory exists
-    [outDir, ~, ~] = fileparts(outputFn);
+    % Determine final GPFS output path
+    zarrOutputFn = regexprep(outputFn, '\.tif$', '.zarr');
+    [outDir, ~, ~] = fileparts(zarrOutputFn);
     if ~exist(outDir, 'dir')
         mkdir(outDir);
     end
     
-    writetiff(final_vol, outputFn);
-    
-    % Cleanup RAM disk
-    if exist(shm_path, 'file')
-        delete(shm_path);
+    % Determine local RAM disk path for fast GPU-to-CPU I/O
+    [~, fname, ext] = fileparts(zarrOutputFn);
+    shmZarrFn = fullfile('/dev/shm', [fname, ext]);
+    if exist(shmZarrFn, 'dir')
+        rmdir(shmZarrFn, 's');
     end
     
-    fprintf('[GPU_Pipeline] Save completed in %.2fs. Total Pipeline Done!\n', toc(t_save));
+    % Get dimensions
+    [ny, nx, nz] = size(dsr_gpu);
+    block_z = 64;  % Z-slabs to transfer per gather() call
+    
+    % Pre-create the Zarr container on RAM disk
+    if pr.save16bit
+        createZarrFile(shmZarrFn, 'dtype', '<u2', 'shape', [ny, nx, nz], 'chunks', [ny, nx, block_z]);
+    else
+        createZarrFile(shmZarrFn, 'dtype', '<f4', 'shape', [ny, nx, nz], 'chunks', [ny, nx, block_z]);
+    end
+    
+    for z_start = 1:block_z:nz
+        z_end = min(z_start + block_z - 1, nz);
+        block = gather(dsr_gpu(:, :, z_start:z_end));
+        if pr.save16bit
+            block = uint16(block);
+        end
+        % Use bbox for writing region [ymin, xmin, zmin, ymax, xmax, zmax]
+        writezarr(block, shmZarrFn, 'bbox', [1, 1, z_start, ny, nx, z_end], 'create', false);
+    end
+    clear dsr_gpu;
+    
+    % Dispatch background transfer to GPFS so the GPU is immediately released
+    fprintf('[GPU_Pipeline] Dispatching background transfer: %s -> %s\n', shmZarrFn, outDir);
+    cmd = sprintf('nohup bash -c "cp -r %s %s && rm -rf %s" >/dev/null 2>&1 &', shmZarrFn, outDir, shmZarrFn);
+    system(cmd);
+    
+    % Cleanup RAM disk input
+    if exist(shm_path, 'file') || exist(shm_path, 'dir')
+        if isfolder(shm_path)
+            rmdir(shm_path, 's');
+        else
+            delete(shm_path);
+        end
+    end
+    
+    % --- FULL MATLAB PROFILING EXPORT ---
+    if pr.debug
+        try
+            profile off
+            profData = profile('info');
+            profDir = fullfile('/dev/shm/petakit_jobs/profiling', sprintf('%s_html', fname));
+            profsave(profData, profDir);
+            fprintf('[GPU_Pipeline] Profiling report saved to %s\n', profDir);
+        catch ME
+            fprintf('[GPU_Pipeline] Profiling export failed: %s\n', ME.message);
+            try
+                errFile = fullfile('/dev/shm/petakit_jobs/profiling', sprintf('%s_prof_err.log', fname));
+                fid = fopen(errFile, 'w');
+                fprintf(fid, 'Error during profsave: %s\n', ME.message);
+                fclose(fid);
+            catch
+            end
+        end
+    end
+    
+    fprintf('[GPU_Pipeline] Zarr save completed. Total Pipeline Done!\n');
 end

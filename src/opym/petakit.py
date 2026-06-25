@@ -16,8 +16,10 @@ import ipywidgets as widgets
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
 
 # Constants
-PETAKIT_JOBS_DIR = Path.home() / "petakit_jobs"
-QUEUE_DIR = PETAKIT_JOBS_DIR / "queue"
+BASE_DIR = Path("/dev/shm/petakit_jobs")
+QUEUE_DIR = BASE_DIR / "queue"
+DONE_DIR = BASE_DIR / "completed"
+FAIL_DIR = BASE_DIR / "failed"
 
 
 def _ensure_directories():
@@ -264,6 +266,8 @@ def submit_pipeline_job(
     rl_method: str = "omw",
     channel_patterns: list[str] | None = None,
     z_crop_end: int | None = None,
+    save_zarr: bool = True,
+    debug: bool = False,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -284,6 +288,8 @@ def submit_pipeline_job(
         "interp_method": interp_method,
         "iterations": iterations,
         "rl_method": rl_method,
+        "save_zarr": save_zarr,
+        "debug": debug,
     }
     if z_crop_end is not None:
         params["z_crop_end"] = int(z_crop_end)

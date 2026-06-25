@@ -94,6 +94,11 @@ def main():
     parser.add_argument(
         "--iter", type=int, default=DEFAULTS["iter"], help="Decon Iterations"
     )
+    
+    # Debug
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable deep profiling in Matlab workers"
+    )
 
     args = parser.parse_args()
 
@@ -141,6 +146,7 @@ def main():
             "run_decon": bool(args.psf),
             "decon_iter": args.iter,
             "psf_path": args.psf,
+            "debug": args.debug,
         },
     }
 

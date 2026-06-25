@@ -36,7 +36,7 @@ else
     end
 end
 
-base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
+base_queue_dir = '/dev/shm/petakit_jobs';
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('SLURM_CPUS_PER_TASK');
@@ -65,6 +65,9 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
 end
 addpath(fullfile(fileparts(mfilename('fullpath')), 'patches'));
 
+% --- VERIFY MEX ---
+verify_mex();
+
 % --- GPU BINDING ---------------------------------------------------------
 envGPU = getenv('PETAKIT_GPU_ID');
 if ~isempty(envGPU)
@@ -86,7 +89,14 @@ pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     try
         delete(pool);
-        pool = parpool('local', numCPUs);
+        pc = parcluster('local');
+        envServer = getenv('PETAKIT_SERVER_ID');
+        if isempty(envServer), envServer = num2str(targetGpu); end
+        pc.JobStorageLocation = fullfile(getenv('HOME'), '.matlab', 'local_cluster_jobs', sprintf('server_%s', envServer));
+        if ~exist(pc.JobStorageLocation, 'dir')
+            mkdir(pc.JobStorageLocation);
+        end
+        pool = parpool(pc, numCPUs, 'IdleTimeout', Inf);
     catch
         logMsg('[Server] Warning: Could not start parpool. Continuing...');
     end
@@ -186,6 +196,8 @@ while true
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
                 val_iter   = safelyGetParam(p, 'iterations', 10);
+                val_zarr   = safelyGetParam(p, 'save_zarr', true);
+                val_debug  = safelyGetParam(p, 'debug', false);
                 
                 if isempty(val_shm)
                     error('No /dev/shm/ path provided for pipeline job.');
@@ -210,7 +222,9 @@ while true
                     'z_step_um', val_zStep, ...
                     'DeconIter', val_iter, ...
                     'SkewAngle', val_angle, ...
-                    'interpMethod', val_interp);
+                    'interpMethod', val_interp, ...
+                    'saveZarr', val_zarr, ...
+                    'debug', val_debug);
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---
