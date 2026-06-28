@@ -39,11 +39,11 @@ end
 base_queue_dir = '/dev/shm/petakit_jobs';
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
-envCPUs = getenv('SLURM_CPUS_PER_TASK');
+envCPUs = getenv('PETAKIT_CPUS');
 if ~isempty(envCPUs)
     numCPUs = str2double(envCPUs);
 else
-    numCPUs = 24;
+    numCPUs = 10; % Default to 10 workers to prevent GPU OOM
 end
 
 % Setup Directories

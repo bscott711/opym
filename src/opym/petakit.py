@@ -297,7 +297,9 @@ def submit_pipeline_job(
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
 
-    if isinstance(psf_paths, (str, Path)):
+    if psf_paths is None:
+        params["psf_paths"] = []
+    elif isinstance(psf_paths, (str, Path)):
         params["psf_paths"] = [str(psf_paths)]
     else:
         params["psf_paths"] = [str(p) for p in psf_paths]

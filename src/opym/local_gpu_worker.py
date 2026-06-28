@@ -61,13 +61,13 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
                 env1["PETAKIT_SERVER_ID"] = "1"
                 env1["PETAKIT_GPU_ID"] = "1"
                 env1["CUDA_VISIBLE_DEVICES"] = "0"
-                env1["PETAKIT_CPUS"] = "6"  # Limit workers to prevent GPU OOM
+                env1["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
                 
                 env2 = env.copy()
                 env2["PETAKIT_SERVER_ID"] = "2"
                 env2["PETAKIT_GPU_ID"] = "1"  # Both use GPU index 1 because CUDA restricts visibility to 1 device
                 env2["CUDA_VISIBLE_DEVICES"] = "1"
-                env2["PETAKIT_CPUS"] = "6"  # Limit workers to prevent GPU OOM
+                env2["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
 
                 # Use bash to load the matlab module so licensing works correctly
                 cmd_str = f"module load matlab/R2024b && matlab -nodisplay -sd {OPYM_DIR} -batch run_petakit_server"
