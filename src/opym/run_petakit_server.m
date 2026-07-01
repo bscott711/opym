@@ -270,6 +270,17 @@ while true
                     end
                 end
 
+                % Note on PSF/OTF cache warmth (persistent vars in
+                % decon_lucy_function.m and run_gpu_pipeline.m are per-worker-
+                % process): since the GPU lock above already fully serializes
+                % pipeline-job dispatch to this pool (one in flight at a time),
+                % parfeval's scheduler was empirically verified to always
+                % reassign the job to the same, now-idle worker rather than
+                % scattering across the pool -- 8/8 consecutive serialized
+                % jobs landed on the same worker PID in an isolated probe
+                % (see the performance plan's Phase 1.1). So both caches
+                % already stay warm across same-PSF jobs without needing a
+                % dedicated single-worker pool; no dispatch change was made.
                 f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, gpu_lock_dir, currentFile, ...
                     'xyPixelSize', val_xyPix, ...
                     'z_step_um', val_zStep, ...
