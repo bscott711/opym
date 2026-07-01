@@ -13,6 +13,8 @@ import time
 import shutil
 from pathlib import Path
 
+from opym.consolidate import run_pending_consolidations
+
 # Dynamically locate the opym installation directory
 OPYM_DIR = Path(__file__).parent.resolve()
 
@@ -89,6 +91,17 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
                     f"🛑 Matlab server spun down after {idle_timeout_sec}s "
                     "of inactivity. GPUs released."
                 )
+
+                print("\n🔗 Checking for pending OME-Zarr consolidations...")
+                try:
+                    n = run_pending_consolidations(BASE_DIR)
+                    if n:
+                        print(f"✅ Consolidated {n} dataset(s) into OME-Zarr")
+                    else:
+                        print("   No pending consolidations found")
+                except Exception as exc:
+                    print(f"⚠️  Consolidation error: {exc}")
+
                 print(f"👀 Watchdog resuming listening on {QUEUE_DIR}...")
 
             time.sleep(poll_interval)
