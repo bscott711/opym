@@ -36,14 +36,14 @@ else
     end
 end
 
-base_queue_dir = fullfile(getenv('HOME'), 'petakit_jobs');
+base_queue_dir = '/dev/shm/petakit_jobs';
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
-envCPUs = getenv('SLURM_CPUS_PER_TASK');
+envCPUs = getenv('PETAKIT_CPUS');
 if ~isempty(envCPUs)
     numCPUs = str2double(envCPUs);
 else
-    numCPUs = 24;
+    numCPUs = 10; % Default to 10 workers to prevent GPU OOM
 end
 
 % Setup Directories
@@ -55,6 +55,18 @@ if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
 if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
+% GPU pipeline-job concurrency lock, scoped per server (= per physical GPU,
+% see local_gpu_worker.py's CUDA_VISIBLE_DEVICES assignment per PETAKIT_SERVER_ID).
+envServerId = getenv('PETAKIT_SERVER_ID');
+if isempty(envServerId), envServerId = 'default'; end
+gpu_lock_dir = fullfile(base_queue_dir, 'gpu_locks', sprintf('server_%s', envServerId));
+if ~exist(gpu_lock_dir, 'dir'), mkdir(gpu_lock_dir); end
+% Clear stale locks from a previous crashed/killed server instance.
+staleLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
+for si = 1:numel(staleLocks)
+    delete(fullfile(gpu_lock_dir, staleLocks(si).name));
+end
+
 % --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
@@ -64,6 +76,9 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 addpath(fullfile(fileparts(mfilename('fullpath')), 'patches'));
+
+% --- VERIFY MEX ---
+verify_mex();
 
 % --- GPU BINDING ---------------------------------------------------------
 envGPU = getenv('PETAKIT_GPU_ID');
@@ -86,10 +101,23 @@ pool = gcp('nocreate');
 if isempty(pool) || pool.NumWorkers ~= numCPUs
     try
         delete(pool);
-        parpool('local', numCPUs);
+        pc = parcluster('local');
+        envServer = getenv('PETAKIT_SERVER_ID');
+        if isempty(envServer), envServer = num2str(targetGpu); end
+        pc.JobStorageLocation = fullfile(getenv('HOME'), '.matlab', 'local_cluster_jobs', sprintf('server_%s', envServer));
+        if ~exist(pc.JobStorageLocation, 'dir')
+            mkdir(pc.JobStorageLocation);
+        end
+        pool = parpool(pc, numCPUs, 'IdleTimeout', Inf);
     catch
         logMsg('[Server] Warning: Could not start parpool. Continuing...');
     end
+end
+
+% Prevent the pool from shutting down after 30 minutes of inactivity
+pool = gcp('nocreate');
+if ~isempty(pool)
+    pool.IdleTimeout = Inf;
 end
 
 logMsg('[Server] Ready. Watching: %s', queue_dir);
@@ -170,16 +198,104 @@ while true
                     run_petakit_cropper(srcPath);
                 end
 
+            case 'pipeline'
+                % --- UNIFIED GPU PIPELINE JOB ---
+                logMsg('         Type: Unified GPU Pipeline (RAM Disk)');
+                val_shm    = safelyGetParam(p, 'shm_path', '');
+                val_psfs   = safelyGetParam(p, 'psf_paths', {});
+                val_xyPix  = safelyGetParam(p, 'xy_pixel_size', 0.136);
+                val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
+                val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
+                val_interp = safelyGetParam(p, 'interp_method', 'cubic');
+                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter   = safelyGetParam(p, 'iterations', default_iter);
+                val_zarr   = safelyGetParam(p, 'save_zarr', true);
+                val_debug  = safelyGetParam(p, 'debug', false);
+                val_dzPSF  = safelyGetParam(p, 'dz_psf', []);
+
+                if isempty(val_shm)
+                    error('No /dev/shm/ path provided for pipeline job.');
+                end
+
+                % outputFn corresponds to dataDir / baseName (which will be a TIF)
+                % The ticket provides dataDir as the target directory (e.g. cell_1/Bot)
+                % and baseName as the file name (e.g. cell_MMStack_Pos0_T0000_C0_bot.tif)
+                outFn = fullfile(job.dataDir, job.baseName);
+
+                % Ensure array is correct
+                if iscell(val_psfs) && ~isempty(val_psfs)
+                    psfFn = val_psfs{1};
+                elseif isstring(val_psfs) || ischar(val_psfs)
+                    psfFn = val_psfs;
+                else
+                    psfFn = '';
+                end
+
+                % dz_psf is required whenever a PSF (i.e. deconvolution) is
+                % requested -- a silent wrong default here previously caused
+                % the decon step to resample against the wrong z-geometry.
+                if ~isempty(psfFn) && isempty(val_dzPSF)
+                    error(['pipeline job requests deconvolution (psf_paths set) but is ', ...
+                        'missing required "dz_psf" parameter (the PSF''s own z-step, in um).']);
+                end
+
+                % --- GPU CONCURRENCY LOCK ---
+                % Only one 'pipeline' job may run on this server's GPU at a time
+                % (deconvolution + DSR both allocate full-volume GPU buffers;
+                % running >1 concurrently reliably OOMs the device). Each server
+                % process owns exactly one physical GPU (see local_gpu_worker.py),
+                % so this lock is scoped per-server via PETAKIT_SERVER_ID.
+                maxGpuJobs = str2double(getenv('PETAKIT_MAX_GPU_PIPELINE_JOBS'));
+                if isnan(maxGpuJobs)
+                    maxGpuJobs = 1;
+                end
+                lockAcquired = false;
+                while ~lockAcquired
+                    existingLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
+                    if numel(existingLocks) < maxGpuJobs
+                        lockName = fullfile(gpu_lock_dir, [currentFile '.lock']);
+                        lfid = fopen(lockName, 'w');
+                        if lfid > 0
+                            fclose(lfid);
+                            lockAcquired = true;
+                        end
+                    end
+                    if ~lockAcquired
+                        pause(1 + rand());
+                    end
+                end
+
+                f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, gpu_lock_dir, currentFile, ...
+                    'xyPixelSize', val_xyPix, ...
+                    'z_step_um', val_zStep, ...
+                    'DeconIter', val_iter, ...
+                    'RLMethod', val_method, ...
+                    'SkewAngle', val_angle, ...
+                    'interpMethod', val_interp, ...
+                    'saveZarr', val_zarr, ...
+                    'debug', val_debug, ...
+                    'dzPSF', val_dzPSF);
+
             case 'decon'
                 % --- DECONVOLUTION JOB ---
                 logMsg('         Type: Deconvolution');
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
-                val_iter   = safelyGetParam(p, 'iterations', 10);
+                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter   = safelyGetParam(p, 'iterations', default_iter);
                 val_gpu    = safelyGetParam(p, 'gpu_job', true);
                 val_skewed = safelyGetParam(p, 'skewed', true);
-                val_method = safelyGetParam(p, 'rl_method', 'omw');
                 val_16bit  = safelyGetParam(p, 'save_16bit', true);
 
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
@@ -222,13 +338,17 @@ while true
                 % Decon Params
                 val_psfPath   = safelyGetParam(p, 'psf_path', '');
                 val_runDecon  = safelyGetParam(p, 'run_decon', ~isempty(val_psfPath));
-                val_iter      = safelyGetParam(p, 'decon_iter', 10);
-
                 % Deskew/Rotate Params
                 val_deskew    = safelyGetParam(p, 'deskew', true);
                 val_rotate    = safelyGetParam(p, 'rotate', true);
                 val_interp    = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method    = safelyGetParam(p, 'rl_method', 'omw');
+                val_method    = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter      = safelyGetParam(p, 'decon_iter', default_iter);
                 val_dsDir     = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir    = safelyGetParam(p, 'dsr_dir_name', 'DSR');
 
@@ -313,31 +433,37 @@ while true
                 end
         end % End switch jobType
 
-        movefile(activePath, fullfile(done_dir, currentFile));
-        logMsg('[Server] <<< Finished: %s', currentFile);
+        if ~strcmp(jobType, 'pipeline')
+            movefile(activePath, fullfile(done_dir, currentFile));
+            logMsg('[Server] <<< Finished: %s', currentFile);
 
-        % --- FREE GPU MEMORY ---
-        try
-            for g = 1:gpuDeviceCount
-                reset(gpuDevice(g));
+            % --- FREE GPU MEMORY ---
+            try
+                for g = 1:gpuDeviceCount
+                    reset(gpuDevice(g));
+                end
+            catch
             end
-        catch
+        else
+            logMsg('[Server] <<< Dispatched %s to background worker.', currentFile);
         end
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
-        movefile(activePath, fullfile(fail_dir, currentFile));
-        errLog = fullfile(fail_dir, [currentFile '.log']);
-        fid = fopen(errLog, 'w');
-        fprintf(fid, '%s\n', getReport(ME));
-        fclose(fid);
+        if ~strcmp(jobType, 'pipeline')
+            movefile(activePath, fullfile(fail_dir, currentFile));
+            errLog = fullfile(fail_dir, [currentFile '.log']);
+            fid = fopen(errLog, 'w');
+            fprintf(fid, '%s\n', getReport(ME));
+            fclose(fid);
 
-        % --- FREE GPU MEMORY ---
-        try
-            for g = 1:gpuDeviceCount
-                reset(gpuDevice(g));
+            % --- FREE GPU MEMORY ---
+            try
+                for g = 1:gpuDeviceCount
+                    reset(gpuDevice(g));
+                end
+            catch
             end
-        catch
         end
     end
 end

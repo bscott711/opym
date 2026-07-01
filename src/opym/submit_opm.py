@@ -22,7 +22,7 @@ DEFAULTS = {
     "angle": 30.0,
     "xy": 0.136,
     "z": 1.0,
-    "iter": 10,
+    "method": "simple",
 }
 
 
@@ -92,7 +92,15 @@ def main():
         "--psf", type=str, default=None, help="Path to PSF file (Enables Decon)"
     )
     parser.add_argument(
-        "--iter", type=int, default=DEFAULTS["iter"], help="Decon Iterations"
+        "--iter", type=int, default=None, help="Decon Iterations (Defaults: 2 for omw, 25 for simple)"
+    )
+    parser.add_argument(
+        "--method", type=str, default=DEFAULTS["method"], choices=["simple", "omw"], help="Deconvolution method"
+    )
+    
+    # Debug
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable deep profiling in Matlab workers"
     )
 
     args = parser.parse_args()
@@ -139,8 +147,10 @@ def main():
             "crop_box": args.roi if args.roi else None,
             # Decon args
             "run_decon": bool(args.psf),
-            "decon_iter": args.iter,
+            "decon_iter": args.iter if args.iter is not None else (2 if args.method == "omw" else 25),
+            "rl_method": args.method,
             "psf_path": args.psf,
+            "debug": args.debug,
         },
     }
 

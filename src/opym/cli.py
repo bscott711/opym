@@ -85,6 +85,11 @@ def main():
         default=["0", "1", "2", "3"],
         help="Space-separated list of output channels to save (e.g., '0 1 2 3').",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable deep profiling in Matlab workers",
+    )
 
     args = parser.parse_args()
 

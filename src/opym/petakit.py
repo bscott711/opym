@@ -16,8 +16,10 @@ import ipywidgets as widgets
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
 
 # Constants
-PETAKIT_JOBS_DIR = Path.home() / "petakit_jobs"
-QUEUE_DIR = PETAKIT_JOBS_DIR / "queue"
+BASE_DIR = Path("/dev/shm/petakit_jobs")
+QUEUE_DIR = BASE_DIR / "queue"
+DONE_DIR = BASE_DIR / "completed"
+FAIL_DIR = BASE_DIR / "failed"
 
 
 def _ensure_directories():
@@ -191,11 +193,11 @@ def submit_remote_deskew_job(
         "reverse": reverse,
     }
 
-    # Add deconvolution parameters if a PSF is provided
     if psf_path:
         params["run_decon"] = True
         params["psf_path"] = str(psf_path)
-        params["decon_iter"] = n_iters if n_iters is not None else 10
+        params["decon_iter"] = n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
+        params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
 
     payload = {
@@ -211,12 +213,12 @@ def submit_remote_deskew_job(
 def submit_remote_decon_job(
     input_target: Path,
     psf_paths: list[str] | str | Path,
-    iterations: int = 10,
+    iterations: int | None = None,
     gpu_job: bool = True,
     skewed: bool = True,
     result_dir_name: str = "Decon",
     channel_patterns: list[str] | None = None,
-    rl_method: str = "omw",
+    rl_method: str = "simple",
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -232,7 +234,7 @@ def submit_remote_decon_job(
 
     params = {
         "result_dir_name": result_dir_name,
-        "iterations": iterations,
+        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
         "gpu_job": gpu_job,
         "skewed": skewed,
         "rl_method": rl_method,
@@ -242,11 +244,6 @@ def submit_remote_decon_job(
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
 
-    if isinstance(psf_paths, (str, Path)):
-        params["psf_paths"] = [str(psf_paths)]
-    else:
-        params["psf_paths"] = [str(p) for p in psf_paths]
-
     payload = {
         "jobType": "decon",
         "dataDir": str(input_target),
@@ -255,6 +252,110 @@ def submit_remote_decon_job(
     }
 
     return _write_ticket(payload, base_name, "DECON", queue_dir)
+
+
+def _read_psf_dz(psf_path: str | Path) -> float | None:
+    """Reads the PSF's own z-step (microns) from its ImageJ 'spacing' tag.
+
+    Returns None if the tag is absent so the caller can fail loudly instead
+    of silently assuming the PSF's z-step matches the data's z-step.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return None
+
+    try:
+        with tifffile.TiffFile(str(psf_path)) as tf:
+            meta = tf.imagej_metadata
+            if meta and "spacing" in meta:
+                return float(meta["spacing"])
+    except Exception:
+        return None
+    return None
+
+
+def submit_pipeline_job(
+    output_file: Path,
+    shm_path: Path,
+    psf_paths: list[str] | str | Path,
+    z_step_um: float,
+    xy_pixel_size: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+    interp_method: str = "cubic",
+    iterations: int | None = None,
+    rl_method: str = "simple",
+    channel_patterns: list[str] | None = None,
+    z_crop_end: int | None = None,
+    save_zarr: bool = True,
+    debug: bool = False,
+    dz_psf: float | None = None,
+    queue_dir: Path = QUEUE_DIR,
+) -> Path:
+    """
+    Creates a JSON job ticket for the unified GPU pipeline.
+    This job instructs MATLAB to load the temporary file from /dev/shm/,
+    perform Decon -> DSR -> Z-Trim on the GPU, and save the final result to output_file.
+
+    dz_psf : float, optional
+        The z-step (microns) the PSF was acquired at. Required for correct
+        deconvolution, since the PSF's z-sampling generally differs from the
+        raw data's z-step and must be resampled to match before use. If not
+        given explicitly, this is read from the first PSF file's ImageJ
+        'spacing' metadata tag (written by psf_tools/extract_bead_psf.py).
+        Raises ValueError if it cannot be determined either way -- a silent
+        wrong default here previously caused a real decon/DSR regression.
+    """
+    _ensure_directories()
+    output_file = Path(output_file).resolve()
+    data_dir = output_file.parent
+    base_name = output_file.name
+
+    if psf_paths is None:
+        resolved_psf_paths: list[str] = []
+    elif isinstance(psf_paths, (str, Path)):
+        resolved_psf_paths = [str(psf_paths)]
+    else:
+        resolved_psf_paths = [str(p) for p in psf_paths]
+
+    if resolved_psf_paths:
+        if dz_psf is None:
+            dz_psf = _read_psf_dz(resolved_psf_paths[0])
+        if dz_psf is None:
+            raise ValueError(
+                f"dz_psf could not be determined for PSF '{resolved_psf_paths[0]}'. "
+                "Pass dz_psf explicitly, or re-save the PSF with "
+                "psf_tools.extract_bead_psf (which embeds the 'spacing' tag)."
+            )
+
+    params = {
+        "shm_path": str(shm_path),
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+        "interp_method": interp_method,
+        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
+        "rl_method": rl_method,
+        "save_zarr": save_zarr,
+        "debug": debug,
+        "psf_paths": resolved_psf_paths,
+    }
+    if resolved_psf_paths:
+        params["dz_psf"] = dz_psf
+    if z_crop_end is not None:
+        params["z_crop_end"] = int(z_crop_end)
+
+    if channel_patterns:
+        params["channel_patterns"] = channel_patterns
+
+    payload = {
+        "jobType": "pipeline",
+        "dataDir": str(data_dir),
+        "baseName": base_name,
+        "parameters": params,
+    }
+
+    return _write_ticket(payload, base_name, "PIPELINE", queue_dir)
 
 
 # --- BACKWARD COMPATIBILITY ALIASES ---
