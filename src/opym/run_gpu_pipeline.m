@@ -194,10 +194,22 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     end
     clear dsr_gpu;
     
-    % Dispatch background transfer to GPFS so the GPU is immediately released
-    fprintf('[GPU_Pipeline] Dispatching background transfer: %s -> %s\n', shmZarrFn, outDir);
-    cmd = sprintf('nohup bash -c "cp -r %s %s && rm -rf %s" >/dev/null 2>&1 &', shmZarrFn, outDir, shmZarrFn);
-    system(cmd);
+    % Transfer to GPFS. This blocks the GPU-holding worker until the copy
+    % finishes (previously fire-and-forget via `nohup ... &`, which let the
+    % job get marked done -- and the next queued job start, and
+    % consolidation run -- before the copy actually completed, risking a
+    % truncated/partial output file under load). The copy is of a bounded,
+    % per-frame result on local-to-cluster storage, not the original
+    % multi-GB acquisition file, so the added latency here is expected to be
+    % small relative to the multi-second decon/DSR cost above it.
+    fprintf('[GPU_Pipeline] Transferring to GPFS: %s -> %s\n', shmZarrFn, outDir);
+    copy_start = tic;
+    cmd = sprintf('cp -r %s %s && rm -rf %s', shmZarrFn, outDir, shmZarrFn);
+    [copy_status, copy_cmdout] = system(cmd);
+    fprintf('[GPU_Pipeline] Transfer completed in %.2fs\n', toc(copy_start));
+    if copy_status ~= 0
+        error('run_gpu_pipeline: GPFS copy failed (status %d): %s', copy_status, copy_cmdout);
+    end
     
     % Cleanup RAM disk input
     if exist(shm_path, 'file') || exist(shm_path, 'dir')
