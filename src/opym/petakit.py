@@ -254,6 +254,27 @@ def submit_remote_decon_job(
     return _write_ticket(payload, base_name, "DECON", queue_dir)
 
 
+def _read_psf_dz(psf_path: str | Path) -> float | None:
+    """Reads the PSF's own z-step (microns) from its ImageJ 'spacing' tag.
+
+    Returns None if the tag is absent so the caller can fail loudly instead
+    of silently assuming the PSF's z-step matches the data's z-step.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return None
+
+    try:
+        with tifffile.TiffFile(str(psf_path)) as tf:
+            meta = tf.imagej_metadata
+            if meta and "spacing" in meta:
+                return float(meta["spacing"])
+    except Exception:
+        return None
+    return None
+
+
 def submit_pipeline_job(
     output_file: Path,
     shm_path: Path,
@@ -268,17 +289,44 @@ def submit_pipeline_job(
     z_crop_end: int | None = None,
     save_zarr: bool = True,
     debug: bool = False,
+    dz_psf: float | None = None,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
     Creates a JSON job ticket for the unified GPU pipeline.
     This job instructs MATLAB to load the temporary file from /dev/shm/,
     perform Decon -> DSR -> Z-Trim on the GPU, and save the final result to output_file.
+
+    dz_psf : float, optional
+        The z-step (microns) the PSF was acquired at. Required for correct
+        deconvolution, since the PSF's z-sampling generally differs from the
+        raw data's z-step and must be resampled to match before use. If not
+        given explicitly, this is read from the first PSF file's ImageJ
+        'spacing' metadata tag (written by psf_tools/extract_bead_psf.py).
+        Raises ValueError if it cannot be determined either way -- a silent
+        wrong default here previously caused a real decon/DSR regression.
     """
     _ensure_directories()
     output_file = Path(output_file).resolve()
     data_dir = output_file.parent
     base_name = output_file.name
+
+    if psf_paths is None:
+        resolved_psf_paths: list[str] = []
+    elif isinstance(psf_paths, (str, Path)):
+        resolved_psf_paths = [str(psf_paths)]
+    else:
+        resolved_psf_paths = [str(p) for p in psf_paths]
+
+    if resolved_psf_paths:
+        if dz_psf is None:
+            dz_psf = _read_psf_dz(resolved_psf_paths[0])
+        if dz_psf is None:
+            raise ValueError(
+                f"dz_psf could not be determined for PSF '{resolved_psf_paths[0]}'. "
+                "Pass dz_psf explicitly, or re-save the PSF with "
+                "psf_tools.extract_bead_psf (which embeds the 'spacing' tag)."
+            )
 
     params = {
         "shm_path": str(shm_path),
@@ -290,19 +338,15 @@ def submit_pipeline_job(
         "rl_method": rl_method,
         "save_zarr": save_zarr,
         "debug": debug,
+        "psf_paths": resolved_psf_paths,
     }
+    if resolved_psf_paths:
+        params["dz_psf"] = dz_psf
     if z_crop_end is not None:
         params["z_crop_end"] = int(z_crop_end)
 
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
-
-    if psf_paths is None:
-        params["psf_paths"] = []
-    elif isinstance(psf_paths, (str, Path)):
-        params["psf_paths"] = [str(psf_paths)]
-    else:
-        params["psf_paths"] = [str(p) for p in psf_paths]
 
     payload = {
         "jobType": "pipeline",

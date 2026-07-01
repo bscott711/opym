@@ -18,7 +18,11 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     % Core parameters
     ip.addParameter('xyPixelSize', 0.136, @isnumeric);
     ip.addParameter('z_step_um', 0.3, @isnumeric);
-    ip.addParameter('dzPSF', 0.1, @isnumeric);
+    % dzPSF: the PSF's own z-step (um), generally different from the data's
+    % z-step. Required whenever a real PSF is supplied -- see PSF-prep block
+    % below. No safe numeric default exists (a silently-wrong value here is
+    % exactly the bug this parameter was added to fix).
+    ip.addParameter('dzPSF', [], @(x) isempty(x) || isnumeric(x));
     
     % Decon params
     ip.addParameter('DeconIter', 25, @isnumeric);
@@ -54,19 +58,51 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     fprintf('[GPU_Pipeline] Loaded %dx%dx%d\n', size(rawdata,1), size(rawdata,2), size(rawdata,3));
     
     %% 2. PREPARE PSF
+    % The raw PSF is captured at its own z-step (dzPSF), which generally
+    % differs from this dataset's z-step, and must be resampled to the
+    % data's *skewed-space* z-sampling before use -- mirroring exactly what
+    % the validated legacy path (RLdecon.m:101-107,247, via
+    % XR_decon_data_wrapper's 'skewed'/'skewAngle' params) does. Getting
+    % this wrong silently corrupts the deconvolution regardless of whether
+    % the deskew angle itself is correct.
+    if isempty(pr.dzPSF)
+        error(['run_gpu_pipeline: dzPSF is required when a PSF is supplied. ', ...
+            'Pass the PSF''s own z-step (um) explicitly -- see psf_tools/extract_bead_psf.py, ', ...
+            'which embeds it as the ''spacing'' tag on newly-generated PSFs.']);
+    end
+
+    % objectiveScan=false for this galvo-scanned OPM setup -> dz_ratio = sind(angle).
+    % (matches RLdecon.m:101-107 exactly; objectiveScan=true would use dz_ratio=1)
+    if ~pr.objectiveScan
+        dz_ratio = sind(abs(pr.SkewAngle));
+    else
+        dz_ratio = 1;
+    end
+    dz_data_skewed = pr.z_step_um * dz_ratio;
+
+    % Cache key includes PSF file AND the geometry it was resampled for, so
+    % an angle sweep (same PSF file, different SkewAngle per job) can never
+    % silently reuse a PSF resampled for a *different* angle's geometry.
     persistent cached_psf
-    persistent cached_psf_fn
-    
-    if isempty(cached_psf) || ~strcmp(cached_psf_fn, PSFfn)
-        psf = single(readtiff(PSFfn));
+    persistent cached_psf_key
+
+    psf_cache_key = sprintf('%s_%.6f_%.6f', PSFfn, pr.dzPSF, dz_data_skewed);
+
+    if isempty(cached_psf) || ~strcmp(cached_psf_key, psf_cache_key)
+        psf_raw = single(readtiff(PSFfn));
+        % Resample the PSF in Z to match this data's skewed-space z-sampling
+        % (same PetaKit5D utility the legacy/validated path uses).
+        psf = psf_gen_new(psf_raw, pr.dzPSF, dz_data_skewed, 1.5, 'masked');
+        fprintf('[GPU_Pipeline] PSF resampled: dzPSF=%.4f um -> dz_data_skewed=%.4f um (ratio %.3f)\n', ...
+            pr.dzPSF, dz_data_skewed, dz_data_skewed / pr.dzPSF);
         % Normalize
         psf = psf ./ sum(psf(:));
         cached_psf = psf;
-        cached_psf_fn = PSFfn;
+        cached_psf_key = psf_cache_key;
     else
         psf = cached_psf;
     end
-    
+
     % Back projector (simplification for omw)
     % In a true pipeline we should generate this once. For now we use the raw PSF as back projector 
     % or we can just use simplified method if OMW back projector isn't provided.

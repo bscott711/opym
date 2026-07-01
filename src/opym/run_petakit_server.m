@@ -55,6 +55,18 @@ if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
 if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
+% GPU pipeline-job concurrency lock, scoped per server (= per physical GPU,
+% see local_gpu_worker.py's CUDA_VISIBLE_DEVICES assignment per PETAKIT_SERVER_ID).
+envServerId = getenv('PETAKIT_SERVER_ID');
+if isempty(envServerId), envServerId = 'default'; end
+gpu_lock_dir = fullfile(base_queue_dir, 'gpu_locks', sprintf('server_%s', envServerId));
+if ~exist(gpu_lock_dir, 'dir'), mkdir(gpu_lock_dir); end
+% Clear stale locks from a previous crashed/killed server instance.
+staleLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
+for si = 1:numel(staleLocks)
+    delete(fullfile(gpu_lock_dir, staleLocks(si).name));
+end
+
 % --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
@@ -204,16 +216,17 @@ while true
                 val_iter   = safelyGetParam(p, 'iterations', default_iter);
                 val_zarr   = safelyGetParam(p, 'save_zarr', true);
                 val_debug  = safelyGetParam(p, 'debug', false);
-                
+                val_dzPSF  = safelyGetParam(p, 'dz_psf', []);
+
                 if isempty(val_shm)
                     error('No /dev/shm/ path provided for pipeline job.');
                 end
-                
+
                 % outputFn corresponds to dataDir / baseName (which will be a TIF)
                 % The ticket provides dataDir as the target directory (e.g. cell_1/Bot)
                 % and baseName as the file name (e.g. cell_MMStack_Pos0_T0000_C0_bot.tif)
                 outFn = fullfile(job.dataDir, job.baseName);
-                
+
                 % Ensure array is correct
                 if iscell(val_psfs) && ~isempty(val_psfs)
                     psfFn = val_psfs{1};
@@ -222,8 +235,42 @@ while true
                 else
                     psfFn = '';
                 end
-                
-                f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, ...
+
+                % dz_psf is required whenever a PSF (i.e. deconvolution) is
+                % requested -- a silent wrong default here previously caused
+                % the decon step to resample against the wrong z-geometry.
+                if ~isempty(psfFn) && isempty(val_dzPSF)
+                    error(['pipeline job requests deconvolution (psf_paths set) but is ', ...
+                        'missing required "dz_psf" parameter (the PSF''s own z-step, in um).']);
+                end
+
+                % --- GPU CONCURRENCY LOCK ---
+                % Only one 'pipeline' job may run on this server's GPU at a time
+                % (deconvolution + DSR both allocate full-volume GPU buffers;
+                % running >1 concurrently reliably OOMs the device). Each server
+                % process owns exactly one physical GPU (see local_gpu_worker.py),
+                % so this lock is scoped per-server via PETAKIT_SERVER_ID.
+                maxGpuJobs = str2double(getenv('PETAKIT_MAX_GPU_PIPELINE_JOBS'));
+                if isnan(maxGpuJobs)
+                    maxGpuJobs = 1;
+                end
+                lockAcquired = false;
+                while ~lockAcquired
+                    existingLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
+                    if numel(existingLocks) < maxGpuJobs
+                        lockName = fullfile(gpu_lock_dir, [currentFile '.lock']);
+                        lfid = fopen(lockName, 'w');
+                        if lfid > 0
+                            fclose(lfid);
+                            lockAcquired = true;
+                        end
+                    end
+                    if ~lockAcquired
+                        pause(1 + rand());
+                    end
+                end
+
+                f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, gpu_lock_dir, currentFile, ...
                     'xyPixelSize', val_xyPix, ...
                     'z_step_um', val_zStep, ...
                     'DeconIter', val_iter, ...
@@ -231,7 +278,8 @@ while true
                     'SkewAngle', val_angle, ...
                     'interpMethod', val_interp, ...
                     'saveZarr', val_zarr, ...
-                    'debug', val_debug);
+                    'debug', val_debug, ...
+                    'dzPSF', val_dzPSF);
 
             case 'decon'
                 % --- DECONVOLUTION JOB ---

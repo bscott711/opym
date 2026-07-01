@@ -11,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+
 
 class OutputFormat(str, Enum):
     """Defines the allowed output formats."""
@@ -106,6 +108,26 @@ def parse_roi_string(roi_str: str) -> tuple[slice, slice]:
     x_start, x_stop = map(int, x_str.strip().split(":"))
 
     return (slice(y_start, y_stop), slice(x_start, x_stop))
+
+
+def orient_zyx_for_dsr(volume: np.ndarray) -> np.ndarray:
+    """
+    Reorders a (Z, Y, X) numpy crop into the (ny, nx, nz) layout PetaKit5D's
+    deskew/rotate functions expect via their `[ny, nx, nz] = size(vol)`
+    convention: ny is the rotation-invariant lateral axis (this galvo-scanned
+    OPM's coverslip-long axis, i.e. raw X), nx is the axis that drifts
+    frame-to-frame as Z changes (raw Y), and nz is the frame count (raw Z).
+
+    This mirrors the rot90() the legacy MATLAB BigTiff cropper applies by
+    default (see run_bigtiff_cropper.m, gated by submit_remote_crop_job's
+    rotate=True) before handing data to XR_deskewRotateFrame.m. The
+    GPU-unified pipeline instead stages raw (Z, Y, X) numpy crops straight to
+    /dev/shm with no equivalent correction, which silently shears/rotates the
+    wrong spatial axis -- confirmed by reproducing deskewRotateFrame3D.m's
+    own outSize formula against a live job's actual output shape.
+    """
+    rotated = np.rot90(volume, k=1, axes=(-2, -1))
+    return np.moveaxis(rotated, 0, -1)
 
 
 def scan_channel_patterns(directory: Path) -> str:
