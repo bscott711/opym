@@ -159,12 +159,9 @@ def process_dataset(
                     for z in range(Z):
                         # Iterate over excitations (pairs of cameras)
                         for exc in range(n_excitations):
-                            # Calculate input channel indices for this excitation.
-                            # Interleaved layout [cam0_exc0, cam1_exc0, cam0_exc1, ...],
-                            # matching the validated production convention in
-                            # run_pipeline_cli.py's get_extraction_plan() (i*2+0/i*2+1).
-                            cam0_idx = exc * 2
-                            cam1_idx = exc * 2 + 1
+                            # Calculate input channel indices for this excitation
+                            cam0_idx = exc
+                            cam1_idx = exc + n_excitations
 
                             # Base output index (e.g., 0 for Exc0, 4 for Exc1)
                             out_base = exc * 4
