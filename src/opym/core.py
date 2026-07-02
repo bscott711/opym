@@ -159,7 +159,13 @@ def process_dataset(
                     for z in range(Z):
                         # Iterate over excitations (pairs of cameras)
                         for exc in range(n_excitations):
-                            # Calculate input channel indices for this excitation
+                            # Calculate input channel indices for this excitation.
+                            # Block layout [cam0_exc0, cam0_exc1, ..., cam1_exc0, ...]:
+                            # this ZARR branch reads from a store already regrouped
+                            # per-channel during an earlier processing step -- NOT
+                            # the same raw layout the TIFF-series branch below reads
+                            # (that one comes straight off the camera, interleaved).
+                            # Confirmed intentional; don't "fix" these to match.
                             cam0_idx = exc
                             cam1_idx = exc + n_excitations
 
@@ -260,6 +266,9 @@ def process_dataset(
                 for z in range(Z):
                     # Iterate Excitations
                     for exc in range(n_excitations):
+                        # Interleaved layout [cam0_exc0, cam1_exc0, cam0_exc1, ...]
+                        # -- this branch reads the raw camera stream directly, unlike
+                        # the ZARR branch above (see its comment). Confirmed intentional.
                         cam0_idx = exc * 2
                         cam1_idx = exc * 2 + 1
                         out_base = exc * 4
