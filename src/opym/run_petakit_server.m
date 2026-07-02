@@ -292,6 +292,87 @@ while true
                     'debug', val_debug, ...
                     'dzPSF', val_dzPSF);
 
+            case 'pipeline_batch'
+                % --- UNIFIED GPU PIPELINE BATCH JOB ---
+                % Same per-frame decon->DSR->zarr-save logic as the 'pipeline'
+                % case above, but N (shm_path, output_file) pairs that share
+                % one PSF are processed inside a single parfeval'd call, so
+                % the GPU concurrency lock below (and the PSF/OTF persistent
+                % caches in run_gpu_pipeline.m / decon_lucy_function.m) are
+                % only paid for once per batch instead of once per frame.
+                % See the performance plan's Phase 2 for the rationale.
+                logMsg('         Type: Unified GPU Pipeline Batch (RAM Disk)');
+                val_items  = safelyGetParam(p, 'items', []);
+                val_psfs   = safelyGetParam(p, 'psf_paths', {});
+                val_xyPix  = safelyGetParam(p, 'xy_pixel_size', 0.136);
+                val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
+                val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
+                val_interp = safelyGetParam(p, 'interp_method', 'cubic');
+                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                if strcmp(val_method, 'omw')
+                    default_iter = 2;
+                else
+                    default_iter = 25;
+                end
+                val_iter   = safelyGetParam(p, 'iterations', default_iter);
+                val_zarr   = safelyGetParam(p, 'save_zarr', true);
+                val_debug  = safelyGetParam(p, 'debug', false);
+                val_dzPSF  = safelyGetParam(p, 'dz_psf', []);
+
+                if isempty(val_items)
+                    error('pipeline_batch job requires a non-empty "items" array.');
+                end
+
+                % Ensure array is correct
+                if iscell(val_psfs) && ~isempty(val_psfs)
+                    psfFn = val_psfs{1};
+                elseif isstring(val_psfs) || ischar(val_psfs)
+                    psfFn = val_psfs;
+                else
+                    psfFn = '';
+                end
+
+                if ~isempty(psfFn) && isempty(val_dzPSF)
+                    error(['pipeline_batch job requests deconvolution (psf_paths set) but is ', ...
+                        'missing required "dz_psf" parameter (the PSF''s own z-step, in um).']);
+                end
+
+                % --- GPU CONCURRENCY LOCK (one lock for the whole batch) ---
+                % Identical acquire mechanism to the 'pipeline' case -- same
+                % gpu_lock_dir, same *.lock-file counting against
+                % PETAKIT_MAX_GPU_PIPELINE_JOBS -- just held for the whole
+                % batch instead of re-acquired per frame.
+                maxGpuJobs = str2double(getenv('PETAKIT_MAX_GPU_PIPELINE_JOBS'));
+                if isnan(maxGpuJobs)
+                    maxGpuJobs = 1;
+                end
+                lockAcquired = false;
+                while ~lockAcquired
+                    existingLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
+                    if numel(existingLocks) < maxGpuJobs
+                        lockName = fullfile(gpu_lock_dir, [currentFile '.lock']);
+                        lfid = fopen(lockName, 'w');
+                        if lfid > 0
+                            fclose(lfid);
+                            lockAcquired = true;
+                        end
+                    end
+                    if ~lockAcquired
+                        pause(1 + rand());
+                    end
+                end
+
+                f = parfeval(pool, @run_gpu_pipeline_batch_async, 0, activePath, done_dir, fail_dir, val_items, psfFn, gpu_lock_dir, currentFile, ...
+                    'xyPixelSize', val_xyPix, ...
+                    'z_step_um', val_zStep, ...
+                    'DeconIter', val_iter, ...
+                    'RLMethod', val_method, ...
+                    'SkewAngle', val_angle, ...
+                    'interpMethod', val_interp, ...
+                    'saveZarr', val_zarr, ...
+                    'debug', val_debug, ...
+                    'dzPSF', val_dzPSF);
+
             case 'decon'
                 % --- DECONVOLUTION JOB ---
                 logMsg('         Type: Deconvolution');
@@ -444,7 +525,7 @@ while true
                 end
         end % End switch jobType
 
-        if ~strcmp(jobType, 'pipeline')
+        if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(done_dir, currentFile));
             logMsg('[Server] <<< Finished: %s', currentFile);
 
@@ -461,7 +542,7 @@ while true
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
-        if ~strcmp(jobType, 'pipeline')
+        if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(fail_dir, currentFile));
             errLog = fullfile(fail_dir, [currentFile '.log']);
             fid = fopen(errLog, 'w');
