@@ -115,7 +115,7 @@ def submit_remote_deskew_job(
     z_stage_scan: bool = False,
     reverse: bool = True,
     gpu_decon: bool = False,
-    crop_was_rotated: bool = False,
+    rl_method: str = "simple",
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -125,8 +125,8 @@ def submit_remote_deskew_job(
     input_axis_order : str, default 'yxz'
         Axis order of input data. Must match PetaKit5D conventions.
         'yxz' = MATLAB cropper output (rows=Y, cols=X, planes=Z).
-        Automatically set to 'xyz' if crop_was_rotated=True, because
-        rot90 in MATLAB transposes dim1/dim2 (Y↔X).
+        Always forced to 'yxz' below regardless of the value passed in --
+        see the comment at the assignment for why.
     output_axis_order : str, default 'yxz'
         Desired axis order of output data.
     objective_scan : bool, default False
@@ -140,10 +140,10 @@ def submit_remote_deskew_job(
     gpu_decon : bool, default False
         Use GPU for deconvolution (requires CUDA-capable GPU on the
         processing node).
-    crop_was_rotated : bool, default False
-        If True, the crop step applied rot90 to match LLSM visual
-        orientation. This swaps Y↔X in the output TIFFs, so
-        input_axis_order is auto-corrected to 'xyz'.
+    rl_method : str, default 'simple'
+        Richardson-Lucy variant for the optional decon step. Only used
+        when psf_path is given; also affects the default iteration count
+        (2 for 'omw', 25 otherwise) unless n_iters overrides it.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
