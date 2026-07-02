@@ -55,8 +55,18 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
 
     try:
         while True:
-            # Check if there are any JSON files in the queue
-            if any(QUEUE_DIR.glob("*.json")):
+            # Check if there are any *claimable* JSON tickets in the queue.
+            # Path.glob("*.json") also matches ".active_*.json" files (an
+            # in-progress or orphaned ticket a MATLAB server already claimed
+            # via movefile) -- unlike the shell, pathlib doesn't hide
+            # dotfiles. run_petakit_server.m explicitly excludes those
+            # (~startsWith(name, '.')) when deciding what it can pick up, so
+            # mirror that here: an orphaned .active_ ticket left behind by a
+            # crashed server shouldn't make the watchdog spin up fresh
+            # servers that will just idle-timeout without touching it.
+            if any(
+                p for p in QUEUE_DIR.glob("*.json") if not p.name.startswith(".")
+            ):
                 print("\n🚀 Jobs detected. Spinning up PetaKit Matlab Server...")
 
                 env1 = env.copy()
