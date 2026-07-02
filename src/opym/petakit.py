@@ -358,6 +358,89 @@ def submit_pipeline_job(
     return _write_ticket(payload, base_name, "PIPELINE", queue_dir)
 
 
+def submit_pipeline_batch_job(
+    items: list[dict],
+    psf_paths: list[str] | str | Path,
+    z_step_um: float,
+    xy_pixel_size: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+    interp_method: str = "cubic",
+    iterations: int | None = None,
+    rl_method: str = "simple",
+    save_zarr: bool = True,
+    debug: bool = False,
+    dz_psf: float | None = None,
+    ticket_label: str = "batch",
+    queue_dir: Path = QUEUE_DIR,
+) -> Path:
+    """
+    Creates a JSON job ticket for the pipeline_batch job type (see
+    run_petakit_server.m / run_gpu_pipeline_batch_async.m). Bundles N
+    (shm_path, output_file) pairs that share one PSF into a single MATLAB
+    call, so the GPU concurrency lock and dispatch overhead are paid once
+    per batch instead of once per frame -- each item still runs through the
+    exact same run_gpu_pipeline() call submit_pipeline_job() would produce
+    for it individually; only dispatch granularity changes.
+
+    items : list of {"shm_path": str, "output_file": str} dicts. All items
+        must share the same PSF/geometry passed to this call -- that's the
+        batchability precondition (keeps the PSF/OTF persistent caches in
+        run_gpu_pipeline.m / decon_lucy_function.m warm across the batch).
+    dz_psf : see submit_pipeline_job -- same resolution/validation logic.
+    """
+    _ensure_directories()
+    if not items:
+        raise ValueError("submit_pipeline_batch_job requires a non-empty items list.")
+
+    if psf_paths is None:
+        resolved_psf_paths: list[str] = []
+    elif isinstance(psf_paths, (str, Path)):
+        resolved_psf_paths = [str(psf_paths)]
+    else:
+        resolved_psf_paths = [str(p) for p in psf_paths]
+
+    if resolved_psf_paths:
+        if dz_psf is None:
+            dz_psf = _read_psf_dz(resolved_psf_paths[0])
+        if dz_psf is None:
+            raise ValueError(
+                f"dz_psf could not be determined for PSF '{resolved_psf_paths[0]}'. "
+                "Pass dz_psf explicitly, or re-save the PSF with "
+                "psf_tools.extract_bead_psf (which embeds the 'spacing' tag)."
+            )
+
+    resolved_items = [
+        {"shm_path": str(item["shm_path"]), "output_file": str(item["output_file"])} for item in items
+    ]
+
+    params = {
+        "items": resolved_items,
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+        "interp_method": interp_method,
+        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
+        "rl_method": rl_method,
+        "save_zarr": save_zarr,
+        "debug": debug,
+        "psf_paths": resolved_psf_paths,
+    }
+    if resolved_psf_paths:
+        params["dz_psf"] = dz_psf
+
+    # dataDir/baseName aren't consumed for pipeline_batch's per-item output
+    # paths (those come from items[i]["output_file"]) -- kept only as a
+    # human-readable ticket label, matching the other job types' schema.
+    payload = {
+        "jobType": "pipeline_batch",
+        "dataDir": str(Path(resolved_items[0]["output_file"]).parent),
+        "baseName": ticket_label,
+        "parameters": params,
+    }
+
+    return _write_ticket(payload, ticket_label, "PIPELINEBATCH", queue_dir)
+
+
 # --- BACKWARD COMPATIBILITY ALIASES ---
 def run_petakit_processing(
     processed_dir_path: Path,
