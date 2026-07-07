@@ -27,6 +27,31 @@ def _ensure_directories():
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _apply_omw_params(
+    params: dict,
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
+) -> dict:
+    """Inject OMW back-projector knobs into a ticket ``params`` dict, but only
+    the ones explicitly provided.
+
+    These are consumed by run_petakit_server.m and forwarded to PetaKit5D's
+    ``omw_backprojector_generation`` (used only when ``rl_method='omw'``).
+    Leaving a value as None omits its key entirely, so non-omw jobs -- and the
+    historical stock-default behavior -- are unchanged. Keys use the ticket's
+    snake_case convention; the server maps them to wienerAlpha / OTFCumThresh /
+    hannWinBounds.
+    """
+    if wiener_alpha is not None:
+        params["wiener_alpha"] = float(wiener_alpha)
+    if otf_cum_thresh is not None:
+        params["otf_cum_thresh"] = float(otf_cum_thresh)
+    if hann_win_bounds is not None:
+        params["hann_win_bounds"] = [float(v) for v in hann_win_bounds]
+    return params
+
+
 def submit_remote_crop_job(
     base_file: Path,
     top_roi: tuple[slice, slice] | None,
@@ -116,6 +141,9 @@ def submit_remote_deskew_job(
     reverse: bool = True,
     gpu_decon: bool = False,
     rl_method: str = "simple",
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -199,6 +227,7 @@ def submit_remote_deskew_job(
         params["decon_iter"] = n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
         params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
+        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
 
     payload = {
         "jobType": "deskew",
@@ -219,6 +248,9 @@ def submit_remote_decon_job(
     result_dir_name: str = "Decon",
     channel_patterns: list[str] | None = None,
     rl_method: str = "simple",
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -240,6 +272,7 @@ def submit_remote_decon_job(
         "rl_method": rl_method,
         "save_16bit": True,
     }
+    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
 
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
@@ -290,6 +323,9 @@ def submit_pipeline_job(
     save_zarr: bool = True,
     debug: bool = False,
     dz_psf: float | None = None,
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
@@ -342,6 +378,7 @@ def submit_pipeline_job(
     }
     if resolved_psf_paths:
         params["dz_psf"] = dz_psf
+        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
     if z_crop_end is not None:
         params["z_crop_end"] = int(z_crop_end)
 
@@ -370,6 +407,9 @@ def submit_pipeline_batch_job(
     save_zarr: bool = True,
     debug: bool = False,
     dz_psf: float | None = None,
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
     ticket_label: str = "batch",
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
@@ -427,6 +467,7 @@ def submit_pipeline_batch_job(
     }
     if resolved_psf_paths:
         params["dz_psf"] = dz_psf
+        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
 
     # dataDir/baseName aren't consumed for pipeline_batch's per-item output
     # paths (those come from items[i]["output_file"]) -- kept only as a
