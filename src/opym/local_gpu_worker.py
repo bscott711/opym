@@ -21,6 +21,25 @@ OPYM_DIR = Path(__file__).parent.resolve()
 BASE_DIR = Path("/dev/shm/petakit_jobs")
 QUEUE_DIR = BASE_DIR / "queue"
 
+# If both Matlab servers exit nonzero (e.g. a license checkout failure kills
+# Matlab before it ever reaches run_petakit_server.m), retrying on the normal
+# short poll_interval would hot-loop launching Matlab -- and re-attempting a
+# license checkout -- forever until whatever's broken gets fixed. Back off
+# exponentially instead, capped, so a stuck license degrades gracefully
+# rather than hammering the license server and spamming logs.
+FAILURE_BACKOFF_BASE_SEC = 15
+FAILURE_BACKOFF_CAP_SEC = 300
+
+
+def _next_backoff_sec(
+    consecutive_failures: int,
+    base: float = FAILURE_BACKOFF_BASE_SEC,
+    cap: float = FAILURE_BACKOFF_CAP_SEC,
+) -> float:
+    """Seconds to wait before the next launch attempt, given how many
+    consecutive attempts have failed (1 = the first failure)."""
+    return min(base * (2 ** (consecutive_failures - 1)), cap)
+
 
 def _ensure_directories():
     """Ensures all necessary job directories exist."""
@@ -45,6 +64,10 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     print(f" 📂 Queue Directory: {QUEUE_DIR}")
     print(f" ⏱️  Idle Timeout:    {idle_timeout_sec} seconds")
     print(f" 🔍 Polling Rate:    Every {poll_interval} seconds")
+    print(
+        f" ⚠️  Failure Backoff: {FAILURE_BACKOFF_BASE_SEC}s-{FAILURE_BACKOFF_CAP_SEC}s "
+        "(exponential, if Matlab exits with an error)"
+    )
     print(f" 🔧 Backend Script:  {OPYM_DIR}/run_petakit_server.m")
     print("=" * 60)
     print("👀 Listening for incoming jobs...\n")
@@ -52,6 +75,8 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     # Pass the timeout to Matlab via environment variables
     env = os.environ.copy()
     env["PETAKIT_IDLE_TIMEOUT"] = str(idle_timeout_sec)
+
+    consecutive_failures = 0
 
     try:
         while True:
@@ -96,6 +121,29 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
                 # their queues AND their timeouts
                 p1.wait()
                 p2.wait()
+
+                # run_petakit_server.m wraps all per-job work in try/catch and
+                # exits 0 on a clean idle-timeout `break`, so a nonzero exit
+                # code here only happens when Matlab itself failed to get
+                # running (license checkout, verify_mex(), a top-level crash)
+                # -- never a job-level failure. Treat that as a launch failure
+                # and back off instead of relaunching on the normal short
+                # poll_interval.
+                if p1.returncode != 0 or p2.returncode != 0:
+                    consecutive_failures += 1
+                    backoff = _next_backoff_sec(consecutive_failures)
+                    print(
+                        f"\n❌ Matlab server(s) exited with an error "
+                        f"(server1={p1.returncode}, server2={p2.returncode}) -- "
+                        "Matlab likely failed to start (check the log above for a "
+                        "license/module error). The queued ticket(s) are untouched "
+                        f"and will be retried automatically. Backing off {backoff:.0f}s "
+                        f"before the next attempt (consecutive failures: {consecutive_failures})."
+                    )
+                    time.sleep(backoff)
+                    continue
+
+                consecutive_failures = 0
 
                 print(
                     f"🛑 Matlab server spun down after {idle_timeout_sec}s "
