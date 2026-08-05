@@ -27,7 +27,8 @@ from pathlib import Path
 
 try:
     import matlab.engine  # noqa: F401
-except ImportError:
+except Exception:  # noqa: BLE001 - without `module load matlab/R2024b`, matlab.engine's
+    # own __init__.py raises a bare OSError (missing GLIBCXX_3.4.30), not ImportError.
     pass
 
 import numpy as np
@@ -42,8 +43,12 @@ from test_gpu_pipeline_regression import (
     _top_peak_coords,
     _write_shm_zarr,
     _wait_for_zarr,
-    matlab_engine,  # noqa: F401 -- imported for pytest fixture discovery
 )
+
+# `matlab_engine` is no longer imported here: it now lives in conftest.py,
+# so pytest auto-discovers it for every test module in this directory
+# without needing a cross-module import (that only worked for a fixture
+# defined in a plain test file, which conftest.py placement supersedes).
 
 pytestmark = pytest.mark.gpu
 

@@ -144,6 +144,7 @@ def submit_remote_deskew_job(
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
+    save_mip: bool = False,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -172,6 +173,13 @@ def submit_remote_deskew_job(
         Richardson-Lucy variant for the optional decon step. Only used
         when psf_path is given; also affects the default iteration count
         (2 for 'omw', 25 otherwise) unless n_iters overrides it.
+    save_mip : bool, default False
+        Have PetaKit5D write a per-timepoint Z-MIP TIFF (to
+        ``<dsrDirName>/MIPs/``) alongside the DS/DSR output. Kept opt-in
+        (default False, matching every caller's behavior before this
+        parameter existed) so existing callers (batch.py, the PSF-tuning
+        scripts, notebooks) are unaffected; only the bulk no-decon backfill
+        driver passes True.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
@@ -219,6 +227,7 @@ def submit_remote_deskew_job(
         "objective_scan": objective_scan,
         "z_stage_scan": z_stage_scan,
         "reverse": reverse,
+        "save_mip": save_mip,
     }
 
     if psf_path:

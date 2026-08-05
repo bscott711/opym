@@ -14,6 +14,7 @@ from .dataloader import (
     load_llsm_tiff_series,
     load_tiff_series,
 )
+from .discovery import LeafDataset, discover_leaf_datasets, is_leaf_dataset_dir
 from .metadata import create_processing_log, parse_timestamps, parse_z_step
 from .petakit import (
     monitor_job_background,
@@ -23,6 +24,8 @@ from .petakit import (
     submit_remote_deskew_job,
     wait_for_job,
 )
+from .registry import StatusRegistry
+from .roi_detect import auto_detect_rois, compute_reference_projection
 from .roi_utils import (
     align_rois,
     load_rois_from_log,
@@ -89,4 +92,11 @@ __all__ = [
     "PSFExtractor",
     "PSFAverager",
     "DeconvolutionViewer",
+    # Bulk backfill support (discovery, ROI auto-detect, status registry)
+    "LeafDataset",
+    "discover_leaf_datasets",
+    "is_leaf_dataset_dir",
+    "compute_reference_projection",
+    "auto_detect_rois",
+    "StatusRegistry",
 ]

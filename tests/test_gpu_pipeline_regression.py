@@ -37,9 +37,14 @@ from pathlib import Path
 # matlab.engine must be imported before numpy/zarr: its native engine library
 # needs a newer libstdc++ than the one bundled in numpy/zarr's C-extension
 # wheels, and whichever loads first wins symbol resolution for the process.
+# Broad except: without `module load matlab/R2024b` active, this doesn't
+# just fail with ImportError -- matlab.engine's own __init__.py raises a
+# bare OSError (missing GLIBCXX_3.4.30) that would otherwise abort
+# collection of this whole module instead of letting the `matlab_engine`
+# fixture skip individual tests gracefully.
 try:
     import matlab.engine  # noqa: F401
-except ImportError:
+except Exception:  # noqa: BLE001
     pass
 
 import numpy as np
@@ -52,9 +57,6 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GOLDEN_DIR = FIXTURES_DIR / "golden"
 PSF_PATH = FIXTURES_DIR / "psf" / "averaged_psf.tif"
 SYNTHETIC_RAW_PATH = FIXTURES_DIR / "synthetic_raw_volume.npy"
-
-OPYM_SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "opym"
-PETAKIT_ROOT = Path(os.environ.get("PETAKIT_ROOT", "/cm/shared/apps_local/petakit5d"))
 
 # Must match the intended production defaults -- see the performance plan's
 # Phase 1.4: DeconIter is 25 for RLMethod='simple', not the buggy 10 that
@@ -71,40 +73,6 @@ PIPELINE_KWARGS = dict(
 )
 
 N_TOP_PEAKS = 4  # matches len(BEAD_CENTERS) in generate_synthetic_fixture.py
-
-
-@pytest.fixture(scope="module")
-def matlab_engine():
-    try:
-        import matlab.engine
-    except ImportError:
-        pytest.skip(
-            "matlab.engine not importable -- run with bioimaging's venv "
-            "(matlabengine is a declared dependency there, not in opym_local's own .venv)."
-        )
-
-    try:
-        eng = matlab.engine.start_matlab("-nodisplay")
-    except Exception as e:  # noqa: BLE001 - report exact MATLAB engine error to the user
-        pytest.skip(f"Could not start MATLAB engine (is `module load matlab/R2024b` active?): {e}")
-
-    try:
-        eng.gpuDevice(1, nargout=1)
-    except Exception as e:  # noqa: BLE001
-        eng.quit()
-        pytest.skip(f"No usable CUDA GPU for matlab.engine: {e}")
-
-    eng.addpath(str(OPYM_SRC_DIR), nargout=0)
-    eng.addpath(str(OPYM_SRC_DIR / "patches"), nargout=0)
-    if eng.exist("XR_deskew_rotate_data_wrapper", "file", nargout=1) == 0:
-        setup_m = PETAKIT_ROOT / "setup.m"
-        if not setup_m.exists():
-            eng.quit()
-            pytest.skip(f"PetaKit5D setup.m not found at {setup_m}")
-        eng.run(str(setup_m), nargout=0)
-
-    yield eng
-    eng.quit()
 
 
 def _write_shm_zarr(path: Path, array: np.ndarray) -> None:
