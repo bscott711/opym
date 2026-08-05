@@ -22,12 +22,15 @@ from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
-    dataset_key      TEXT PRIMARY KEY,
-    root             TEXT NOT NULL,
-    leaf_dir         TEXT NOT NULL,
-    master_file      TEXT NOT NULL,
-    has_legacy_decon INTEGER NOT NULL DEFAULT 0,
-    discovered_at    TEXT NOT NULL
+    dataset_key         TEXT PRIMARY KEY,
+    root                TEXT NOT NULL,
+    leaf_dir            TEXT NOT NULL,
+    master_file         TEXT NOT NULL,
+    has_legacy_decon    INTEGER NOT NULL DEFAULT 0,
+    discovered_at       TEXT NOT NULL,
+    signal_flag         TEXT,
+    expected_timepoints INTEGER,
+    actual_timepoints   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS stage_status (
@@ -49,6 +52,23 @@ CREATE TABLE IF NOT EXISTS stage_status (
 STAGES = ("roi_detect", "crop_zarr", "crop_tiff", "deskew", "mip_encode")
 
 
+# Columns added after the original schema shipped -- `CREATE TABLE IF NOT
+# EXISTS` is a no-op against an already-existing table, so a registry
+# created before this change needs an explicit migration to pick them up.
+_NEW_DATASET_COLUMNS = {
+    "signal_flag": "TEXT",
+    "expected_timepoints": "INTEGER",
+    "actual_timepoints": "INTEGER",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(datasets)")}
+    for col, col_type in _NEW_DATASET_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE datasets ADD COLUMN {col} {col_type}")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -66,6 +86,8 @@ class StatusRegistry:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(SCHEMA)
+        self._conn.commit()
+        _migrate_schema(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -103,6 +125,28 @@ class StatusRegistry:
                    ON CONFLICT(dataset_key) DO UPDATE SET
                        has_legacy_decon = excluded.has_legacy_decon""",
                 (dataset_key, root, leaf_dir, master_file, int(has_legacy_decon), _now()),
+            )
+
+    def set_triage(
+        self,
+        dataset_key: str,
+        *,
+        signal_flag: str,
+        expected_timepoints: int | None = None,
+        actual_timepoints: int | None = None,
+    ) -> None:
+        """Records the cheap upfront signal-presence check + frame-count
+        info gathered during `roi_detect` -- lets the bulk orchestrator
+        deprioritize likely-empty/aborted datasets (see `backfill/cli.py`'s
+        triage phase) and lets the dashboard show a frame-count sanity badge
+        (e.g. "1/100" for an acquisition that aborted after one timepoint).
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """UPDATE datasets
+                       SET signal_flag=?, expected_timepoints=?, actual_timepoints=?
+                     WHERE dataset_key=?""",
+                (signal_flag, expected_timepoints, actual_timepoints, dataset_key),
             )
 
     def start_stage(self, dataset_key: str, stage: str, *, ticket_path: str | None = None) -> None:

@@ -75,6 +75,23 @@ def parse_z_step(metadata_file: Path, default_z_step: float = 1.0) -> float:
     return default_z_step
 
 
+def parse_expected_timepoints(metadata_file: Path, default: int = 1) -> int:
+    """Reads the acquisition's *configured* timepoint count from
+    AcqSettings.txt (`numTimepoints`, gated by `useTimepoints`) -- compared
+    against the raw file's own *actual* timepoint count (from its array
+    shape), this flags incomplete/aborted acquisitions (see
+    `backfill/pipeline.py`'s triage step in the bioimaging repo).
+    """
+    spim_settings = _get_spim_settings(metadata_file)
+    if not spim_settings.get("useTimepoints", False):
+        return 1
+    n = spim_settings.get("numTimepoints")
+    try:
+        return int(n) if n else default
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
     """
     Parses the Micro-Manager metadata file to extract the
