@@ -351,7 +351,7 @@ def run_processing_job(
     top_roi: tuple[slice, slice] | None,
     bottom_roi: tuple[slice, slice] | None,
     output_format: OutputFormat,
-    channels_to_output: list[int],
+    channels_to_output: list[int] | None = None,
     cli_log_file: Path = Path("opm_roi_log.json"),
     rotate_90: bool = False,
 ):
@@ -365,12 +365,18 @@ def run_processing_job(
     4. Running the core `process_dataset` function.
     5. Creating the metadata log.
     6. Saving ROIs to the central CLI log.
+
+    `channels_to_output=None` means "auto-detect from the raw file's real
+    channel-axis size" (same contract as `process_dataset`'s own fallback,
+    resolved once here -- see below -- so `process_dataset` and
+    `create_processing_log` never disagree about which channels were
+    actually exported).
     """
     print("--- Starting Processing Job ---")
 
     if top_roi is None and bottom_roi is None:
         raise ValueError("At least one ROI (top_roi or bottom_roi) must be provided.")
-    if not channels_to_output:
+    if channels_to_output is not None and not channels_to_output:
         raise ValueError("channels_to_output list cannot be empty.")
 
     paths = derive_paths(base_file, output_format)
@@ -378,7 +384,29 @@ def run_processing_job(
     if not paths.base_file.exists():
         raise FileNotFoundError(f"Input file not found: {paths.base_file}")
     if not paths.metadata_file.exists():
-        raise FileNotFoundError(f"Metadata file not found: {paths.metadata_file}")
+        print(
+            f"Warning: Metadata file not found: {paths.metadata_file}. "
+            "Z-step, timepoint count, and timestamps will fall back to "
+            "defaults instead of real acquisition metadata."
+        )
+
+    if channels_to_output is None:
+        # Resolved here (not left to process_dataset's own fallback) so
+        # create_processing_log -- which has its own, independent hardcoded
+        # fallback -- logs the SAME channel list process_dataset actually
+        # exports, rather than silently disagreeing with it.
+        with tifffile.TiffFile(paths.base_file) as tif:
+            c_axis_size = tif.series[0].shape[-3]  # (Z,C,Y,X) or (T,Z,C,Y,X)
+        if c_axis_size % 2 != 0:
+            raise ValueError(
+                "Expected an even number of channels (pairs of cameras), "
+                f"but found C={c_axis_size}."
+            )
+        channels_to_output = list(range((c_axis_size // 2) * 4))
+        print(
+            f"channels_to_output not provided -- derived {channels_to_output} "
+            "from raw file shape."
+        )
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 

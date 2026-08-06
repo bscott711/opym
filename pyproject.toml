@@ -43,6 +43,7 @@ dependencies = [
     "scikit-learn",
     "PyPetaKit5D",
     "imagecodecs",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

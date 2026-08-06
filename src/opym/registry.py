@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS stage_status (
 # should only ever use these.
 STAGES = ("roi_detect", "crop_zarr", "crop_tiff", "deskew", "mip_encode")
 
+# Valid `signal_flag` values (also plain TEXT, no CHECK constraint, for the
+# same forward-compatibility reason). 'corrupt' marks a raw file that is
+# fundamentally unreadable (truncated/corrupted acquisition, or corrupted
+# TIFF metadata inside a third-party library's own parser) -- distinct from
+# 'dud' (readable, just no detectable signal) so the dashboard can tell
+# "nothing will ever come of this" from "weak signal, still processed".
+SIGNAL_FLAGS = ("ok", "dud", "unknown", "corrupt")
+
 
 # Columns added after the original schema shipped -- `CREATE TABLE IF NOT
 # EXISTS` is a no-op against an already-existing table, so a registry

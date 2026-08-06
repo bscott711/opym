@@ -14,8 +14,24 @@ from .dataloader import (
     load_llsm_tiff_series,
     load_tiff_series,
 )
-from .discovery import LeafDataset, discover_leaf_datasets, is_leaf_dataset_dir
-from .metadata import create_processing_log, parse_timestamps, parse_z_step
+from .discovery import (
+    KIND_OME_TIF,
+    KIND_ZARR_PRECROPPED,
+    LeafDataset,
+    discover_leaf_datasets,
+    find_channel_zarr_stores,
+    is_leaf_dataset_dir,
+    is_zarr_leaf_dataset_dir,
+)
+from .metadata import (
+    create_processing_log,
+    parse_expected_timepoints,
+    parse_mda_settings,
+    parse_timestamps,
+    parse_z_step,
+    parse_zarr_expected_timepoints,
+    parse_zarr_z_step,
+)
 from .petakit import (
     monitor_job_background,
     run_petakit_processing,
@@ -99,4 +115,13 @@ __all__ = [
     "compute_reference_projection",
     "auto_detect_rois",
     "StatusRegistry",
+    # Pre-cropped zarr acquisitions (newer pymmcore-based MDA writer)
+    "KIND_OME_TIF",
+    "KIND_ZARR_PRECROPPED",
+    "is_zarr_leaf_dataset_dir",
+    "find_channel_zarr_stores",
+    "parse_expected_timepoints",
+    "parse_mda_settings",
+    "parse_zarr_z_step",
+    "parse_zarr_expected_timepoints",
 ]

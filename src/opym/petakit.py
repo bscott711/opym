@@ -9,6 +9,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import ipywidgets as widgets
@@ -145,6 +146,7 @@ def submit_remote_deskew_job(
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
     save_mip: bool = False,
+    zarr_input: bool = False,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -180,6 +182,18 @@ def submit_remote_deskew_job(
         parameter existed) so existing callers (batch.py, the PSF-tuning
         scripts, notebooks) are unaffected; only the bulk no-decon backfill
         driver passes True.
+    zarr_input : bool, default False
+        `input_target` is a directory of already-cropped, per-channel
+        `.ome.zarr` stores (the newer pymmcore-based MDA acquisition
+        format) rather than TIFF -- confirmed against PetaKit5D's own
+        source (`XR_deskewRotateFrame.m` dispatches on file extension via
+        `readtiff`/`readzarr`; `XR_decon_data_wrapper`/
+        `XR_deskew_rotate_data_wrapper` both have a first-class `zarrFile`
+        parameter controlling how they discover input files by
+        `channel_patterns`). Threaded straight through to the MATLAB
+        ticket's `zarr_input` field; `run_petakit_server.m` maps it to
+        `zarrFile` for whichever stage actually reads the original raw
+        input.
     """
     _ensure_directories()
     input_target = Path(input_target).resolve()
@@ -228,6 +242,7 @@ def submit_remote_deskew_job(
         "z_stage_scan": z_stage_scan,
         "reverse": reverse,
         "save_mip": save_mip,
+        "zarr_input": zarr_input,
     }
 
     if psf_path:
@@ -538,11 +553,28 @@ def wait_for_job(job_path: Path, poll_interval: int = 2) -> bool:
 
 
 def _write_ticket(payload: dict, base_name: str, prefix: str, queue_dir: Path) -> Path:
-    """Helper to write the JSON file."""
+    """Helper to write the JSON file.
+
+    `base_name` alone is not a reliable per-dataset differentiator -- for
+    both `submit_remote_deskew_job` callers it collapses to a FIXED
+    subdirectory name shared by every dataset (`processed_tiff_series_split`
+    for OME-TIF input, `zarr_mirror` for pre-cropped zarr input), not
+    something dataset-specific. A millisecond timestamp alone isn't enough
+    uniqueness either: confirmed via a real run (11 zarr datasets, 2
+    concurrent crop workers) that two datasets' tickets landed in the same
+    millisecond and one filename collision silently overwrote the other's
+    ticket JSON -- the clobbered dataset's registry entry then got marked
+    done/failed based on its sibling's ticket outcome, never actually having
+    been submitted to MATLAB at all. A short uuid4 suffix makes every
+    ticket filename unique regardless of submission timing, independent of
+    how collision-prone `base_name`/`timestamp` happen to be for a given
+    caller.
+    """
     timestamp = int(time.time() * 1000)
+    unique_suffix = uuid.uuid4().hex[:8]
     # Sanitize name
     safe_name = re.sub(r"[^\w\-_\.]", "_", base_name)
-    job_file = queue_dir / f"{prefix}_{safe_name}_{timestamp}.json"
+    job_file = queue_dir / f"{prefix}_{safe_name}_{timestamp}_{unique_suffix}.json"
 
     with open(job_file, "w") as f:
         json.dump(payload, f, indent=4)

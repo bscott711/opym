@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, overload
 
+import yaml
+
 from .utils import DerivedPaths, OutputFormat
 
 
@@ -92,6 +94,50 @@ def parse_expected_timepoints(metadata_file: Path, default: int = 1) -> int:
         return default
 
 
+def parse_mda_settings(mda_settings_file: Path) -> dict[str, Any]:
+    """Reads a pymmcore/useq-schema `MDA_settings.yaml` sidecar -- the newer
+    acquisition writer's counterpart to the legacy `AcqSettings.txt`, sitting
+    alongside per-channel pre-cropped `*.ome.zarr` stores instead of a single
+    raw OME-TIF (see `opym.discovery.KIND_ZARR_PRECROPPED`).
+    """
+    try:
+        with mda_settings_file.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"Warning: Could not parse {mda_settings_file}: {e}", file=sys.stderr)
+        return {}
+
+
+def parse_zarr_z_step(mda_settings_file: Path, default_z_step: float = 0.3) -> float:
+    """Reads `z_plan.step` (microns) from `MDA_settings.yaml`."""
+    z_plan = parse_mda_settings(mda_settings_file).get("z_plan") or {}
+    step = z_plan.get("step")
+    try:
+        return float(step) if step is not None else default_z_step
+    except (TypeError, ValueError):
+        return default_z_step
+
+
+def parse_zarr_expected_timepoints(mda_settings_file: Path, default: int = 1) -> int:
+    """Reads the configured timepoint count from `MDA_settings.yaml`'s
+    `time_plan` block, if present -- mirrors `parse_expected_timepoints`'s
+    role for the legacy AcqSettings.txt format. useq-schema's `time_plan`
+    key for loop count hasn't been confirmed against a real multi-timepoint
+    example yet (every acquisition seen so far is single-timepoint, no
+    `time_plan` block at all), so this checks a couple of plausible key
+    names defensively and falls back to 1 (no time_plan == single timepoint)
+    rather than guessing wrong.
+    """
+    time_plan = parse_mda_settings(mda_settings_file).get("time_plan")
+    if not time_plan:
+        return 1
+    loops = time_plan.get("loops", time_plan.get("num_timepoints"))
+    try:
+        return int(loops) if loops else default
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:
     """
     Parses the Micro-Manager metadata file to extract the
@@ -166,6 +212,7 @@ def create_processing_log(
 ):
     """Writes a JSON log file with all processing parameters."""
 
+    metadata_available = paths.metadata_file.exists()
     timestamps = parse_timestamps(paths.metadata_file, num_timepoints)
 
     if channels_to_output is None:
@@ -180,6 +227,7 @@ def create_processing_log(
         "processing_version": "3.1-selective-channel",
         "processing_date": datetime.now().isoformat(),
         "channels_exported": channels_to_output,
+        "timestamps_source": "parsed_metadata" if metadata_available else "synthesized_no_metadata_file",
         "rotate_90_degrees": rotate_90,
         "source_base_file": str(paths.base_file),
         "source_metadata_file": str(paths.metadata_file),
