@@ -28,6 +28,36 @@ def _ensure_directories():
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def resolve_deskew_working_dir(master_file: Path) -> Path:
+    """Resolves the directory PetaKit5D actually treats as `dataDir` for a
+    given raw master file: the current convention names it after the
+    master file's stem (e.g. `foo_MMStack_Pos0.ome.tif` ->
+    `foo_MMStack_Pos0/`); `processed_tiff_series_split/` is an older,
+    legacy convention some already-cropped datasets still use. Prefers the
+    newer convention, same order `submit_remote_deskew_job`'s path-
+    redirection logic below already applies when building the ticket's
+    `dataDir` -- callers that need to find output *after* the job finishes
+    (e.g. `backfill/cli.py` locating `DSR_nodecon/`) must resolve it the
+    same way or they'll look in the wrong place.
+    """
+    folder_name = master_file.name
+    if folder_name.lower().endswith(".ome.tif"):
+        folder_name = folder_name[:-8]
+    elif folder_name.lower().endswith(".tif"):
+        folder_name = folder_name[:-4]
+
+    potential_dir = master_file.parent / folder_name
+    if potential_dir.exists():
+        return potential_dir
+    legacy_dir = master_file.parent / "processed_tiff_series_split"
+    if legacy_dir.exists():
+        return legacy_dir
+    raise FileNotFoundError(
+        f"Neither {potential_dir} nor {legacy_dir} exists -- crop stage "
+        "output not found for this master file."
+    )
+
+
 def _apply_omw_params(
     params: dict,
     wiener_alpha: float | None = None,
@@ -206,19 +236,7 @@ def submit_remote_deskew_job(
 
     # --- PATH REDIRECTION LOGIC ---
     if input_target.is_file():
-        folder_name = input_target.name
-        if folder_name.lower().endswith(".ome.tif"):
-            folder_name = folder_name[:-8]
-        elif folder_name.lower().endswith(".tif"):
-            folder_name = folder_name[:-4]
-
-        potential_dir = input_target.parent / folder_name
-        if potential_dir.exists():
-            input_target = potential_dir
-        else:
-            legacy_dir = input_target.parent / "processed_tiff_series_split"
-            if legacy_dir.exists():
-                input_target = legacy_dir
+        input_target = resolve_deskew_working_dir(input_target)
 
     if not input_target.exists():
         raise FileNotFoundError(f"Input directory not found: {input_target}")

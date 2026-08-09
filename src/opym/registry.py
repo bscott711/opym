@@ -125,12 +125,26 @@ class StatusRegistry:
         master_file: str,
         has_legacy_decon: bool = False,
     ) -> None:
+        """Every backfill run re-discovers and re-registers every dataset
+        (see `run_backfill`), including ones already in the registry -- the
+        ON CONFLICT branch must refresh `master_file` or a dataset whose
+        raw file was still mid-upload at first discovery (so
+        `select_master_ome_tif` picked a numbered continuation file instead
+        of the not-yet-written bare-name master) stays wrong forever, even
+        after the real master file lands and every later re-discovery pass
+        recomputes the correct one. Confirmed via a real stuck dataset:
+        `discovered_at` predated the bare master file's mtime by hours, and
+        `master_file` never budged across dozens of subsequent runs.
+        `discovered_at` itself is intentionally NOT refreshed -- it's "first
+        seen," not "last seen."
+        """
         with self._cursor() as cur:
             cur.execute(
                 """INSERT INTO datasets
                        (dataset_key, root, leaf_dir, master_file, has_legacy_decon, discovered_at)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(dataset_key) DO UPDATE SET
+                       master_file = excluded.master_file,
                        has_legacy_decon = excluded.has_legacy_decon""",
                 (dataset_key, root, leaf_dir, master_file, int(has_legacy_decon), _now()),
             )
