@@ -193,6 +193,61 @@ def test_frames_use_declared_indices_not_arrival_order(tmp_path, receiver, clien
     np.testing.assert_array_equal(t1, orient_zyx_for_dsr(vol1))
 
 
+def test_channels_may_have_different_frame_shapes(tmp_path, receiver, client):
+    """Per-FRAME `shape_zyx` overrides the SESSION_START default (see
+    protocol.py) -- exercises that this actually works end-to-end, for a
+    multi-camera/spectral-crop client whose per-region ROIs aren't
+    necessarily all the same size.
+    """
+    session_id = "sess-mixed-shapes"
+    output_dir = tmp_path / "out"
+    sock = client(session_id)
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, session_id, _session_header(output_dir))
+    )
+    _drive(receiver)
+    _recv_ack(sock)
+
+    small_shape = (3, 4, 5)
+    large_shape = (3, 9, 11)
+    vol_small = np.full(small_shape, fill_value=1, dtype=np.uint16)
+    vol_large = np.full(large_shape, fill_value=2, dtype=np.uint16)
+    header_small = {
+        "t": 0,
+        "c": 0,
+        "frame_index": 0,
+        "timestamp": 0.0,
+        "camera_id": 0,
+        "shape_zyx": list(small_shape),
+        "dtype": "uint16",
+    }
+    header_large = {
+        "t": 0,
+        "c": 1,
+        "frame_index": 1,
+        "timestamp": 0.0,
+        "camera_id": 1,
+        "shape_zyx": list(large_shape),
+        "dtype": "uint16",
+    }
+
+    for header, vol in [(header_small, vol_small), (header_large, vol_large)]:
+        sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
+        _drive(receiver)
+        _recv_ack(sock)
+
+    staged_small = np.asarray(
+        zarr.open(str(receiver.shm_dir / "sample_T0000_C0.zarr"), mode="r")
+    )
+    staged_large = np.asarray(
+        zarr.open(str(receiver.shm_dir / "sample_T0000_C1.zarr"), mode="r")
+    )
+    np.testing.assert_array_equal(staged_small, orient_zyx_for_dsr(vol_small))
+    np.testing.assert_array_equal(staged_large, orient_zyx_for_dsr(vol_large))
+    assert staged_small.shape != staged_large.shape
+    assert len(list((tmp_path / "queue").glob("*.json"))) == 2
+
+
 def test_duplicate_frame_is_not_reticketed(tmp_path, receiver, client):
     session_id = "sess-dup"
     output_dir = tmp_path / "out"
