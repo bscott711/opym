@@ -107,6 +107,33 @@ reading it from the PSF file's own ImageJ `spacing` tag — but that read
 happens per-frame on the hot path here, so send it explicitly if you have
 it.
 
+**`sheet_angle_deg` is not a free parameter — use `60.0`.** That's the
+validated production value for this OPM, used as the default everywhere
+else in this codebase (`opym.petakit`, `run_petakit_server.m`,
+`run_napari_opym.py`, every `psf_tools/*` script) and explicitly called out
+as such in `bioimaging/psf_tools/omw_rl_comparison.py`'s
+`--sheet-angle-deg` help text. Every other value in the example above is
+just illustrative; this one isn't.
+
+**Multi-camera acquisitions — there is no separate camera axis, by
+design.** `channels`/`c` is the only channel-identity key the receiver
+addresses staging and tickets by (`camera_id` in the `FRAME` header below
+is descriptive metadata only — it is never used for staging, ticketing, or
+dedup). This OPM is always dual-camera, so resolve each physical
+camera's output into its own distinct `c` index client-side, exactly like
+the existing pre-cropped zarr batch writer already does (see
+`opym.discovery`'s `KIND_ZARR_PRECROPPED` docstring: the newer
+pymmcore-based MDA writer "crop[s] and split[s] one-per-channel at capture
+time," and everything downstream — PetaKit5D tickets, `consolidate.py` —
+only ever sees flat channel indices, never a camera dimension). A
+2-camera, single-excitation session declares e.g.
+`"channels": [0, 1], "channel_names": ["Cam0_mScarlet_561",
+"Cam1_GFP_488"]` and sends each camera's frames under its own `c`; a
+setup with more excitations/sub-channels per camera just extends the same
+flat list further. There's nothing to add to the protocol for this —
+`SessionState.channels` in `receiver.py` is already an arbitrary-length
+list with no hardcoded channel-count assumption anywhere in the receiver.
+
 The server replies with an `ACK` (`through_frame_index: -1`) once the
 session is registered.
 
@@ -126,10 +153,13 @@ payload = volume.tobytes()      # C-contiguous (Z, Y, X)
 ```
 
 `t`/`c` are your acquisition's own indices, not send order — frames may
-arrive in any `(t, c)` order (e.g. multi-camera channels finishing a
-Z-stack at different times) and the receiver stages/tickets by those
-indices, not by arrival order. Resending an already-staged `(t, c)` (e.g.
-after a reconnect) is a safe no-op, not a duplicate ticket.
+arrive in any `(t, c)` order (e.g. the two cameras finishing a Z-stack at
+different times) and the receiver stages/tickets by those indices, not by
+arrival order. Resending an already-staged `(t, c)` (e.g. after a
+reconnect) is a safe no-op, not a duplicate ticket. `camera_id` is carried
+along for logging/debugging only — see the multi-camera note above:
+`c` (matched against `SESSION_START`'s `channels`) is what actually
+identifies which camera+excitation this volume belongs to.
 
 ### 3. `SESSION_END`
 
