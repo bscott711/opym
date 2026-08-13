@@ -53,6 +53,17 @@ def consolidate_to_ome_zarr(
     read back correctly as (Z, Y, X) — see module docstring.
 
     Returns True on success, False if no matching zarrs were found.
+
+    Raises ValueError if any (t, c) entry's shape or dtype doesn't match
+    the rest -- every acquisition is expected to produce same-sized
+    per-channel volumes (fixed at capture time), so a mismatch here means
+    something upstream is wrong, not a benign edge case to paper over. The
+    hardlink-no-copy trick this function relies on (see module docstring)
+    declares ONE shape/chunks/dtype for the whole unified 5D array from a
+    single reference entry; silently proceeding with a mismatched entry
+    would hardlink real chunk data under indices whose declared shape
+    doesn't match those actual bytes, corrupting the array for anyone
+    who reads it back rather than failing where the problem is caused.
     """
     pattern = re.compile(rf"^{re.escape(base_name)}_T(\d+)_C(\d+)\.zarr$")
     entries: dict[tuple[int, int], Path] = {}
@@ -80,6 +91,25 @@ def consolidate_to_ome_zarr(
 
     spatial_shape: list[int] = src_meta["shape"]
     spatial_chunks: list[int] = src_meta["chunks"]
+
+    for (t, c), entry_path in entries.items():
+        entry_zarray_path = entry_path / ".zarray"
+        if not entry_zarray_path.exists():
+            print(f"[consolidate] ERROR: {entry_zarray_path} not found — invalid zarr")
+            return False
+        with open(entry_zarray_path) as f:
+            entry_meta = json.load(f)
+        shape_ok = entry_meta["shape"] == spatial_shape
+        dtype_ok = entry_meta["dtype"] == src_meta["dtype"]
+        if not (shape_ok and dtype_ok):
+            raise ValueError(
+                f"Shape/dtype mismatch in {decon_dir}: T={t} C={c} is "
+                f"{entry_meta['shape']} {entry_meta['dtype']} but T={all_t[0]} "
+                f"C={all_c[0]} (the reference entry) is {spatial_shape} "
+                f"{src_meta['dtype']}. Every channel is expected to produce "
+                f"same-sized volumes — refusing to consolidate a mismatched set."
+            )
+
     print(
         f"[consolidate] Linking {num_t}T × {num_c}C, each {spatial_shape} {src_meta['dtype']} "
         f"(chunks {spatial_chunks}) — no data copy"
