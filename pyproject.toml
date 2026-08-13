@@ -37,13 +37,15 @@ keywords = [
 dependencies = [
     "numpy",
     "tifffile",
-    "zarr",
+    "zarr<3",
     "tqdm",
     "scikit-image",
     "scikit-learn",
     "PyPetaKit5D",
     "imagecodecs",
     "pyyaml",
+    "pyzmq",
+    "msgpack",
 ]
 
 [project.optional-dependencies]

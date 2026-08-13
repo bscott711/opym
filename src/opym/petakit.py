@@ -23,9 +23,17 @@ DONE_DIR = BASE_DIR / "completed"
 FAIL_DIR = BASE_DIR / "failed"
 
 
-def _ensure_directories():
-    """Ensures the job queue directory exists."""
-    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_directories(queue_dir: Path = QUEUE_DIR):
+    """Ensures the job queue directory exists.
+
+    Every `submit_*_job` function below accepts its own `queue_dir`
+    override (tests and non-default callers pass one), but this used to
+    unconditionally `mkdir` the module-level default `QUEUE_DIR` regardless
+    of what was actually passed in -- silently a no-op for any real
+    override, masked only because every caller that overrides `queue_dir`
+    happened to `mkdir` it manually first. Takes the actual target dir now.
+    """
+    Path(queue_dir).mkdir(parents=True, exist_ok=True)
 
 
 def resolve_deskew_working_dir(master_file: Path) -> Path:
@@ -102,7 +110,7 @@ def submit_remote_crop_job(
     Creates a JSON job ticket for Cropping.
     Automatically handles BigTiff naming conventions.
     """
-    _ensure_directories()
+    _ensure_directories(queue_dir)
     base_file = Path(base_file).resolve()
 
     # ROI formatting for CLI
@@ -225,7 +233,7 @@ def submit_remote_deskew_job(
         `zarrFile` for whichever stage actually reads the original raw
         input.
     """
-    _ensure_directories()
+    _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
 
     # PetaKit5D's default 'yxz' shears the 2nd dimension (X).
@@ -298,7 +306,7 @@ def submit_remote_decon_job(
     """
     Creates a JSON job ticket for standalone Deconvolution.
     """
-    _ensure_directories()
+    _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
 
     if not input_target.exists():
@@ -384,7 +392,7 @@ def submit_pipeline_job(
         Raises ValueError if it cannot be determined either way -- a silent
         wrong default here previously caused a real decon/DSR regression.
     """
-    _ensure_directories()
+    _ensure_directories(queue_dir)
     output_file = Path(output_file).resolve()
     data_dir = output_file.parent
     base_name = output_file.name
@@ -470,7 +478,7 @@ def submit_pipeline_batch_job(
         run_gpu_pipeline.m / decon_lucy_function.m warm across the batch).
     dz_psf : see submit_pipeline_job -- same resolution/validation logic.
     """
-    _ensure_directories()
+    _ensure_directories(queue_dir)
     if not items:
         raise ValueError("submit_pipeline_batch_job requires a non-empty items list.")
 
