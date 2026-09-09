@@ -33,8 +33,6 @@ _OUTPUT_DIR_NAMES = frozenset(
 )
 
 
-_MDA_SETTINGS_NAME = "MDA_settings.yaml"
-
 # Discriminates the two raw-acquisition shapes this module can discover --
 # see LeafDataset.kind.
 KIND_OME_TIF = "ome_tif"
@@ -164,15 +162,20 @@ def group_channel_zarr_stores(leaf_dir: Path) -> dict[str, list[Path]]:
 
 def is_zarr_leaf_dataset_dir(path: Path) -> bool:
     """True iff `path` is a pre-cropped acquisition from the newer
-    pymmcore-based MDA writer: an `MDA_settings.yaml` sibling plus at least
-    one per-channel `*.ome.zarr` store. Both markers are required so a
-    still-in-flight transfer (e.g. Globus writes chunk data before the
-    settings file, or vice versa) isn't picked up mid-sync -- it simply
-    isn't recognized as a leaf yet, and gets discovered on the next run once
-    both are present, consistent with the existing OME-TIF leaf's
-    already-tolerant-of-arbitrary-transfer-state behavior.
+    pymmcore-based MDA writer: at least one per-channel `*.ome.zarr` store.
+
+    `MDA_settings.yaml` is NOT required here -- confirmed with the user
+    it's a one-time-per-experiment-set file the acquisition GUI doesn't
+    currently write per dataset, so gating discovery on it silently drops
+    real, fully-uploaded datasets (as it did for a real backfill upload).
+    Its absence is already handled gracefully downstream: `parse_zarr_z_step`
+    / `parse_zarr_expected_timepoints` (metadata.py) fall back to defaults
+    when the sidecar is missing, same as the rest of this metadata-parsing
+    chain. This module only ever runs against already-landed backfill data
+    (not live acquisition), so there's no in-flight-transfer case to guard
+    against the way there was when this required both markers.
     """
-    return (path / _MDA_SETTINGS_NAME).is_file() and bool(find_channel_zarr_stores(path))
+    return bool(find_channel_zarr_stores(path))
 
 
 def walk_leaf_datasets(root: Path) -> Iterator[tuple[Path, str]]:
