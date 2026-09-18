@@ -76,6 +76,16 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 addpath(fullfile(fileparts(mfilename('fullpath')), 'patches'));
+% Shadow-patched parallelReadZarr: the shared PetaKit5D build
+% (/cm/shared/apps_local/petakit5d, not writable by this account) can't
+% parse a spec-legal `"compressor": null` (uncompressed) zarr v2 array --
+% both its blosc and gzip metadata-parsing attempts throw on JSON null,
+% and it mislabels the result "Metadata is incomplete. Check the .zarray
+% file" (confirmed against zarr.cpp's compressor-parsing try/catch).
+% Prepending our patched build here (source + patch notes in
+% patches/cpp-zarr/) shadows the shared one via normal MATLAB path order,
+% without touching the shared install other users share.
+addpath(fullfile(fileparts(mfilename('fullpath')), 'patches', 'cpp-zarr', 'linux'));
 
 % --- VERIFY MEX ---
 verify_mex();

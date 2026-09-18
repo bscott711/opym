@@ -45,6 +45,19 @@ def compute_reference_projection(
     convention). `timepoint=0` (or any int) selects that specific index --
     also the right call for an already T-sliced 4D array (e.g. a napari
     layer's `.data[0]`), where no further T-slicing should happen.
+
+    Projects one 2D (Y, X) plane at a time (running max) rather than
+    materializing the whole remaining array via `np.asarray()` first --
+    for an already-single-timepoint 4D array (`timepoint=None`, a true
+    full-stack projection over every Z/C plane) that whole-array read was
+    confirmed live to balloon a 2-21GB source file into 90-120GB+ of actual
+    reads (zarr/tifffile chunk-misaligned re-reads) and multi-GB peak RSS
+    per worker, for a bead/focal-check calibration stack with many Z
+    planes -- slow/memory-heavy enough to stall the bulk backfill's whole
+    worker pool. Plane-by-plane access instead maps ~1:1 onto the
+    underlying TIFF's own IFD pages and needs only one plane + the running
+    max in memory at a time. Numerically identical to the old
+    `np.max(frame, axis=proj_axes)`.
     """
     arr = z_array
     if arr.ndim >= 5:
@@ -53,10 +66,13 @@ def compute_reference_projection(
     elif arr.ndim == 4 and timepoint is not None:
         arr = arr[timepoint]
 
-    frame = np.asarray(arr)
-    if frame.ndim > 2:
-        proj_axes = tuple(range(frame.ndim - 2))
-        frame = np.max(frame, axis=proj_axes)
+    if arr.ndim <= 2:
+        return np.asarray(arr)
+
+    frame: np.ndarray | None = None
+    for idx in np.ndindex(*arr.shape[: arr.ndim - 2]):
+        plane = np.asarray(arr[idx])
+        frame = plane if frame is None else np.maximum(frame, plane)
     return frame
 
 

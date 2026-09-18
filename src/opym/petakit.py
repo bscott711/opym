@@ -55,14 +55,25 @@ def resolve_deskew_working_dir(master_file: Path) -> Path:
         folder_name = folder_name[:-4]
 
     potential_dir = master_file.parent / folder_name
-    if potential_dir.exists():
+    # Existence alone isn't enough -- confirmed live that a master-stem dir
+    # can exist with zero cropped frames in it (only stale DSR/DSR_nodecon
+    # output left behind by an earlier deskew attempt that itself used this
+    # same dir as its working directory). Preferring it anyway sends
+    # PetaKit5D a baseName glob that matches nothing, so `inputFullpaths{1}`
+    # comes back an empty string and `getImageSize('')` dies with "Index
+    # exceeds array bounds" -- a hard-to-diagnose failure for what's really
+    # just "wrong directory". Require an actual TIFF frame before trusting it.
+    if potential_dir.exists() and (
+        next(potential_dir.glob("*.tif"), None) is not None
+        or next(potential_dir.glob("*.tiff"), None) is not None
+    ):
         return potential_dir
     legacy_dir = master_file.parent / "processed_tiff_series_split"
     if legacy_dir.exists():
         return legacy_dir
     raise FileNotFoundError(
-        f"Neither {potential_dir} nor {legacy_dir} exists -- crop stage "
-        "output not found for this master file."
+        f"Neither {potential_dir} (with real TIFF frames) nor {legacy_dir} "
+        "exists -- crop stage output not found for this master file."
     )
 
 
