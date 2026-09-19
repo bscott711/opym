@@ -453,9 +453,19 @@ while true
                 % --- DESKEW / DECONVOLUTION / ROTATION PIPELINE ---
 
                 % 1. Extract Shared Parameters
+                % These defaults are a backstop only -- every real ticket
+                % sets all three. `z_step_um` used to default to 1.0 here
+                % while the two branches above defaulted to 0.3, so the same
+                % missing field meant different geometry depending on job
+                % type; aligned to 0.3. Geometry is logged below because a
+                % wrong-but-plausible step produces output that looks fine
+                % and is silently the wrong size.
                 val_xy        = safelyGetParam(p, 'xy_pixel_size', 0.136);
-                val_dz        = safelyGetParam(p, 'z_step_um', 1.0);
+                val_dz        = safelyGetParam(p, 'z_step_um', 0.3);
                 val_ang       = safelyGetParam(p, 'sheet_angle_deg', 60.0);
+                if ~isfield(p, 'z_step_um') || isempty(p.z_step_um)
+                    logMsg('[Server] WARNING: ticket set no z_step_um; falling back to %g um', val_dz);
+                end
                 val_chans     = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 if ischar(val_chans) || isstring(val_chans)
                     val_chans = {val_chans};
@@ -562,6 +572,20 @@ while true
                     % current_input_dir is still the original raw zarr dir.
                     val_deconRan = val_runDecon && ~isempty(val_psfPath);
                     val_deskewZarrInput = val_zarrInput && ~val_deconRan;
+
+                    % Echo the geometry actually in force. A zarr mirror is
+                    % (z,y,x) on disk and needs inputAxisOrder 'zxy' to
+                    % reach PetaKit5D as (y,x,z) in this microscope's
+                    % convention (the tilted axis and the coverslip axis are
+                    % named the opposite way round from what PetaKit5D
+                    % means by them -- see the comment in petakit.py's
+                    % submit_remote_deskew_job); 'yxz' on a zarr input means
+                    % the scan planes are being sheared as image rows.
+                    logMsg('[Server] DSR geometry: xyPixelSize=%g um, dz=%g um, skewAngle=%g deg, inputAxisOrder=%s, zarrFile=%d', ...
+                        val_xy, val_dz, val_ang, val_inputAxis, val_deskewZarrInput);
+                    if val_deskewZarrInput && strcmpi(val_inputAxis, 'yxz')
+                        logMsg('[Server] WARNING: zarr input with inputAxisOrder=yxz -- DSR output will be the wrong size.');
+                    end
 
                     XR_deskew_rotate_data_wrapper( ...
                         {current_input_dir}, ...

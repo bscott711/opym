@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import datetime
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, overload
 
@@ -136,6 +137,113 @@ def parse_zarr_expected_timepoints(mda_settings_file: Path, default: int = 1) ->
         return int(loops) if loops else default
     except (TypeError, ValueError):
         return default
+
+
+# Microns. Real stores measure a spread of ~1e-15 um across their whole z
+# range, so anything near this tolerance is a genuinely ragged axis.
+_Z_STEP_UNIFORMITY_TOL = 1e-3
+
+
+def parse_zarr_z_step_from_store(store: Path) -> float | None:
+    """Z step (microns) from a pymmcore MDA zarr store's own `z` coordinate
+    array -- the only real geometry this acquisition writer records.
+
+    `<store>/z` is a tiny 1-D float64 array of per-plane galvo positions in
+    microns (`units: "um"` in its `.zattrs`): e.g. 301 planes spanning
+    -15..+15 um -> 0.1 um, or 61 planes over the same range -> 0.5 um. The
+    step genuinely differs between acquisitions, so it has to be read per
+    dataset rather than defaulted.
+
+    Deliberately NOT taken from the OME-NGFF `coordinateTransformations`
+    scale: every store this writer produces carries the placeholder
+    `[1, 1, 1, 1]` there (and `pixel_size_um: 0.0` in `frame_meta`), so
+    trusting it would silently yield a 1 um step.
+
+    Returns None rather than a guess when the array is missing, too short,
+    non-positive or unevenly spaced, so the caller falls back explicitly.
+    """
+    # Local import: keeps numpy/zarr off the import path of the lightweight
+    # metadata callers (CLI, log writers) that never touch a zarr store.
+    try:
+        import numpy as np
+        import zarr
+    except ImportError as e:  # pragma: no cover - both are hard deps
+        print(f"Warning: cannot read z coordinates from {store}: {e}", file=sys.stderr)
+        return None
+
+    try:
+        z = np.asarray(zarr.open(str(store), mode="r")["z"])
+    except Exception as e:
+        print(
+            f"Warning: no readable 'z' coordinate array in {store}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+    if z.ndim != 1 or z.size < 2:
+        print(
+            f"Warning: 'z' in {store} is not a usable coordinate array "
+            f"(shape {z.shape})",
+            file=sys.stderr,
+        )
+        return None
+
+    steps = np.diff(z)
+    # Round off float64 accumulation noise (a true 0.1 um step averages to
+    # 0.09999999999999964) so the value stays legible in the ticket and in
+    # PetaKit5D's parameters.json. 1e-6 um is a picometre -- far below any
+    # step a galvo is ever commanded to, so this is lossless in practice.
+    step = round(float(steps.mean()), 6)
+    if step <= 0:
+        print(
+            f"Warning: non-positive z step ({step}) from {store}",
+            file=sys.stderr,
+        )
+        return None
+    if float(abs(steps - step).max()) > _Z_STEP_UNIFORMITY_TOL:
+        print(
+            f"Warning: non-uniform z spacing in {store} "
+            f"({step:.6f} +/- {float(steps.std()):.6f} um); ignoring",
+            file=sys.stderr,
+        )
+        return None
+    return step
+
+
+def resolve_zarr_z_step(
+    stores: Sequence[Path],
+    mda_settings_file: Path,
+    default_z_step: float | None = 0.3,
+) -> tuple[float | None, str]:
+    """Z step for a zarr-precropped dataset, plus where it came from.
+
+    Ordered by trustworthiness: the store's own `z` coordinate array, then
+    the `MDA_settings.yaml` sidecar (which this acquisition writer does not
+    currently produce), then `default_z_step`.
+
+    Pass `default_z_step=None` to refuse to guess: the result is then
+    `(None, "unmeasured")` and the caller can defer the dataset instead of
+    deskewing it at a made-up scale. A silently-defaulted step is exactly
+    how every zarr dataset came to be deskewed at 0.3 um when the truth was
+    0.1 or 0.5 -- once it reaches the ticket a wrong value is
+    indistinguishable from a right one.
+
+    The source is returned so the caller can log it.
+    """
+    for store in stores:
+        step = parse_zarr_z_step_from_store(store)
+        if step is not None:
+            return step, f"{store.name}/z"
+
+    # -1.0 sentinel: tells "the sidecar really said a value" apart from
+    # "the sidecar is absent", which a plain default cannot express.
+    from_sidecar = parse_zarr_z_step(mda_settings_file, default_z_step=-1.0)
+    if from_sidecar > 0:
+        return from_sidecar, mda_settings_file.name
+
+    if default_z_step is None:
+        return None, "unmeasured"
+    return default_z_step, f"default ({default_z_step} um -- NOT measured)"
 
 
 def parse_timestamps(metadata_file: Path, num_timepoints: int) -> list[float]:

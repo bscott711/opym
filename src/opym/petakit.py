@@ -203,12 +203,15 @@ def submit_remote_deskew_job(
     Parameters
     ----------
     input_axis_order : str, default 'yxz'
-        Axis order of input data. Must match PetaKit5D conventions.
-        'yxz' = MATLAB cropper output (rows=Y, cols=X, planes=Z).
-        Always forced to 'yxz' below regardless of the value passed in --
-        see the comment at the assignment for why.
+        Ignored -- derived from `zarr_input` below, because the on-disk
+        axis order is a property of the input format, not a free choice.
+        TIFF input is already (y, x, z) in MATLAB so it gets 'yxz'; a zarr
+        mirror store is (z, y, x) and gets 'zxy'. See the comment at the
+        assignment for why the correct string for this microscope's
+        convention is 'zxy' and not the more intuitive-looking 'zyx'.
     output_axis_order : str, default 'yxz'
-        Desired axis order of output data.
+        Ignored -- always 'yxz'; the DSR result is (y, x, z) and is written
+        out as TIFF.
     objective_scan : bool, default False
         True if the objective moves during scanning. For standard galvo-
         scanned OPM this should be False.
@@ -247,10 +250,42 @@ def submit_remote_deskew_job(
     _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
 
-    # PetaKit5D's default 'yxz' shears the 2nd dimension (X).
-    # Since the galvo sweeps in the depth-Z plane, the coverslip (Y) is the invariant axis.
-    # Therefore, we MUST shear the X axis. So 'yxz' is mathematically perfect.
-    input_axis_order = "yxz"
+    # PetaKit5D shears its 2nd dimension and holds the 1st invariant, so it
+    # must end up with the frame as (y, x, z) where x is the TILTED camera
+    # axis -- the one that sweeps in depth as the galvo scans -- and y is the
+    # axis lying along the coverslip.
+    #
+    # A TIFF stack loads in MATLAB as (rows, cols, planes) == (y, x, z)
+    # already, so the TIFF path passes 'yxz' and no permute happens.
+    #
+    # A zarr mirror store is (z, y, x) on disk, where `y` is 490 px (the
+    # tilted axis) and `x` is 1458 px (along the coverslip) -- i.e. the
+    # acquisition's axis names are the opposite way round from what
+    # PetaKit5D means by them. The frame it needs is therefore
+    # (1458, 490, 41): the long coverslip axis invariant, the short tilted
+    # axis sheared. 'zxy' produces exactly that.
+    #
+    # Confirmed by running one timepoint through PetaKit5D at all four
+    # candidate orders and looking at the projections: 'zxy' is the only one
+    # whose YZ view shows a flattened adherent cell sitting on the coverslip
+    # line, and whose XY view is a real top-down footprint. It also agrees
+    # with `opym.utils.orient_zyx_for_dsr`, which solves the same problem for
+    # the streaming path by physically reorienting the array (rot90 +
+    # moveaxis -> ny=X, nx=Y, nz=Z) and mirrors what the legacy MATLAB
+    # BigTiff cropper did.
+    #
+    # Beware `axis_order_mapping` (PetaKit5D utils/axis_order_mapping.m): it
+    # returns `order(i) = strfind('yxz', inputAxisOrder(i))`, the INVERSE of
+    # the vector MATLAB's `permute` consumes, and XR_deskewRotateFrame.m
+    # applies it directly as `permute(frame, order)`. 'zyx' and 'xzy' are a
+    # 3-cycle pair and get swapped by that; 'zxy' -> [3,2,1] is self-inverse,
+    # so it is unambiguous. On a (41, 490, 1458) mirror store:
+    #     'yxz' -> [1,2,3] -> (41, 490, 1458)   ny=41    the original bug
+    #     'xzy' -> [2,3,1] -> (490, 1458, 41)   ny=490   shears the wrong axis
+    #     'zxy' -> [3,2,1] -> (1458, 490, 41)   ny=1458  correct
+    # Pinned by tests/test_zarr_deskew_geometry.py.
+    input_axis_order = "zxy" if zarr_input else "yxz"
+    # The DSR result is (y, x, z) either way and is written out as TIFF.
     output_axis_order = "yxz"
 
     # --- PATH REDIRECTION LOGIC ---
