@@ -190,6 +190,15 @@ while true
 
         jobType = safelyGetParam(job, 'jobType', 'deskew');
 
+        % Echo the revision of the opym checkout that BUILT this ticket. This
+        % MATLAB process loads run_petakit_server.m exactly once at startup,
+        % so after a code change without `systemctl --user restart opym-serve`
+        % a stale server silently interprets new tickets. Printing the
+        % submitter's rev next to the server's own startup banner makes that
+        % mismatch visible in the log instead of inferred hours later.
+        logMsg('[Server] Ticket built by opym rev %s (jobType=%s)', ...
+            safelyGetParam(job, 'submitterRev', 'unknown'), jobType);
+
         switch jobType
             case 'crop'
                 % --- CROPPING JOB ---
@@ -217,7 +226,7 @@ while true
                 val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'simple'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -327,7 +336,7 @@ while true
                 val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'simple'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -406,7 +415,9 @@ while true
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                % Default 'omw' matches petakit.py's submit_remote_decon_job;
+                % this jobType reaches RLdecon.m's switch.
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'omw'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -419,6 +430,13 @@ while true
 
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
                 if isstring(val_psfs), val_psfs = cellstr(val_psfs); end
+                if ischar(val_psfs), val_psfs = {val_psfs}; end
+                if isempty(val_psfs)
+                    error(['decon job has no "psf_paths". XR_decon_data_wrapper ', ...
+                        'would fail indexing dc_psfFullpaths{psfMapping} several ', ...
+                        'steps later, which reads as a PSF-file problem rather ', ...
+                        'than a missing parameter.']);
+                end
 
                 % Ensure number of PSFs matches number of channels
                 if numel(val_chans) > 1 && numel(val_psfs) == 1
@@ -429,6 +447,31 @@ while true
                 val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
                 val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
                 val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+
+                % Geometry. XR_decon_data_wrapper defaults dz=0.5 and
+                % dzPSF=0.1, and psf_gen_new FFT-decimates the PSF's dim 3 by
+                % dz/dzPSF whenever that ratio is > 1. Deconvolving data that
+                % has ALREADY been deskewed and rotated means data and PSF
+                % share one isotropic lab grid, so both must be the lab voxel
+                % size -- otherwise the PSF is silently shrunk 5x and the
+                % result looks merely disappointing rather than wrong.
+                val_xy     = safelyGetParam(p, 'xy_pixel_size', 0.108);
+                val_dz     = safelyGetParam(p, 'z_step_um', []);
+                val_dzPSF  = safelyGetParam(p, 'dz_psf', []);
+                val_bg     = safelyGetParam(p, 'background', []);
+                val_erode  = safelyGetParam(p, 'edge_erosion', 0);
+                % Required, same as the pipeline branches above: this jobType
+                % always deconvolves, so there is no case where guessing the
+                % geometry is better than refusing to run.
+                if isempty(val_dz) || isempty(val_dzPSF)
+                    error(['decon job is missing required "z_step_um" and/or "dz_psf" ', ...
+                        '(the data''s and the PSF''s z-steps, in um). psf_gen_new ', ...
+                        'decimates the PSF by z_step_um/dz_psf, so a wrong default ', ...
+                        'silently shrinks the PSF instead of failing.']);
+                end
+                logMsg(['         [Decon] method=%s iter=%d skewed=%d alpha=%g ' ...
+                        'xy=%g dz=%g dzPSF=%g erode=%d'], val_method, val_iter, ...
+                        val_skewed, val_wAlpha, val_xy, val_dz, val_dzPSF, val_erode);
 
                 XR_decon_data_wrapper( ...
                     {job.dataDir}, ...
@@ -442,6 +485,11 @@ while true
                     'wienerAlpha', val_wAlpha, ...
                     'OTFCumThresh', val_otfCT, ...
                     'hannWinBounds', val_hann, ...
+                    'xyPixelSize', val_xy, ...
+                    'dz', val_dz, ...
+                    'dzPSF', val_dzPSF, ...
+                    'background', val_bg, ...
+                    'edgeErosion', val_erode, ...
                     'save16bit', val_16bit, ...
                     'parseCluster', false, ...
                     'parseParfor', true, ...
@@ -478,7 +526,8 @@ while true
                 val_deskew    = safelyGetParam(p, 'deskew', true);
                 val_rotate    = safelyGetParam(p, 'rotate', true);
                 val_interp    = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method    = safelyGetParam(p, 'rl_method', 'simple');
+                % Default 'omw' matches petakit.py's submit_remote_deskew_job.
+                val_method    = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'omw'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -511,18 +560,59 @@ while true
                     logMsg('         Type: Deconvolution (Skewed Mode)');
                     deconDirName = 'Decon'; % Consistent output name for pipeline
 
-                    % Ensure number of PSFs matches number of channels
-                    val_psfs = {val_psfPath};
-                    if numel(val_chans) > 1
-                        logMsg('         [Decon] Broadcasting single PSF to %d channels.', numel(val_chans));
-                        val_psfs = repmat(val_psfs, 1, numel(val_chans));
+                    % PetaKit5D indexes psfFullpaths by channel, in the same
+                    % order as channelPatterns. A ticket may supply either
+                    % `psf_paths` (per-channel, preferred) or the single
+                    % `psf_path` shorthand, which we broadcast.
+                    val_psfList = safelyGetParam(p, 'psf_paths', {});
+                    if ischar(val_psfList) || isstring(val_psfList)
+                        val_psfList = {char(val_psfList)};
+                    elseif iscell(val_psfList)
+                        val_psfList = reshape(cellfun(@char, val_psfList, ...
+                            'UniformOutput', false), 1, []);
+                    end
+                    if ~isempty(val_psfList)
+                        if numel(val_psfList) ~= numel(val_chans)
+                            error('run_petakit_server:psfChannelMismatch', ...
+                                ['psf_paths has %d entries but channel_patterns ' ...
+                                 'has %d; PetaKit5D indexes psfFullpaths by ' ...
+                                 'channel.'], numel(val_psfList), numel(val_chans));
+                        end
+                        val_psfs = val_psfList;
+                        logMsg('         [Decon] Using %d per-channel PSFs.', numel(val_psfs));
+                    else
+                        val_psfs = {val_psfPath};
+                        if numel(val_chans) > 1
+                            logMsg('         [Decon] Broadcasting single PSF to %d channels.', numel(val_chans));
+                            val_psfs = repmat(val_psfs, 1, numel(val_chans));
+                        end
+                    end
+                    for pi = 1:numel(val_psfs)
+                        if ~exist(val_psfs{pi}, 'file')
+                            error('run_petakit_server:psfNotFound', ...
+                                'PSF not found: %s', val_psfs{pi});
+                        end
                     end
 
                     val_gpuDecon = safelyGetParam(p, 'gpu_decon', false);
+                    % Camera offset subtracted before decon. Left empty,
+                    % XR_decon_data_wrapper resolves its own default of 100,
+                    % which matches this microscope's measured dark level; for
+                    % 'omw'/'simplified' it is subtracted inside the decon
+                    % kernel rather than up front.
+                    val_bg       = safelyGetParam(p, 'background', []);
+                    % RLdecon edge-tapers each z-PLANE laterally but never
+                    % along z, so a short scan rings at its z faces. Eroding
+                    % the result's boundary is PetaKit5D's own remedy.
+                    val_erode    = safelyGetParam(p, 'edge_erosion', 0);
 
                     val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
                     val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
                     val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+
+                    logMsg(['[Server] Decon: method=%s, iters=%d, wienerAlpha=%g, ' ...
+                        'OTFCumThresh=%g, edgeErosion=%d, skewed=1, psf=%s'], val_method, val_iter, ...
+                        val_wAlpha, val_otfCT, val_erode, val_psfs{1});
 
                     XR_decon_data_wrapper( ...
                         {current_input_dir}, ...
@@ -533,6 +623,8 @@ while true
                         'dz', val_dz, ...
                         'skewAngle', val_ang, ...
                         'skewed', true, ...
+                        'background', val_bg, ...
+                        'edgeErosion', val_erode, ...
                         'GPUJob', val_gpuDecon, ...
                         'RLMethod', val_method, ...
                         'wienerAlpha', val_wAlpha, ...
@@ -659,6 +751,31 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
         end
     else
         val = defaultValue;
+    end
+end
+
+% --- HELPER: Map an RL method name onto one PetaKit5D actually implements ---
+% PetaKit5D's RLdecon.m dispatches RLMethod through two `switch` statements
+% that have NO `otherwise` branch, over {original, simplified, omw, cudagen}.
+% `deconvolved` is initialized to [] at the top of that function, so an
+% unrecognized name means nothing ever assigns it and an EMPTY volume is
+% written -- silently, after background subtraction has already run.
+%
+% Our historical default, 'simple', is exactly such a name. It never bit
+% because the pipeline/pipeline_batch jobTypes go through run_gpu_pipeline.m,
+% which dispatches on strcmpi(RLMethod,'omw') itself and never reaches that
+% switch. The 'decon' and 'deskew'-with-decon jobTypes DO reach it.
+function method = normalizeRLMethod(method)
+    valid = {'original', 'simplified', 'omw', 'cudagen'};
+    method = lower(char(method));
+    if strcmp(method, 'simple')
+        method = 'simplified';
+    end
+    if ~ismember(method, valid)
+        error('run_petakit_server:badRLMethod', ...
+            ['Unknown rl_method ''%s''. PetaKit5D recognizes {original, ' ...
+             'simplified, omw, cudagen} and silently writes an EMPTY volume ' ...
+             'for anything else.'], method);
     end
 end
 

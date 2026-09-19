@@ -130,6 +130,42 @@ def orient_zyx_for_dsr(volume: np.ndarray) -> np.ndarray:
     return np.moveaxis(rotated, 0, -1)
 
 
+def orient_zyx_for_decon_tiff(volume: np.ndarray) -> np.ndarray:
+    """
+    Reorders a (Z, Y, X) numpy crop into the (nz, ny, nx) layout a TIFF must
+    be written in so that MATLAB's `readtiff` hands PetaKit5D (ny, nx, nz).
+
+    This is `orient_zyx_for_dsr` MINUS its trailing `moveaxis(0, -1)` -- TIFF
+    paging performs that step for you. `tifffile.imwrite` of a numpy (a, b, c)
+    array writes `a` pages of `b x c`, and `readtiff` returns
+    (rows, cols, pages) == (b, c, a). So writing `orient_zyx_for_dsr`'s own
+    output would give `ny` pages and reach MATLAB as (nx, nz, ny) -- wrong.
+
+    Why this matters for deconvolution specifically: decon is a 3D
+    convolution, and PetaKit5D's decon path
+    (XR_decon_data_wrapper -> XR_RLdeconFrame3D -> RLdecon) has NO
+    axis-order parameter -- it convolves the array exactly as stored, before
+    XR_deskewRotateFrame's `inputAxisOrder` permute ever happens. Two of its
+    internals hard-code dim 3 == scan Z: `psf_gen_new` takes its background
+    from `psf(:, :, [1:5, end-4:end])` and FFT-resamples dim 3 from dz_psf to
+    dz_data, and `omw_backprojector_generation` with `skewed=true` builds the
+    skewed OTF mask as `cat(3, mask_r, mask_c, mask_l)` -- the three lobes
+    must separate along dim 3. So a zarr-mirror store presented as (z, y, x)
+    cannot be deconvolved in place, and permuting the PSF instead does not
+    rescue it: the data itself has to be materialized in this order.
+
+    The rot90 (rather than a plain transpose) is deliberate and load-bearing.
+    It matches the legacy MATLAB BigTiff cropper, and -- critically -- the
+    measured PSF carries the SAME rot90 (psf_tools/extract_bead_psf.py applies
+    `np.rot90(avg_psf, k=1, axes=(1, 2))` with `rotate_90=True` by default).
+    A plain transpose, which is what the deskew-only zarr path's
+    `inputAxisOrder='zxy'` performs, differs from this by a flip of the ny
+    (coverslip) axis -- i.e. it is a mirror image. Pinned by
+    tests/test_decon_staging_geometry.py.
+    """
+    return np.rot90(volume, k=1, axes=(-2, -1))
+
+
 def scan_channel_patterns(directory: Path) -> str:
     """
     Scans a directory for unique channel identifiers (e.g., _C00, _C01).

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS datasets (
     discovered_at       TEXT NOT NULL,
     signal_flag         TEXT,
     expected_timepoints INTEGER,
-    actual_timepoints   INTEGER
+    actual_timepoints   INTEGER,
+    decon_psf           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stage_status (
@@ -67,6 +68,16 @@ _NEW_DATASET_COLUMNS = {
     "signal_flag": "TEXT",
     "expected_timepoints": "INTEGER",
     "actual_timepoints": "INTEGER",
+    # Which PSF this dataset's DSR output was deconvolved with; NULL means
+    # deskew-only. Deliberately a dataset column rather than a new `decon`
+    # entry in STAGES: deconvolution is step A *inside* the same MATLAB
+    # deskew ticket, so it has no ticket of its own and cannot succeed or
+    # fail independently of `deskew`. A stage row would also be dropped
+    # silently by the dashboard, which keeps its own duplicate STAGES tuple
+    # (opym-dashboard/app/registry_reader.py) and filters to it -- failures
+    # included. What is actually wanted here is provenance: which PSF
+    # produced the data on disk.
+    "decon_psf": "TEXT",
 }
 
 
@@ -170,6 +181,31 @@ class StatusRegistry:
                      WHERE dataset_key=?""",
                 (signal_flag, expected_timepoints, actual_timepoints, dataset_key),
             )
+
+    def set_decon_psf(self, dataset_key: str, psf_path: str | None) -> None:
+        """Records which PSF this dataset was deconvolved with (None =
+        deskew-only), so the provenance of the data on disk is recoverable
+        without re-deriving it from directory names. See
+        `_NEW_DATASET_COLUMNS` for why this is a column, not a stage.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE datasets SET decon_psf=? WHERE dataset_key=?",
+                (psf_path, dataset_key),
+            )
+
+    def get_decon_psf(self, dataset_key: str) -> str | None:
+        """The PSF this dataset's on-disk output was produced with, or None
+        for deskew-only. Callers compare this against the PSF they are about
+        to use: a dataset whose `deskew` stage says `done` was only done for
+        the PSF it was done WITH, and re-running with a different one (or
+        with decon newly switched on) must not be skipped as already-complete.
+        """
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT decon_psf FROM datasets WHERE dataset_key=?", (dataset_key,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
 
     def start_stage(self, dataset_key: str, stage: str, *, ticket_path: str | None = None) -> None:
         with self._cursor() as cur:

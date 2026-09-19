@@ -5,8 +5,10 @@ Utilities for interacting with the PetaKit job queue system.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -102,6 +104,69 @@ def _apply_omw_params(
     return params
 
 
+# PetaKit5D's RLdecon.m dispatches on RLMethod with a `switch` that has NO
+# `otherwise` branch (see its two switches, on the back-projector and on the
+# algorithm itself). `deconvolved` is initialized to [] at the top of that
+# function, so an unrecognized method name means nothing ever assigns it and
+# an EMPTY volume is written to disk -- silently, after the background
+# subtraction has already run, so it looks like work happened.
+#
+# Our historical default, 'simple', is exactly such an unrecognized name. It
+# never bit because the 'pipeline'/'pipeline_batch' jobTypes go through
+# run_gpu_pipeline.m, which dispatches on `strcmpi(RLMethod, 'omw')` itself
+# and never reaches PetaKit5D's switch. The 'deskew'-with-decon and
+# standalone 'decon' jobTypes DO reach it, via XR_decon_data_wrapper.
+_RL_METHODS = ("original", "simplified", "omw", "cudagen")
+_RL_METHOD_ALIASES = {"simple": "simplified"}
+
+
+def _normalize_rl_method(rl_method: str) -> str:
+    """Map a caller's RL method name onto one PetaKit5D actually implements.
+
+    'simple' -> 'simplified' (the same `decon_lucy_function` kernel, under the
+    name PetaKit5D's switch recognizes). Anything else unrecognized raises,
+    rather than being passed through to write empty volumes.
+    """
+    normalized = _RL_METHOD_ALIASES.get(str(rl_method).lower(), str(rl_method).lower())
+    if normalized not in _RL_METHODS:
+        raise ValueError(
+            f"Unknown rl_method {rl_method!r}. PetaKit5D's RLdecon.m recognizes "
+            f"{_RL_METHODS} and silently writes an EMPTY volume for anything "
+            f"else. Did you mean 'omw' or 'simplified'?"
+        )
+    return normalized
+
+
+def _resolve_psf_paths(
+    psf_path: str | Path | None,
+    psf_paths: list[str | Path] | None,
+    channel_patterns: list[str] | None,
+) -> list[str]:
+    """Normalize the two PSF-input spellings into one per-channel list.
+
+    `psf_paths` is per-channel and must line up with `channel_patterns` --
+    that is the order PetaKit5D's `psfFullpaths` cell array is indexed in.
+    `psf_path` is the single-PSF shorthand, which the MATLAB server
+    broadcasts across however many channels the ticket names. Returning []
+    means "no decon": the server's own switch is `run_decon =
+    ~isempty(psf_path)`.
+    """
+    if psf_paths and psf_path:
+        raise ValueError("Pass psf_path or psf_paths, not both.")
+    if psf_paths:
+        resolved = [str(Path(p).resolve()) for p in psf_paths]
+        if channel_patterns and len(resolved) != len(channel_patterns):
+            raise ValueError(
+                f"psf_paths has {len(resolved)} entries but channel_patterns has "
+                f"{len(channel_patterns)}; PetaKit5D indexes psfFullpaths by "
+                "channel, so they must correspond one-to-one."
+            )
+        return resolved
+    if psf_path:
+        return [str(Path(psf_path).resolve())]
+    return []
+
+
 def submit_remote_crop_job(
     base_file: Path,
     top_roi: tuple[slice, slice] | None,
@@ -182,6 +247,7 @@ def submit_remote_deskew_job(
     dsr_dir_name: str = "DSR",
     queue_dir: Path = QUEUE_DIR,
     psf_path: str | Path | None = None,
+    psf_paths: list[str | Path] | None = None,
     n_iters: int | None = None,
     channel_patterns: list[str] | None = None,
     input_axis_order: str = "yxz",
@@ -190,7 +256,9 @@ def submit_remote_deskew_job(
     z_stage_scan: bool = False,
     reverse: bool = True,
     gpu_decon: bool = False,
-    rl_method: str = "simple",
+    rl_method: str = "omw",
+    background: float | None = None,
+    edge_erosion: int | None = None,
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
@@ -223,10 +291,32 @@ def submit_remote_deskew_job(
     gpu_decon : bool, default False
         Use GPU for deconvolution (requires CUDA-capable GPU on the
         processing node).
-    rl_method : str, default 'simple'
+    psf_paths : list, optional
+        Per-channel PSFs, in the same order as `channel_patterns` -- the
+        order PetaKit5D indexes its `psfFullpaths` cell array in. Mutually
+        exclusive with `psf_path`, which is the single-PSF shorthand the
+        server broadcasts across every channel.
+    rl_method : str, default 'omw'
         Richardson-Lucy variant for the optional decon step. Only used
-        when psf_path is given; also affects the default iteration count
-        (2 for 'omw', 25 otherwise) unless n_iters overrides it.
+        when a PSF is given; also affects the default iteration count
+        (2 for 'omw', 25 otherwise) unless n_iters overrides it. Must be one
+        of 'original'/'simplified'/'omw'/'cudagen' -- 'simple' is accepted
+        as an alias for 'simplified'. See `_normalize_rl_method` for why an
+        unrecognized name is a silent data-loss bug rather than an error.
+    edge_erosion : int, optional
+        Erode this many voxels off the deconvolution result at the volume
+        boundary. PetaKit5D's `RLdecon` applies `edgetaper` per z-PLANE, so
+        the lateral edges are tapered but the AXIAL ones never are; with a
+        short scan (tens of planes) and a PSF covering a large fraction of
+        it, the FFT wraps around in z and rings, producing a bright sheet one
+        or two planes in from the z face. After deskew that sheet appears as
+        a stripe along the acquisition slab's boundary. Leave None for
+        PetaKit5D's default of 0 (no erosion).
+    background : float, optional
+        Camera offset subtracted before deconvolution. Left as None,
+        PetaKit5D resolves its own default of 100 counts, which matches this
+        microscope's measured dark level; pass it explicitly only to record
+        the value in the ticket or to override it.
     save_mip : bool, default False
         Have PetaKit5D write a per-timepoint Z-MIP TIFF (to
         ``<dsrDirName>/MIPs/``) alongside the DS/DSR output. Kept opt-in
@@ -317,12 +407,24 @@ def submit_remote_deskew_job(
         "zarr_input": zarr_input,
     }
 
-    if psf_path:
+    resolved_psfs = _resolve_psf_paths(psf_path, psf_paths, channel_patterns)
+    if resolved_psfs:
+        rl_method = _normalize_rl_method(rl_method)
         params["run_decon"] = True
-        params["psf_path"] = str(psf_path)
+        # `psf_path` stays the single-PSF field the server broadcasts, and is
+        # also what its `run_decon = ~isempty(psf_path)` default keys on, so
+        # always set it. `psf_paths` is the per-channel override it prefers
+        # when present.
+        params["psf_path"] = resolved_psfs[0]
+        if len(resolved_psfs) > 1:
+            params["psf_paths"] = resolved_psfs
         params["decon_iter"] = n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
         params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
+        if background is not None:
+            params["background"] = float(background)
+        if edge_erosion is not None:
+            params["edge_erosion"] = int(edge_erosion)
         _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
 
     payload = {
@@ -343,14 +445,31 @@ def submit_remote_decon_job(
     skewed: bool = True,
     result_dir_name: str = "Decon",
     channel_patterns: list[str] | None = None,
-    rl_method: str = "simple",
+    rl_method: str = "omw",
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
+    xy_pixel_size: float | None = None,
+    z_step_um: float | None = None,
+    dz_psf: float | None = None,
+    background: float | None = None,
+    edge_erosion: int | None = None,
     queue_dir: Path = QUEUE_DIR,
 ) -> Path:
     """
     Creates a JSON job ticket for standalone Deconvolution.
+
+    `z_step_um` and `dz_psf` are the data's and the PSF's axial steps. They
+    are not cosmetic: XR_decon_data_wrapper defaults them to 0.5 and 0.1, and
+    psf_gen_new FFT-decimates the PSF's dim 3 by `z_step_um / dz_psf` whenever
+    that ratio exceeds 1. Deconvolving already-deskewed-and-rotated data means
+    both the data and the PSF are on the same isotropic lab grid, so both must
+    be set to the lab voxel size (0.136) or the PSF is silently shrunk 5x.
+
+    `rl_method` must be one of 'original'/'simplified'/'omw'/'cudagen'
+    ('simple' is accepted as an alias for 'simplified'); this jobType reaches
+    PetaKit5D's RLdecon.m switch, where an unrecognized name silently writes
+    an empty volume. See `_normalize_rl_method`.
     """
     _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
@@ -360,7 +479,32 @@ def submit_remote_decon_job(
 
     base_name = input_target.name
 
+    rl_method = _normalize_rl_method(rl_method)
+
+    # psf_paths has always been a required argument of this function and has
+    # never been written into the ticket, so the standalone 'decon' jobType
+    # reached XR_decon_data_wrapper with psfFullpaths={} and died indexing
+    # dc_psfFullpaths{psfMapping}. One PSF is allowed to stand for every
+    # channel -- the server broadcasts it -- but any other count has to line
+    # up with channelPatterns, which is the order PetaKit5D indexes them in.
+    if isinstance(psf_paths, (str, Path)):
+        resolved_psfs = [str(Path(psf_paths).resolve())]
+    else:
+        resolved_psfs = [str(Path(x).resolve()) for x in psf_paths]
+    if not resolved_psfs:
+        raise ValueError("submit_remote_decon_job needs at least one PSF path.")
+    for candidate in resolved_psfs:
+        if not Path(candidate).exists():
+            raise FileNotFoundError(f"PSF not found: {candidate}")
+    if channel_patterns and len(resolved_psfs) not in (1, len(channel_patterns)):
+        raise ValueError(
+            f"psf_paths has {len(resolved_psfs)} entries but channel_patterns has "
+            f"{len(channel_patterns)}; pass one PSF (broadcast to every channel) "
+            "or exactly one per channel."
+        )
+
     params = {
+        "psf_paths": resolved_psfs,
         "result_dir_name": result_dir_name,
         "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
         "gpu_job": gpu_job,
@@ -369,6 +513,17 @@ def submit_remote_decon_job(
         "save_16bit": True,
     }
     _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
+
+    if xy_pixel_size is not None:
+        params["xy_pixel_size"] = float(xy_pixel_size)
+    if z_step_um is not None:
+        params["z_step_um"] = float(z_step_um)
+    if dz_psf is not None:
+        params["dz_psf"] = float(dz_psf)
+    if background is not None:
+        params["background"] = float(background)
+    if edge_erosion is not None:
+        params["edge_erosion"] = int(edge_erosion)
 
     if channel_patterns:
         params["channel_patterns"] = channel_patterns
@@ -460,6 +615,7 @@ def submit_pipeline_job(
                 "psf_tools.extract_bead_psf (which embeds the 'spacing' tag)."
             )
 
+    rl_method = _normalize_rl_method(rl_method)
     params = {
         "shm_path": str(shm_path),
         "xy_pixel_size": xy_pixel_size,
@@ -549,6 +705,7 @@ def submit_pipeline_batch_job(
         {"shm_path": str(item["shm_path"]), "output_file": str(item["output_file"])} for item in items
     ]
 
+    rl_method = _normalize_rl_method(rl_method)
     params = {
         "items": resolved_items,
         "xy_pixel_size": xy_pixel_size,
@@ -624,6 +781,24 @@ def wait_for_job(job_path: Path, poll_interval: int = 2) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _submitter_revision() -> str:
+    """Short git revision of the opym checkout that built this ticket.
+
+    Returns 'unknown' rather than raising if git isn't available or this
+    isn't a checkout -- ticket submission must never fail over provenance.
+    """
+    try:
+        repo_dir = str(Path(__file__).resolve().parent)
+        rev = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        return rev or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _write_ticket(payload: dict, base_name: str, prefix: str, queue_dir: Path) -> Path:
     """Helper to write the JSON file.
 
@@ -647,6 +822,14 @@ def _write_ticket(payload: dict, base_name: str, prefix: str, queue_dir: Path) -
     # Sanitize name
     safe_name = re.sub(r"[^\w\-_\.]", "_", base_name)
     job_file = queue_dir / f"{prefix}_{safe_name}_{timestamp}_{unique_suffix}.json"
+
+    # Stamp the submitting code's revision. `opym-serve` loads
+    # run_petakit_server.m into a long-lived MATLAB process exactly once, so
+    # a restart-less code change leaves a stale server interpreting new
+    # tickets -- which in this codebase has repeatedly presented as "silently
+    # wrong but reported done". The server echoes this on every job, so a
+    # stale process is visible in the log instead of being inferred hours later.
+    payload.setdefault("submitterRev", _submitter_revision())
 
     with open(job_file, "w") as f:
         json.dump(payload, f, indent=4)
