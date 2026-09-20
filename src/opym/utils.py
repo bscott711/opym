@@ -166,6 +166,37 @@ def orient_zyx_for_decon_tiff(volume: np.ndarray) -> np.ndarray:
     return np.rot90(volume, k=1, axes=(-2, -1))
 
 
+def write_decon_staged_tiff(volume_zyx: np.ndarray, dst: Path) -> None:
+    """Writes one raw (Z, Y, X) volume as a decon-ready staged TIFF at `dst`,
+    in the `orient_zyx_for_decon_tiff` orientation PetaKit5D's decon path
+    requires (see that function's docstring for why).
+
+    Shared by `bioimaging.backfill.pipeline.build_decon_staging_dir` (batch
+    path: materializes a whole zarr-precropped acquisition after the fact)
+    and `opym.stream.receiver` (live path: stages each frame as it arrives)
+    so the two never drift on the write-then-rename contract below.
+
+    No-ops if `dst` already exists -- a half-written TIFF is not merely
+    incomplete, it poisons every subsequent retry, because PetaKit5D's
+    `readtiff` raises on it and a naive retry would keep handing it back;
+    skip-if-present also makes re-delivery of an already-staged frame (a
+    stream client's reconnect resend, or a batch re-run) a safe no-op.
+    """
+    import os
+
+    import tifffile
+
+    dst = Path(dst)
+    if dst.exists():
+        return
+    oriented = orient_zyx_for_decon_tiff(np.asarray(volume_zyx))
+    # Write-then-rename so a crash mid-write never leaves a half-written
+    # TIFF at the real destination name (see docstring above).
+    tmp = dst.with_name(dst.name + ".tmp")
+    tifffile.imwrite(tmp, oriented, compression="zlib")
+    os.replace(tmp, dst)
+
+
 def scan_channel_patterns(directory: Path) -> str:
     """
     Scans a directory for unique channel identifiers (e.g., _C00, _C01).

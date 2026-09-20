@@ -42,39 +42,57 @@ _VALID_TYPES = frozenset(
 # --- SESSION_START header fields ---------------------------------------
 #
 # Sent once, before any MSG_FRAME, to declare the acquisition this session
-# will stream. Fields map directly onto opym.petakit.submit_pipeline_job's
-# parameters -- the receiver has no other source for them, so everything
-# that function needs must be declared upfront:
+# will stream. The receiver writes each channel directly into a raw OME-Zarr
+# mirror store on GPFS (opym.stream.rawmirror) -- the same layout a
+# completed Globus transfer already produces -- rather than submitting a
+# processing ticket itself; opym-backfill's normal discovery/deskew/decon
+# path picks the finished dataset up from there unmodified. So only what
+# the raw-mirror writer itself needs is REQUIRED:
 #
-#   base_name        str    -- output basename; final zarrs are named
-#                               "<base_name>_T{t:04d}_C{c}.zarr"
-#   output_dir       str    -- GPFS directory PetaKit5D writes final
-#                               Decon/DSR output into (submit_pipeline_job's
-#                               `output_file.parent`), e.g. ".../Decon"
+#   base_name        str    -- the sample/grouping prefix, e.g. "Cell_001".
+#                               Each channel's raw store is named
+#                               "<base_name>_<channel_name>.ome.zarr" --
+#                               must match opym.discovery's
+#                               "<prefix>_<Channel>_<Wavelength>" convention
+#                               (see channel_names below) so the finished
+#                               store groups back under this same prefix.
+#   raw_root         str    -- GPFS directory to write each channel's raw
+#                               "<base_name>_<channel_name>.ome.zarr" store
+#                               into -- what a Globus transfer would drop
+#                               the session into today, e.g.
+#                               ".../DataUpload/<session>/"
 #   dtype            str    -- numpy dtype string for every frame's raw
 #                               payload, e.g. "uint16"
-#   shape_zyx        [int, int, int]  -- raw per-volume (Z, Y, X) shape
-#                               every MSG_FRAME payload will match
-#   num_timepoints   int    -- total T count (for the (T, C) grid)
+#   shape_zyx        [int, int, int]  -- raw per-volume (Z, Y, X) shape;
+#                               a per-FRAME shape_zyx overrides this for
+#                               that channel (see FRAME fields below)
+#   num_timepoints   int    -- declared T count, used as the raw store's
+#                               array shape. May exceed what actually gets
+#                               written (aborted acquisition) -- handled
+#                               downstream exactly like a Globus-landed
+#                               dataset (see channel_store_timepoints in
+#                               bioimaging/backfill/pipeline.py)
 #   channels         [int]  -- channel indices this session will send
-#   channel_names    [str]  -- human-readable names, same order as `channels`
-#   z_step_um        float
-#   xy_pixel_size    float
-#   sheet_angle_deg  float
-#   t_interval_s     float  -- seconds between timepoints (consolidate metadata)
-#   interp_method    str    -- default "cubic"
-#   rl_method        str    -- default "simple"
-#   iterations       int | None
-#   psf_paths        [str] | None -- omit/empty to skip decon (deskew only)
-#   dz_psf           float | None -- the PSF's own z-step, microns. If
-#                               omitted while psf_paths is non-empty,
-#                               submit_pipeline_job falls back to reading it
-#                               from the first PSF file's ImageJ 'spacing'
-#                               tag (same as the batch path) -- but that read
-#                               happens on the hot per-frame path here, so
-#                               sending it explicitly avoids a per-frame file
-#                               open and avoids a hard failure if the PSF
-#                               file lacks that tag.
+#   channel_names    [str]  -- REQUIRED, one per `channels` entry, in the
+#                               "<ChannelName>_<Wavelength>" shape
+#                               opym.discovery expects, e.g. "GFP_488"
+#   z_step_um        float  -- written into each store's own "z" coordinate
+#                               array, the only z-step source
+#                               opym.metadata.parse_zarr_z_step_from_store
+#                               trusts (see its docstring)
+#
+# Decon parameters (PSF, wiener_alpha, edge_erosion, rl_method) are NOT
+# part of this handshake -- they're resolved server-side by the batch
+# backfill driver's own fixed configuration (OPYM_DECON_PSF env var,
+# DECON_WIENER_ALPHA/DECON_EDGE_EROSION constants), same as for a
+# Globus-landed dataset. When that env var is set on the receiver's host,
+# every frame is ALSO pre-staged as a decon-ready TIFF
+# (opym.utils.write_decon_staged_tiff) so the batch pass's own staging
+# step is a no-op by the time it runs -- purely a latency optimization,
+# not a correctness dependency; a client sending sheet_angle_deg,
+# xy_pixel_size, t_interval_s, psf_paths, etc. is harmless (ignored) but
+# no longer required, since STREAMING_PROTOCOL.md's worked example still
+# shows them for provenance/logging purposes.
 #
 # --- FRAME header fields -------------------------------------------------
 #
@@ -102,10 +120,10 @@ _VALID_TYPES = frozenset(
 #
 #   through_frame_index  int  -- highest frame_index N such that every
 #                               frame_index in [0, N] has been durably
-#                               staged to /dev/shm AND ticketed. -1 if
-#                               nothing has been processed yet for this
-#                               session. The client's local retry buffer
-#                               only needs to keep frames with
+#                               written into its channel's raw mirror store
+#                               on GPFS. -1 if nothing has been processed
+#                               yet for this session. The client's local
+#                               retry buffer only needs to keep frames with
 #                               frame_index > through_frame_index.
 #
 # --- RESUME header fields (client -> server, right after reconnecting) ---

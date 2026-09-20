@@ -1,28 +1,45 @@
 # Ruff style: Compliant
 """
 ROUTER-side server for the real-time frame-streaming protocol (see
-`opym.stream.protocol`). Bridges incoming frames into the existing
-`/dev/shm/petakit_jobs` ticket pipeline -- `opym.petakit`,
-`opym.local_gpu_worker`, and `opym.consolidate` are unmodified; this module
-only produces the same staged-zarr + JSON-ticket shape the batch path
-already produces (see `bioimaging/CLAUDE.md`'s pipeline diagram), per frame
-instead of per dataset.
+`opym.stream.protocol`). Writes each incoming frame directly into a
+GPFS-resident raw OME-Zarr mirror store (`opym.stream.rawmirror`) -- the
+exact same directory-per-channel layout a completed Globus transfer already
+leaves behind for the newer pymmcore-based MDA writer. That means
+`opym.discovery` and the existing `opym-backfill --watch` loop discover a
+streamed dataset, and submit its one deskew/decon ticket, with no code
+changes on the discovery/backfill side: this module's whole job is making a
+live acquisition indistinguishable, once `SESSION_END` lands, from one that
+finished uploading over Globus.
+
+When decon is enabled on this host (`OPYM_DECON_PSF` set -- the same switch
+`bioimaging.backfill.pipeline.resolve_decon_psf` reads), each frame is also
+written straight to `decon_stage/` in PetaKit5D's required `(ny, nx, nz)`
+TIFF layout (`opym.utils.write_decon_staged_tiff`, shared with
+`bioimaging.backfill.pipeline.build_decon_staging_dir`). This is a pure
+pre-computation: it makes the batch pass's own staging step a no-op (every
+destination file already exists) rather than a second, divergent decon
+path -- decon parameters themselves (PSF, wiener_alpha, edge_erosion) are
+still resolved and the ticket still submitted entirely by the batch
+backfill driver, unchanged.
+
+There is deliberately no `opym.consolidate` step here anymore: each
+channel's frames are written straight into their final-shaped store as they
+arrive, not into small per-(t,c) outputs that need stitching afterward.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import zarr
 import zmq
 
-from opym.petakit import QUEUE_DIR, submit_pipeline_job
+from opym.stream import rawmirror
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -32,16 +49,29 @@ from opym.stream.protocol import (
     pack_message,
     unpack_message,
 )
-from opym.utils import orient_zyx_for_dsr
+from opym.utils import write_decon_staged_tiff
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BIND_ADDR = "tcp://127.0.0.1:5555"
-DEFAULT_SHM_DIR = Path("/dev/shm/opym_jobs")
 ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
 POLL_TIMEOUT_MS = 500
+
+# Same environment variable bioimaging.backfill.pipeline.resolve_decon_psf
+# reads to decide whether the batch pass decons at all. Read directly
+# (rather than importing that function) to keep the one-way dependency
+# direction CLAUDE.md documents: opym_local must not import from
+# bioimaging. Duplicating a single env-var name is a far smaller coupling
+# than that import would be, and getting this wrong costs nothing but a
+# missed pre-staging optimization -- build_decon_staging_dir's own
+# skip-if-exists check makes it harmless either way (see module docstring).
+_DECON_PSF_ENV_VAR = "OPYM_DECON_PSF"
+
+
+def _decon_enabled() -> bool:
+    return bool(os.environ.get(_DECON_PSF_ENV_VAR, "").strip())
 
 
 @dataclass
@@ -49,21 +79,23 @@ class SessionState:
     session_id: str
     identity: bytes
     base_name: str
-    output_dir: Path
+    raw_root: Path
     dtype: str
     shape_zyx: tuple[int, int, int]
     num_timepoints: int
     channels: list[int]
     channel_names: list[str]
+    channel_store_paths: dict[int, Path]
+    # Position of each channel's store path in the whole session's
+    # lexicographically-sorted store-path list -- this is exactly the
+    # `cidx` `opym.discovery.discover_leaf_datasets` will later assign via
+    # `sorted(members)`, so decon-stage filenames written here match what
+    # `build_decon_staging_dir` would independently produce byte-for-byte
+    # (see its skip-if-exists check in `write_decon_staged_tiff`).
+    channel_cidx: dict[int, int]
     z_step_um: float
-    xy_pixel_size: float
-    sheet_angle_deg: float
-    t_interval_s: float
-    interp_method: str
-    rl_method: str
-    iterations: int | None
-    psf_paths: list[str]
-    dz_psf: float | None
+    decon_enabled: bool
+    channel_arrays: dict[int, Any] = field(default_factory=dict)
     received_pairs: set[tuple[int, int]] = field(default_factory=set)
     processed_frame_indices: set[int] = field(default_factory=set)
     ack_floor: int = -1
@@ -72,12 +104,17 @@ class SessionState:
     last_activity: float = field(default_factory=time.monotonic)
     ended: bool = False
 
-    def expected_zarr_names(self) -> list[str]:
-        return [
-            f"{self.base_name}_T{t:04d}_C{c}.zarr"
-            for t in range(self.num_timepoints)
-            for c in self.channels
-        ]
+    @property
+    def leaf_dir(self) -> Path:
+        """Matches `opym.discovery.LeafDataset.leaf_dir` for this session's
+        eventual dataset: `raw_root / base_name`."""
+        return self.raw_root / self.base_name
+
+    @property
+    def decon_stage_dir(self) -> Path:
+        """Matches `zarr_deskew_data_dir`'s decon branch in
+        `bioimaging.backfill.pipeline`."""
+        return self.leaf_dir / "decon_stage"
 
 
 class StreamReceiver:
@@ -92,24 +129,27 @@ class StreamReceiver:
     def __init__(
         self,
         bind_addr: str = DEFAULT_BIND_ADDR,
-        shm_dir: Path = DEFAULT_SHM_DIR,
-        queue_dir: Path = QUEUE_DIR,
         ack_every_n_frames: int = ACK_EVERY_N_FRAMES,
         ack_every_sec: float = ACK_EVERY_SEC,
         idle_timeout_sec: float = IDLE_TIMEOUT_SEC,
     ) -> None:
         self.bind_addr = bind_addr
-        self.shm_dir = Path(shm_dir)
-        self.queue_dir = Path(queue_dir)
         self.ack_every_n_frames = ack_every_n_frames
         self.ack_every_sec = ack_every_sec
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
 
-        self.shm_dir.mkdir(parents=True, exist_ok=True)
-
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
+        # Required for the RESUME/reconnect design this protocol depends on
+        # (see protocol.py's module docstring): by default a ROUTER socket
+        # REJECTS a new connection that presents an identity already
+        # associated with another (possibly just-dropped) connection,
+        # rather than handing the identity over to it -- which silently
+        # breaks exactly the "fresh TCP connection, same identity" reconnect
+        # this receiver is built around. Confirmed via a real flaky
+        # reconnect-drops-RESUME failure without this set.
+        self._socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
         self._socket.bind(self.bind_addr)
         self._poller = zmq.Poller()
         self._poller.register(self._socket, zmq.POLLIN)
@@ -173,36 +213,57 @@ class StreamReceiver:
     def _handle_session_start(
         self, identity: bytes, session_id: str, header: dict[str, Any]
     ) -> None:
-        output_dir = Path(header["output_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        session = SessionState(
-            session_id=session_id,
-            identity=identity,
-            base_name=header["base_name"],
-            output_dir=output_dir,
-            dtype=header["dtype"],
-            shape_zyx=tuple(header["shape_zyx"]),
-            num_timepoints=header["num_timepoints"],
-            channels=list(header["channels"]),
-            channel_names=list(header.get("channel_names") or []),
-            z_step_um=header["z_step_um"],
-            xy_pixel_size=header["xy_pixel_size"],
-            sheet_angle_deg=header["sheet_angle_deg"],
-            t_interval_s=header["t_interval_s"],
-            interp_method=header.get("interp_method", "cubic"),
-            rl_method=header.get("rl_method", "simple"),
-            iterations=header.get("iterations"),
-            psf_paths=list(header.get("psf_paths") or []),
-            dz_psf=header.get("dz_psf"),
-        )
+        # A malformed header here must not take down every other session
+        # this process is holding -- log and drop rather than let a
+        # KeyError/ValueError propagate out of _run_once.
+        try:
+            raw_root = Path(header["raw_root"])
+            base_name = header["base_name"]
+            channels = list(header["channels"])
+            channel_names = list(header.get("channel_names") or [])
+            if len(channel_names) != len(channels):
+                raise ValueError(
+                    f"channel_names (got {len(channel_names)}) must have exactly "
+                    f"one entry per channel (got {len(channels)}) -- see "
+                    "STREAMING_PROTOCOL.md's SESSION_START fields"
+                )
+            channel_store_paths = {
+                c: rawmirror.store_path_for_channel(raw_root, base_name, name)
+                for c, name in zip(channels, channel_names)
+            }
+            sorted_paths = sorted(channel_store_paths.values())
+            channel_cidx = {
+                c: sorted_paths.index(p) for c, p in channel_store_paths.items()
+            }
+
+            session = SessionState(
+                session_id=session_id,
+                identity=identity,
+                base_name=base_name,
+                raw_root=raw_root,
+                dtype=header["dtype"],
+                shape_zyx=tuple(header["shape_zyx"]),
+                num_timepoints=header["num_timepoints"],
+                channels=channels,
+                channel_names=channel_names,
+                channel_store_paths=channel_store_paths,
+                channel_cidx=channel_cidx,
+                z_step_um=header["z_step_um"],
+                decon_enabled=_decon_enabled(),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
+            return
+
         self.sessions[session_id] = session
         logger.info(
-            "Session %s started: base_name=%s grid=%dT x %dC -> %s",
+            "Session %s started: base_name=%s grid=%dT x %dC -> %s (decon_enabled=%s)",
             session_id,
             session.base_name,
             session.num_timepoints,
             len(session.channels),
-            output_dir,
+            session.raw_root,
+            session.decon_enabled,
         )
         self._send_ack(session)
 
@@ -228,10 +289,10 @@ class StreamReceiver:
         if frame_index not in session.processed_frame_indices:
             if (t, c) not in session.received_pairs:
                 try:
-                    self._stage_and_ticket(session, header, payload)
+                    self._stage_frame(session, header, payload)
                 except Exception:
                     logger.exception(
-                        "Failed to stage/ticket (t=%d, c=%d) for session %s -- "
+                        "Failed to stage (t=%d, c=%d) for session %s -- "
                         "dropping this frame; the client's retry buffer will "
                         "resend it on the next ACK-driven resume.",
                         t,
@@ -258,7 +319,7 @@ class StreamReceiver:
         ):
             self._send_ack(session)
 
-    def _stage_and_ticket(
+    def _stage_frame(
         self, session: SessionState, header: dict[str, Any], payload: bytes
     ) -> None:
         t, c = header["t"], header["c"]
@@ -266,29 +327,44 @@ class StreamReceiver:
         dtype = header.get("dtype") or session.dtype
 
         raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
-        volume = orient_zyx_for_dsr(raw)
 
-        name = f"{session.base_name}_T{t:04d}_C{c}.zarr"
-        shm_path = self.shm_dir / name
-        zarr.save_array(str(shm_path), volume, chunks=volume.shape)
+        arr = session.channel_arrays.get(c)
+        if arr is None:
+            # Lazily created on this channel's first frame, using THIS
+            # frame's own shape/dtype -- shape_zyx can legitimately differ
+            # per channel (e.g. two cameras with different crops), so a
+            # single session-wide array shape can't be assumed up front.
+            arr = rawmirror.create_channel_store(
+                session.channel_store_paths[c],
+                num_timepoints=session.num_timepoints,
+                shape_zyx=shape_zyx,
+                dtype=dtype,
+                z_step_um=session.z_step_um,
+            )
+            session.channel_arrays[c] = arr
+        rawmirror.write_timepoint(arr, t, raw)
 
-        output_file = session.output_dir / name
-        submit_pipeline_job(
-            output_file=output_file,
-            shm_path=shm_path,
-            psf_paths=session.psf_paths or None,
-            z_step_um=session.z_step_um,
-            xy_pixel_size=session.xy_pixel_size,
-            sheet_angle_deg=session.sheet_angle_deg,
-            interp_method=session.interp_method,
-            iterations=session.iterations,
-            rl_method=session.rl_method,
-            dz_psf=session.dz_psf,
-            queue_dir=self.queue_dir,
-        )
+        if session.decon_enabled:
+            dst = self._decon_stage_path(session, c, t)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            write_decon_staged_tiff(raw, dst)
+
         logger.debug(
-            "Staged + ticketed T=%d C=%d for session %s", t, c, session.session_id
+            "Staged T=%d C=%d for session %s -> %s",
+            t,
+            c,
+            session.session_id,
+            session.channel_store_paths[c],
         )
+
+    def _decon_stage_path(self, session: SessionState, c: int, t: int) -> Path:
+        """Matches `build_decon_staging_dir`'s own naming exactly, so its
+        skip-if-exists check treats this file as already done."""
+        if session.num_timepoints > 1:
+            cidx = session.channel_cidx[c]
+            return session.decon_stage_dir / f"{session.base_name}_C{cidx}_T{t:03d}.tif"
+        store_name = session.channel_store_paths[c].name.removesuffix(".zarr")
+        return session.decon_stage_dir / f"{store_name}.tif"
 
     def _advance_ack_floor(self, session: SessionState) -> None:
         processed = session.processed_frame_indices
@@ -315,28 +391,18 @@ class StreamReceiver:
         if session.ended:
             return
         session.ended = True
-        sidecar = session.output_dir / ".opym_consolidate.json"
-        sidecar.write_text(
-            json.dumps(
-                {
-                    "expected_zarrs": session.expected_zarr_names(),
-                    "base_name": session.base_name,
-                    "z_step_um": session.z_step_um,
-                    "xy_pixel_um": session.xy_pixel_size,
-                    "t_interval_s": session.t_interval_s,
-                    "channel_names": session.channel_names,
-                },
-                indent=2,
-            )
-        )
         logger.info(
-            "Session %s ended (%s): %d/%d (t,c) pairs received, sidecar written to %s",
+            "Session %s ended (%s): %d/%d (t,c) pairs received for %s under %s",
             session.session_id,
             reason,
             len(session.received_pairs),
             session.num_timepoints * len(session.channels),
-            sidecar,
+            session.base_name,
+            session.raw_root,
         )
+        # No consolidation step: see module docstring. `opym-backfill
+        # --watch` (already running independently) discovers this dataset
+        # on its own next pass -- nothing to trigger here.
         del self.sessions[session.session_id]
 
     def _handle_resume(self, identity: bytes, session_id: str) -> None:
