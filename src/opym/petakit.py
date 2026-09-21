@@ -93,16 +93,20 @@ def _apply_omw_params(
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
+    damp_factor: float | None = None,
 ) -> dict:
     """Inject OMW back-projector knobs into a ticket ``params`` dict, but only
     the ones explicitly provided.
 
     These are consumed by run_petakit_server.m and forwarded to PetaKit5D's
-    ``omw_backprojector_generation`` (used only when ``rl_method='omw'``).
-    Leaving a value as None omits its key entirely, so non-omw jobs -- and the
-    historical stock-default behavior -- are unchanged. Keys use the ticket's
-    snake_case convention; the server maps them to wienerAlpha / OTFCumThresh /
-    hannWinBounds.
+    ``omw_backprojector_generation`` (used only when ``rl_method='omw'``) and,
+    for ``damp_factor``, to ``decon_lucy_omw_function`` directly (it only has
+    an effect when > 1, capping how far a decon value can depart from its own
+    input -- PetaKit5D's own remedy for isolated over-sharpened voxel
+    spikes). Leaving a value as None omits its key entirely, so non-omw jobs
+    -- and the historical stock-default behavior -- are unchanged. Keys use
+    the ticket's snake_case convention; the server maps them to wienerAlpha /
+    OTFCumThresh / hannWinBounds / dampFactor.
     """
     if wiener_alpha is not None:
         params["wiener_alpha"] = float(wiener_alpha)
@@ -110,6 +114,8 @@ def _apply_omw_params(
         params["otf_cum_thresh"] = float(otf_cum_thresh)
     if hann_win_bounds is not None:
         params["hann_win_bounds"] = [float(v) for v in hann_win_bounds]
+    if damp_factor is not None:
+        params["damp_factor"] = float(damp_factor)
     return params
 
 
@@ -271,6 +277,7 @@ def submit_remote_deskew_job(
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
+    damp_factor: float | None = None,
     save_mip: bool = False,
     zarr_input: bool = False,
 ) -> Path:
@@ -434,7 +441,7 @@ def submit_remote_deskew_job(
             params["background"] = float(background)
         if edge_erosion is not None:
             params["edge_erosion"] = int(edge_erosion)
-        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
+        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
 
     payload = {
         "jobType": "deskew",
@@ -458,6 +465,7 @@ def submit_remote_decon_job(
     wiener_alpha: float | None = None,
     otf_cum_thresh: float | None = None,
     hann_win_bounds: list[float] | None = None,
+    damp_factor: float | None = None,
     xy_pixel_size: float | None = None,
     z_step_um: float | None = None,
     dz_psf: float | None = None,
@@ -521,7 +529,7 @@ def submit_remote_decon_job(
         "rl_method": rl_method,
         "save_16bit": True,
     }
-    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds)
+    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
 
     if xy_pixel_size is not None:
         params["xy_pixel_size"] = float(xy_pixel_size)

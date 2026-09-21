@@ -95,6 +95,15 @@ _NEW_DATASET_COLUMNS = {
     # included. What is actually wanted here is provenance: which PSF
     # produced the data on disk.
     "decon_psf": "TEXT",
+    # A short fingerprint of the OMW knobs (wienerAlpha/OTFCumThresh/
+    # hannWinBounds/dampFactor) this dataset's DSR output was actually
+    # produced with. `decon_psf` alone answers "which PSF" but not "which
+    # settings" -- two runs with the identical PSF file and different
+    # alpha/hann/damp look byte-identical to that column, so a parameter
+    # retune (this one: the 22- then 20-variant sweep that picked `super4`)
+    # would otherwise be silently skipped as already-done. NULL for
+    # deskew-only or for output predating this column.
+    "decon_params": "TEXT",
     # (size, mtime) signature of the raw master file at the moment it was
     # marked 'corrupt'/'dead' -- lets a later pass tell "same broken file
     # we already gave up on" (skip re-attempting a guaranteed-identical
@@ -284,6 +293,33 @@ class StatusRegistry:
         with self._cursor() as cur:
             row = cur.execute(
                 "SELECT decon_psf FROM datasets WHERE dataset_key=?", (dataset_key,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_decon_params(self, dataset_key: str, params_fingerprint: str | None) -> None:
+        """Records a fingerprint of the OMW knobs (see
+        `backfill.pipeline.decon_params_fingerprint`) this dataset's on-disk
+        output was actually produced with -- the parameter-retune analog of
+        `set_decon_psf`. Set alongside it, not instead of it: `decon_psf`
+        stays the human-readable "which PSF" answer.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE datasets SET decon_params=? WHERE dataset_key=?",
+                (params_fingerprint, dataset_key),
+            )
+
+    def get_decon_params(self, dataset_key: str) -> str | None:
+        """The OMW parameter fingerprint this dataset's on-disk output was
+        produced with, or None for deskew-only or for output written before
+        this column existed. Callers compare this against the fingerprint of
+        the settings they are about to use, alongside `get_decon_psf`: same
+        PSF file but different alpha/hann/damp is a real, on-disk-visible
+        difference, not a no-op.
+        """
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT decon_params FROM datasets WHERE dataset_key=?", (dataset_key,)
             ).fetchone()
         return row[0] if row and row[0] else None
 
