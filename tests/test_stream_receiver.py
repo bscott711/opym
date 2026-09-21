@@ -10,6 +10,8 @@ see the module docstring in `opym.stream.receiver`.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 import tifffile
@@ -262,6 +264,37 @@ def test_session_end_cleans_up_session_state(tmp_path, receiver, client):
     assert session_id not in receiver.sessions
 
 
+def test_session_end_sends_final_ack(tmp_path, receiver, client):
+    """Regression test for a real bug found on the rig: a client's
+    `wait_for_all_acked()` (its durability signal) timed out waiting for the
+    last batch of frames' ACK, even though the receiver had already durably
+    staged everything -- because `_finalize_session` deleted the session
+    without ever sending a closing ACK. Reproduce with a batch smaller than
+    `ack_every_n_frames` so no periodic inline ACK would have covered it."""
+    session_id = "sess-final-ack"
+    raw_root = tmp_path / "raw"
+    sock = client(session_id)
+    _start_session(
+        sock, session_id, receiver, _session_header(raw_root, num_timepoints=1)
+    )
+
+    header, vol = _frame(t=0, c=0, frame_index=0)
+    sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
+    _drive(receiver)
+    _, frame_ack = _recv_ack(sock)
+    assert frame_ack["through_frame_index"] == 0
+
+    sock.send_multipart(
+        pack_message(MSG_SESSION_END, session_id, {"reason": "complete"})
+    )
+    _drive(receiver)
+
+    # Before the fix, no message was ever sent here -- this recv would hang
+    # (or, under a poller with a timeout, simply never arrive).
+    _, final_ack = _recv_ack(sock)
+    assert final_ack["through_frame_index"] == 0
+
+
 def test_resume_after_reconnect_skips_already_processed_frames(
     tmp_path, receiver, client
 ):
@@ -395,6 +428,99 @@ def test_decon_stage_written_with_correct_orientation_when_enabled(
     np.testing.assert_array_equal(
         tifffile.imread(staged), orient_zyx_for_decon_tiff(vol)
     )
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.02):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+# --- receiver behavior: RAM-disk staging + background drain ---------------
+
+
+def test_staging_off_by_default_writes_directly_to_raw_root(
+    tmp_path, receiver, client, monkeypatch
+):
+    """No env var set -- must behave exactly like every test above, with no
+    staging root and no drain involved at all."""
+    monkeypatch.delenv("OPYM_STREAM_STAGE_ROOT", raising=False)
+    session_id = "sess-nostage"
+    raw_root = tmp_path / "raw"
+    sock = client(session_id)
+    _start_session(
+        sock, session_id, receiver, _session_header(raw_root, num_timepoints=1)
+    )
+    assert receiver.sessions[session_id].write_root == raw_root
+
+
+def test_staging_writes_to_stage_root_then_drains_to_raw_root(
+    tmp_path, receiver, client, monkeypatch
+):
+    stage_root = tmp_path / "stage"
+    raw_root = tmp_path / "raw"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage_root))
+    session_id = "sess-staged"
+    sock = client(session_id)
+    _start_session(
+        sock, session_id, receiver, _session_header(raw_root, num_timepoints=1)
+    )
+    assert receiver.sessions[session_id].write_root == stage_root
+
+    header, vol = _frame(t=0, c=0, frame_index=0)
+    sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
+    _drive(receiver)
+    _recv_ack(sock)
+
+    # Immediately visible under the STAGE root, not raw_root yet.
+    np.testing.assert_array_equal(
+        _read_raw_timepoint(stage_root, "sample", "C0", t=0), vol
+    )
+    assert not (raw_root / "sample_C0.ome.zarr").exists()
+
+    sock.send_multipart(
+        pack_message(MSG_SESSION_END, session_id, {"reason": "complete"})
+    )
+    _drive(receiver)
+    _recv_ack(sock)  # the final-ACK fix -- also exercised here
+
+    # The drain runs on a background thread; wait for it to land.
+    dest = raw_root / "sample_C0.ome.zarr"
+    assert _wait_until(lambda: dest.exists())
+    got = _read_raw_timepoint(raw_root, "sample", "C0", t=0)
+    np.testing.assert_array_equal(got, vol)
+
+
+def test_staging_rejects_session_when_insufficient_free_space(
+    tmp_path, receiver, client, monkeypatch
+):
+    stage_root = tmp_path / "stage"
+    stage_root.mkdir()
+    raw_root = tmp_path / "raw"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage_root))
+
+    class _TinyDiskUsage:
+        free = 1  # 1 byte free -- nowhere near enough for any real session
+
+    import opym.stream.receiver as receiver_mod
+
+    monkeypatch.setattr(
+        receiver_mod.shutil, "disk_usage", lambda _path: _TinyDiskUsage()
+    )
+
+    session_id = "sess-nospace"
+    sock = client(session_id)
+    sock.send_multipart(
+        pack_message(
+            MSG_SESSION_START, session_id, _session_header(raw_root, num_timepoints=1)
+        )
+    )
+    _drive(receiver)
+
+    assert session_id not in receiver.sessions
 
 
 def test_decon_stage_cidx_matches_sorted_store_order_not_channel_index(

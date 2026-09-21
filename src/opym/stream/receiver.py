@@ -25,12 +25,28 @@ backfill driver, unchanged.
 There is deliberately no `opym.consolidate` step here anymore: each
 channel's frames are written straight into their final-shaped store as they
 arrive, not into small per-(t,c) outputs that need stitching afterward.
+
+RAM-disk staging (opt-in, `OPYM_STREAM_STAGE_ROOT`): when set, every write
+this module makes (raw mirror stores AND decon-stage TIFFs) goes to
+`<stage_root>/<base_name>/...` instead of `<raw_root>/<base_name>/...` --
+intended to be a tmpfs mount (e.g. `/dev/shm`), so PetaKit5D's local GPU
+pipeline (itself already tmpfs-native -- see `local_gpu_worker.py`,
+`run_petakit_server.m`) reads its input with zero GPFS read latency. `Session
+State.raw_root` keeps its exact original meaning (the client's declared
+final destination) unchanged; a background `opym.stream.drain.DrainPool`
+copies each completed session from the staging root to `raw_root`,
+verifies it byte-for-byte, and only then makes it visible there -- see
+`_finalize_session`. Unset (the default, and what every existing test and
+the current `opym-receive.service` use), this module behaves exactly as
+before: every write goes straight to `raw_root`, synchronously, no staging,
+no drain, no behavior change at all.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +55,7 @@ from typing import Any
 import numpy as np
 import zmq
 
-from opym.stream import rawmirror
+from opym.stream import drain, rawmirror
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -69,9 +85,32 @@ POLL_TIMEOUT_MS = 500
 # skip-if-exists check makes it harmless either way (see module docstring).
 _DECON_PSF_ENV_VAR = "OPYM_DECON_PSF"
 
+# See module docstring's "RAM-disk staging" section. Read fresh per session
+# (not captured once at receiver construction), matching `_decon_enabled`'s
+# own per-session-read pattern -- both are toggled per-test via monkeypatch,
+# and neither is expected to change mid-process in production.
+_STAGE_ROOT_ENV_VAR = "OPYM_STREAM_STAGE_ROOT"
+
 
 def _decon_enabled() -> bool:
     return bool(os.environ.get(_DECON_PSF_ENV_VAR, "").strip())
+
+
+def _stage_root_from_env() -> Path | None:
+    val = os.environ.get(_STAGE_ROOT_ENV_VAR, "").strip()
+    return Path(val) if val else None
+
+
+def _estimate_session_bytes(header: dict[str, Any]) -> int:
+    """Rough pre-flight size estimate from SESSION_START's declared shape --
+    used only to guard against starting a session RAM-disk staging can't
+    possibly fit, not an exact accounting (per-FRAME `shape_zyx` may differ
+    slightly per the protocol, see `protocol.py`)."""
+    nz, ny, nx = header["shape_zyx"]
+    itemsize = np.dtype(header["dtype"]).itemsize
+    return (
+        nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
+    )
 
 
 @dataclass
@@ -80,6 +119,14 @@ class SessionState:
     identity: bytes
     base_name: str
     raw_root: Path
+    """The client's declared FINAL destination -- unchanged in meaning from
+    before RAM-disk staging existed. Only used directly as a write target
+    when staging is off; when staging is on, it's the drain worker's
+    destination instead (see `dest_leaf_dir`)."""
+    write_root: Path
+    """Where this session's raw mirror stores and decon-stage TIFFs are
+    ACTUALLY written: `raw_root` with staging off, or the staging root with
+    it on. See module docstring's "RAM-disk staging" section."""
     dtype: str
     shape_zyx: tuple[int, int, int]
     num_timepoints: int
@@ -106,8 +153,16 @@ class SessionState:
 
     @property
     def leaf_dir(self) -> Path:
-        """Matches `opym.discovery.LeafDataset.leaf_dir` for this session's
-        eventual dataset: `raw_root / base_name`."""
+        """Where this session actually lives right now: `write_root /
+        base_name`. Matches `opym.discovery.LeafDataset.leaf_dir` exactly
+        when staging is off (`write_root is raw_root`); with staging on,
+        this is the RAM-disk copy, and `dest_leaf_dir` is the GPFS one."""
+        return self.write_root / self.base_name
+
+    @property
+    def dest_leaf_dir(self) -> Path:
+        """The drain worker's destination: `raw_root / base_name`. Equal to
+        `leaf_dir` (and unused) when staging is off."""
         return self.raw_root / self.base_name
 
     @property
@@ -132,12 +187,25 @@ class StreamReceiver:
         ack_every_n_frames: int = ACK_EVERY_N_FRAMES,
         ack_every_sec: float = ACK_EVERY_SEC,
         idle_timeout_sec: float = IDLE_TIMEOUT_SEC,
+        drain_workers: int = drain.DEFAULT_DRAIN_WORKERS,
+        drain_retention_s: float = drain.DEFAULT_RETENTION_S,
+        drain_high_water_bytes: int = drain.DEFAULT_HIGH_WATER_BYTES,
     ) -> None:
         self.bind_addr = bind_addr
         self.ack_every_n_frames = ack_every_n_frames
         self.ack_every_sec = ack_every_sec
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
+        # Always constructed (cheap: idle threads blocked on a queue read)
+        # so staging can be toggled per-session via the env var without
+        # needing the receiver process restarted -- mirrors `_decon_enabled`
+        # being read fresh per SESSION_START rather than cached at startup.
+        self._drain_pool = drain.DrainPool(
+            num_workers=drain_workers,
+            retention_s=drain_retention_s,
+            high_water_bytes=drain_high_water_bytes,
+        )
+        self._drain_pool.start()
 
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
@@ -156,6 +224,12 @@ class StreamReceiver:
 
     def close(self) -> None:
         self._socket.close(linger=0)
+        # Deliberately not draining the queue first: shutdown must not block
+        # on GPFS copies. Any not-yet-drained session's staging copy stays
+        # on /dev/shm, untouched, and a restarted receiver process re-drains
+        # it once it's told to (not automatic today -- see drain.py's
+        # `_drain_one` docstring, same v1 scope as the RESUME design).
+        self._drain_pool.stop()
 
     def __enter__(self) -> StreamReceiver:
         return self
@@ -227,8 +301,32 @@ class StreamReceiver:
                     f"one entry per channel (got {len(channels)}) -- see "
                     "STREAMING_PROTOCOL.md's SESSION_START fields"
                 )
+
+            stage_root = _stage_root_from_env()
+            write_root = stage_root if stage_root is not None else raw_root
+            if stage_root is not None:
+                # mkdir first -- disk_usage needs an existing path, and this
+                # root is otherwise only created lazily on a channel store's
+                # first write (rawmirror.create_channel_store).
+                stage_root.mkdir(parents=True, exist_ok=True)
+                estimated_bytes = _estimate_session_bytes(header)
+                free_bytes = shutil.disk_usage(stage_root).free
+                # Require 2x headroom, not just enough to fit exactly -- the
+                # staging root is shared with every other concurrently
+                # staging session (and PetaKit5D's own /dev/shm usage), and
+                # a session that starts right at the edge would starve
+                # whichever one grows next. See module docstring.
+                if estimated_bytes * 2 > free_bytes:
+                    raise ValueError(
+                        f"staging root {stage_root} has {free_bytes / 1e9:.1f} GB "
+                        f"free, need >= {estimated_bytes * 2 / 1e9:.1f} GB "
+                        f"(2x this session's estimated {estimated_bytes / 1e9:.1f} "
+                        "GB) -- rejecting rather than risking a mid-session "
+                        "tmpfs overflow"
+                    )
+
             channel_store_paths = {
-                c: rawmirror.store_path_for_channel(raw_root, base_name, name)
+                c: rawmirror.store_path_for_channel(write_root, base_name, name)
                 for c, name in zip(channels, channel_names)
             }
             sorted_paths = sorted(channel_store_paths.values())
@@ -241,6 +339,7 @@ class StreamReceiver:
                 identity=identity,
                 base_name=base_name,
                 raw_root=raw_root,
+                write_root=write_root,
                 dtype=header["dtype"],
                 shape_zyx=tuple(header["shape_zyx"]),
                 num_timepoints=header["num_timepoints"],
@@ -257,13 +356,15 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         logger.info(
-            "Session %s started: base_name=%s grid=%dT x %dC -> %s (decon_enabled=%s)",
+            "Session %s started: base_name=%s grid=%dT x %dC -> %s "
+            "(decon_enabled=%s, staging=%s)",
             session_id,
             session.base_name,
             session.num_timepoints,
             len(session.channels),
-            session.raw_root,
+            session.write_root,
             session.decon_enabled,
+            session.write_root != session.raw_root,
         )
         self._send_ack(session)
 
@@ -398,11 +499,63 @@ class StreamReceiver:
             len(session.received_pairs),
             session.num_timepoints * len(session.channels),
             session.base_name,
-            session.raw_root,
+            session.write_root,
         )
-        # No consolidation step: see module docstring. `opym-backfill
-        # --watch` (already running independently) discovers this dataset
-        # on its own next pass -- nothing to trigger here.
+        # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
+        # see protocol.py's ACK docs) previously had no way to learn about
+        # this session's LAST batch of frames if SESSION_END arrived before
+        # the next periodic ACK was due (ack_every_n_frames / ack_every_sec).
+        # Confirmed on the real rig: the client would time out waiting for an
+        # ACK that was simply never going to come, even though every frame
+        # had already been durably staged. Send one final ACK at the true
+        # ack_floor before the session state (and the identity needed to
+        # reach the client) is gone.
+        self._send_ack(session)
+
+        if session.write_root != session.raw_root:
+            # Staging was active for this session -- hand its completed
+            # artifacts to the background drain pool. A session is NOT one
+            # contiguous directory: each channel's store is a top-level
+            # sibling under write_root, and decon_stage/ (if present) is
+            # separately nested under write_root/base_name -- see
+            # `opym.stream.drain.DrainJob`'s docstring. Only items that
+            # actually got written are included (a channel declared in
+            # SESSION_START but never sent, or decon_stage when zero frames
+            # arrived, simply won't exist).
+            items = [
+                (
+                    session.channel_store_paths[c],
+                    rawmirror.store_path_for_channel(
+                        session.raw_root, session.base_name, name
+                    ),
+                )
+                for c, name in zip(session.channels, session.channel_names)
+            ]
+            if session.decon_enabled:
+                items.append(
+                    (session.decon_stage_dir, session.dest_leaf_dir / "decon_stage")
+                )
+            items = [(s, d) for s, d in items if s.exists()]
+
+            if items:
+                # Enqueue is a cheap, non-blocking `queue.put`; the actual
+                # GPFS copy happens on a drain worker thread, off this poll
+                # loop, so a slow/loaded GPFS write can never delay ingest
+                # for the NEXT session.
+                self._drain_pool.enqueue(
+                    drain.DrainJob(session_id=session.session_id, items=items)
+                )
+                logger.info(
+                    "Session %s: queued %d item(s) for drain to %s",
+                    session.session_id,
+                    len(items),
+                    session.raw_root,
+                )
+        # No consolidation step: see module docstring. With staging off,
+        # `opym-backfill --watch` (already running independently) discovers
+        # this dataset directly under raw_root on its own next pass -- with
+        # staging on, it discovers it once the drain above lands it there --
+        # either way nothing else needs triggering here.
         del self.sessions[session.session_id]
 
     def _handle_resume(self, identity: bytes, session_id: str) -> None:
