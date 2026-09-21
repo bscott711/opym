@@ -117,6 +117,29 @@ def _find_half_roi(image_half: np.ndarray, offset_y: int, sigma: float, area_thr
     }
 
 
+def _clamp_window(center: int, size: int, dim_max: int) -> tuple[int, int]:
+    """Returns (start, stop) for a `size`-wide window centered at `center`,
+    shifted inward -- never shrunk -- to fit within [0, dim_max).
+
+    Both call sites below previously clamped only the trailing edge (`min(dim_max,
+    start + size)`), which silently shrinks the window below `size` whenever the
+    center sits close enough to the frame's far edge that the naive window would
+    overrun -- exactly the failure that produced mismatched top/bottom ROI shapes
+    in `core.py`'s `ROI shapes do not match` check. Shifting the window keeps it
+    at the full requested `size` whenever the frame is at least that big.
+    """
+    start = center - size // 2
+    stop = start + size
+    if stop > dim_max:
+        start -= stop - dim_max
+        stop = dim_max
+    if start < 0:
+        stop -= start
+        start = 0
+    stop = min(stop, dim_max)
+    return start, stop
+
+
 def auto_detect_rois(
     max_proj: np.ndarray,
     master_roi_path: Path | None = None,
@@ -185,14 +208,8 @@ def auto_detect_rois(
         y_center = (r_dict["ymin"] + r_dict["ymax"]) // 2
         x_center = (r_dict["xmin"] + r_dict["xmax"]) // 2
 
-        new_ymin = max(0, y_center - max_h // 2)
-        new_ymax = new_ymin + max_h
-
-        new_xmin = max(0, x_center - max_w // 2)
-        new_xmax = min(max_x, new_xmin + max_w)
-        if new_xmax > max_x:
-            new_xmax = max_x
-            new_xmin = max(0, new_xmax - max_w)
+        new_ymin, new_ymax = _clamp_window(y_center, max_h, max_y)
+        new_xmin, new_xmax = _clamp_window(x_center, max_w, max_x)
 
         rois_out.append((slice(new_ymin, new_ymax), slice(new_xmin, new_xmax)))
 

@@ -17,6 +17,7 @@ from pathlib import Path
 import ipywidgets as widgets
 
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
+from .utils import resolve_output_base
 
 # Constants
 BASE_DIR = Path("/dev/shm/petakit_jobs")
@@ -49,6 +50,13 @@ def resolve_deskew_working_dir(master_file: Path) -> Path:
     `dataDir` -- callers that need to find output *after* the job finishes
     (e.g. `backfill/cli.py` locating `DSR_nodecon/`) must resolve it the
     same way or they'll look in the wrong place.
+
+    Resolves against `resolve_output_base(master_file.parent)`, not
+    `master_file.parent` directly, so this stays consistent with wherever
+    `derive_paths()` actually put the crop stage's output: when the raw dir
+    isn't writable, that was the mirror location, not a sibling of the raw
+    file -- looking in the raw dir here would always come up empty for
+    exactly the datasets that needed the mirror in the first place.
     """
     folder_name = master_file.name
     if folder_name.lower().endswith(".ome.tif"):
@@ -56,7 +64,8 @@ def resolve_deskew_working_dir(master_file: Path) -> Path:
     elif folder_name.lower().endswith(".tif"):
         folder_name = folder_name[:-4]
 
-    potential_dir = master_file.parent / folder_name
+    base = resolve_output_base(master_file.parent)
+    potential_dir = base / folder_name
     # Existence alone isn't enough -- confirmed live that a master-stem dir
     # can exist with zero cropped frames in it (only stale DSR/DSR_nodecon
     # output left behind by an earlier deskew attempt that itself used this
@@ -70,7 +79,7 @@ def resolve_deskew_working_dir(master_file: Path) -> Path:
         or next(potential_dir.glob("*.tiff"), None) is not None
     ):
         return potential_dir
-    legacy_dir = master_file.parent / "processed_tiff_series_split"
+    legacy_dir = base / "processed_tiff_series_split"
     if legacy_dir.exists():
         return legacy_dir
     raise FileNotFoundError(

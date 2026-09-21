@@ -29,6 +29,15 @@ _OUTPUT_DIR_NAMES = frozenset(
         "DSR_nodecon",
         "MIPs",
         "mip_movies",
+        # KIND_ZARR_PRECROPPED's staging dirs (see
+        # backfill/pipeline.py:zarr_deskew_data_dir) -- missing from this set
+        # meant a resumed backfill would re-descend into its own staged
+        # symlink mirror / materialized decon TIFFs on every pass.
+        "zarr_mirror",
+        "decon_stage",
+        # Other convenience output written beside the crop/deskew stages.
+        "viewer",
+        "decon_qc",
     }
 )
 

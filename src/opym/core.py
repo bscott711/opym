@@ -40,12 +40,28 @@ def process_dataset(
     output_format: OutputFormat,
     rotate_90: bool = False,
     channels_to_output: list[int] | None = None,
+    read_file: Path | None = None,
+    max_timepoints: int | None = None,
 ) -> int:
     """
     Main processing function. Streams data to either a single OME-TIF file
     or a series of 3D (ZYX) TIFF files.
 
     Processes only the channels specified in `channels_to_output`.
+
+    `read_file`, when given, is opened for the actual pixel data INSTEAD of
+    `base_file` -- used when `base_file` has a corrupt Micro-Manager sibling
+    and `backfill.pipeline.resolve_readable_master` built a repaired mirror
+    to read from, while `base_file` itself still names the true dataset (for
+    logging/messages only here -- callers deriving OUTPUT paths from it via
+    `derive_paths` do so independently of this function).
+
+    `max_timepoints`, when given, caps `T` to at most this many timepoints --
+    used with a repaired `read_file` whose declared shape is still the full
+    configured acquisition length but only the first `max_timepoints` are
+    real (the rest tifffile zero-fills for the excluded corrupt file(s)).
+    Exporting those zero-filled frames would silently bloat the output with
+    blank timepoints and waste downstream deskew/decon time on empty volumes.
 
     Returns:
         int: The number of timepoints processed (T).
@@ -54,9 +70,10 @@ def process_dataset(
     if rotate_90:
         print("    90-degree rotation: ENABLED")
 
+    pixel_file = read_file if read_file is not None else base_file
     try:
         # --- Handle 4D (single timepoint) vs 5D data (STREAM-SAFE) ---
-        with tifffile.TiffFile(base_file) as tif:
+        with tifffile.TiffFile(pixel_file) as tif:
             series = tif.series[0]
             store = series.aszarr()
             zarr_array: zarr.Array = zarr.open_array(store, mode="r")
@@ -64,14 +81,44 @@ def process_dataset(
             shape = zarr_array.shape
             ndim = zarr_array.ndim
             dtype = series.dtype
+            axes = series.axes
 
-            if ndim == 4:  # ZCYX
+            # Unpacking by ndim alone silently misreads an axis order this
+            # dual-camera crop pipeline doesn't actually support: a real
+            # single-channel 4D (T, Z, Y, X) acquisition (axes 'TZYX', no C
+            # axis at all) was previously unpacked as if it were the
+            # expected 4D (Z, C, Y, X) -- reading its T=60 as Z and its
+            # real Z=31 as C, which then failed the even-channel check with
+            # a confusing "C=31" error that had nothing to do with the real
+            # problem. Checking `axes` against the two orders this function
+            # actually implements turns that into an honest rejection
+            # instead, with zero behavior change for every dataset that
+            # already has the expected axes (confirmed against a live
+            # sample: every currently-working dataset is 'ZCYX' or
+            # 'TZCYX', never anything else).
+            if ndim == 4:
+                if axes != "ZCYX":
+                    raise ValueError(
+                        f"Unsupported 4D axis order {axes!r} (shape {shape}) -- "
+                        "this pipeline's crop step only handles a single-"
+                        "timepoint (Z, C, Y, X) dual-camera layout. A dataset "
+                        "with no channel axis (e.g. a single-camera "
+                        "acquisition) needs its own handling, not this path."
+                    )
                 print(f"  Info: 4D data detected (shape {shape}). Assuming T=1.")
                 T = 1
                 Z, C, Y, X = shape
-            elif ndim == 5:  # TZCXY
+            elif ndim == 5:
+                if axes != "TZCYX":
+                    raise ValueError(
+                        f"Unsupported 5D axis order {axes!r} (shape {shape}) -- "
+                        "expected (T, Z, C, Y, X)."
+                    )
                 print(f"  Info: 5D data detected (shape {shape}).")
                 T, Z, C, Y, X = shape
+                if max_timepoints is not None and max_timepoints < T:
+                    print(f"  Info: capping T={T} to {max_timepoints} real timepoint(s).")
+                    T = max_timepoints
             else:
                 raise ValueError(
                     f"Unsupported data shape: {shape}. "
@@ -354,6 +401,8 @@ def run_processing_job(
     channels_to_output: list[int] | None = None,
     cli_log_file: Path = Path("opm_roi_log.json"),
     rotate_90: bool = False,
+    read_file: Path | None = None,
+    max_timepoints: int | None = None,
 ):
     """
     Runs a full processing job for a single file.
@@ -371,6 +420,11 @@ def run_processing_job(
     resolved once here -- see below -- so `process_dataset` and
     `create_processing_log` never disagree about which channels were
     actually exported).
+
+    `read_file`/`max_timepoints` pass straight through to `process_dataset`
+    -- see its docstring. All PATH derivation (`derive_paths` below) stays
+    anchored to `base_file`, never `read_file`: a repaired mirror lives in
+    its own directory unrelated to the dataset's real output location.
     """
     print("--- Starting Processing Job ---")
 
@@ -395,8 +449,25 @@ def run_processing_job(
         # create_processing_log -- which has its own, independent hardcoded
         # fallback -- logs the SAME channel list process_dataset actually
         # exports, rather than silently disagreeing with it.
-        with tifffile.TiffFile(paths.base_file) as tif:
-            c_axis_size = tif.series[0].shape[-3]  # (Z,C,Y,X) or (T,Z,C,Y,X)
+        #
+        # `shape[-3]` assumes C is always 3rd-from-last, regardless of the
+        # file's real axes -- the same silent-misread bug fixed in
+        # process_dataset() above, hit again here via this INDEPENDENT read
+        # (confirmed live: a single-camera 'TZYX' file, no C axis at all,
+        # has shape[-3] == its real Z size, misread as C and rejected with a
+        # confusing "found C=31" that has nothing to do with channels).
+        with tifffile.TiffFile(read_file if read_file is not None else paths.base_file) as tif:
+            series = tif.series[0]
+            axes, shape = series.axes, series.shape
+        if axes not in ("ZCYX", "TZCYX"):
+            raise ValueError(
+                f"Unsupported axis order {axes!r} (shape {shape}) -- this "
+                "pipeline's crop step only handles a dual-camera (Z, C, Y, X) "
+                "or (T, Z, C, Y, X) layout. A dataset with no channel axis "
+                "(e.g. a single-camera acquisition) needs its own handling, "
+                "not this path."
+            )
+        c_axis_size = shape[axes.index("C")]
         if c_axis_size % 2 != 0:
             raise ValueError(
                 "Expected an even number of channels (pairs of cameras), "
@@ -435,6 +506,8 @@ def run_processing_job(
         output_format,
         rotate_90=rotate_90,
         channels_to_output=channels_to_output,
+        read_file=read_file,
+        max_timepoints=max_timepoints,
     )
 
     print("\nCreating processing log...")

@@ -5,6 +5,7 @@ Core utilities, definitions, and path helpers for the OPM Cropper.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +13,41 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+
+# Env var to override where redirected output lands when the raw acquisition
+# directory itself isn't writable (see `resolve_output_base`). Must match
+# whatever the opym-dashboard repo's `registry_reader.py` mirrors this as --
+# that's a schema contract, not shared code (same reasoning as `STAGES`
+# there), so keep both in sync by hand if this ever changes.
+MIRROR_ROOT_ENV = "OPYM_OUTPUT_MIRROR_ROOT"
+DEFAULT_MIRROR_ROOT = Path("/mmfs2/scratch/SDSMT.LOCAL/bscott/opym_backfill/outputs")
+
+
+def mirror_root() -> Path:
+    return Path(os.environ.get(MIRROR_ROOT_ENV, str(DEFAULT_MIRROR_ROOT)))
+
+
+def resolve_output_base(leaf_dir: Path) -> Path:
+    """Returns `leaf_dir` itself when it's writable -- the normal case, and
+    the one every already-processed dataset was written under -- else a
+    mirrored location under `mirror_root()` reproducing `leaf_dir`'s full
+    absolute path.
+
+    Some raw acquisition directories (e.g. a lab-mate's read-only-to-us
+    `jacks.local` upload) can never be written to, so writing output as a
+    sibling of the raw file there always fails with `PermissionError`.
+    Falling back only when unwritable -- rather than always mirroring --
+    keeps the documented "output lives next to the raw data" convention
+    (bioimaging/CLAUDE.md) for the common case and never relocates output
+    for a dataset that already has it written in place.
+
+    Reproducing the full path (not a hash) under the mirror root keeps the
+    result human-navigable: `<mirror_root>/mmfs1/scratch/jacks.local/.../Cell_1/`.
+    """
+    leaf_dir = Path(leaf_dir)
+    if os.access(leaf_dir, os.W_OK):
+        return leaf_dir
+    return mirror_root() / str(leaf_dir.resolve()).lstrip("/")
 
 
 class OutputFormat(str, Enum):
@@ -71,7 +107,14 @@ def sanitize_filename(name: str) -> str:
 
 
 def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
-    """Derives all associated input and output paths from the base file."""
+    """Derives all associated input and output paths from the base file.
+
+    Input paths (`metadata_file`) always stay next to the raw file -- it's
+    read-only input, always readable if `base_file` itself is. Only
+    `output_dir` goes through `resolve_output_base`, so it redirects to the
+    mirror only when `base_file.parent` (the raw acquisition dir) can't
+    actually be written to.
+    """
     base_name_no_ext = base_file.name.replace(".ome.tif", "")
     sanitized_name = sanitize_filename(base_file.name)
     metadata_file = base_file.parent / (base_name_no_ext + "_metadata.txt")
@@ -81,7 +124,7 @@ def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
     else:
         output_dir_name = "processed_tiff_series_split"
 
-    output_dir = base_file.parent / output_dir_name
+    output_dir = resolve_output_base(base_file.parent) / output_dir_name
     output_log = output_dir / (sanitized_name + "_processing_log.json")
 
     return DerivedPaths(

@@ -58,7 +58,24 @@ STAGES = ("roi_detect", "crop_zarr", "crop_tiff", "deskew", "mip_encode")
 # TIFF metadata inside a third-party library's own parser) -- distinct from
 # 'dud' (readable, just no detectable signal) so the dashboard can tell
 # "nothing will ever come of this" from "weak signal, still processed".
-SIGNAL_FLAGS = ("ok", "dud", "unknown", "corrupt")
+# 'partial' marks a Micro-Manager multi-file series where one or more
+# sibling files were corrupt but a valid LEADING PREFIX was recovered and
+# processed -- readable and real, just fewer timepoints than the
+# acquisition was configured for (see `expected_timepoints` /
+# `actual_timepoints`). Deliberately a prefix, never a subset with gaps --
+# see `resolve_readable_master` in bioimaging/backfill/pipeline.py. 'dead'
+# marks a raw file with NO valid data at all (the master file itself is
+# corrupt) -- distinct from 'corrupt' only so a human scanning the
+# dashboard can tell "not even worth a partial-recovery attempt" from
+# "recovery was attempted and something is still wrong". 'blocked' marks a
+# dataset deferred on a deliberate guard rather than a bug -- e.g. no
+# z-step derivable yet (see `resolve_zarr_z_step` and its
+# `OPYM_ZARR_ALLOW_DEFAULT_Z_STEP` override) -- so the dashboard's failure
+# count reflects genuine problems, not a working-as-intended wait for data
+# that hasn't finished landing. Unlike 'corrupt'/'dead', still cheap to
+# recheck every pass (no multi-GB re-read) and self-heals automatically
+# once the missing metadata arrives -- not made sticky the way those are.
+SIGNAL_FLAGS = ("ok", "dud", "unknown", "corrupt", "partial", "dead", "blocked")
 
 
 # Columns added after the original schema shipped -- `CREATE TABLE IF NOT
@@ -78,6 +95,12 @@ _NEW_DATASET_COLUMNS = {
     # included. What is actually wanted here is provenance: which PSF
     # produced the data on disk.
     "decon_psf": "TEXT",
+    # (size, mtime) signature of the raw master file at the moment it was
+    # marked 'corrupt'/'dead' -- lets a later pass tell "same broken file
+    # we already gave up on" (skip re-attempting a guaranteed-identical
+    # failure every --watch pass) from "the file changed since then" (a
+    # re-upload/repair, worth retrying). See `master_file_fingerprint()`.
+    "master_file_fingerprint": "TEXT",
 }
 
 
@@ -90,6 +113,23 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def master_file_fingerprint(path: Path) -> str | None:
+    """A cheap (size, mtime) signature for a raw master file -- not a
+    content hash (too slow to compute over a multi-GB acquisition on every
+    --watch pass), just enough to distinguish "the same broken file we
+    already gave up on" from "someone re-uploaded or repaired it". Returns
+    None if the file can't be stat'd (e.g. already gone), which never
+    matches a previously-recorded fingerprint, so a vanished file is always
+    treated as "changed" (worth a fresh attempt) rather than silently
+    staying stuck on stale triage.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return f"{st.st_size}:{st.st_mtime_ns}"
 
 
 class StatusRegistry:
@@ -180,6 +220,46 @@ class StatusRegistry:
                        SET signal_flag=?, expected_timepoints=?, actual_timepoints=?
                      WHERE dataset_key=?""",
                 (signal_flag, expected_timepoints, actual_timepoints, dataset_key),
+            )
+
+    def get_dataset(self, dataset_key: str) -> dict | None:
+        """The `datasets` row for one dataset (signal_flag, timepoint
+        counts, fingerprint, etc.), or None if it hasn't been registered
+        yet. Used to check triage state before redoing expensive work --
+        e.g. `detect_rois` skipping a dataset already known 'dead'/'corrupt'
+        with an unchanged raw file, rather than re-reading it every pass.
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM datasets WHERE dataset_key=?", (dataset_key,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            return dict(zip(cols, row))
+
+    def set_signal_flag(self, dataset_key: str, signal_flag: str) -> None:
+        """Updates ONLY `signal_flag`, unlike `set_triage` -- which always
+        overwrites `expected_timepoints`/`actual_timepoints` too, defaulting
+        them to NULL when not given. Callers that want to reclassify a
+        dataset (e.g. 'blocked' on a deliberate guard, or 'dead'/'corrupt'
+        on an unreadable raw file) without a freshly-computed frame count
+        must use this instead, or they'd silently erase real timepoint
+        counts `set_triage` recorded earlier in the SAME dataset's
+        lifecycle (confirmed real risk: a zarr-precropped dataset already
+        past `roi_detect` before hitting the z-step guard on every deskew
+        retry would otherwise lose its frame-count badge on every pass).
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE datasets SET signal_flag=? WHERE dataset_key=?",
+                (signal_flag, dataset_key),
+            )
+
+    def set_master_file_fingerprint(self, dataset_key: str, fingerprint: str | None) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE datasets SET master_file_fingerprint=? WHERE dataset_key=?",
+                (fingerprint, dataset_key),
             )
 
     def set_decon_psf(self, dataset_key: str, psf_path: str | None) -> None:
