@@ -25,6 +25,7 @@ implements, "Stage 3").
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import shutil
@@ -90,7 +91,15 @@ class DrainPool:
         num_workers: int = DEFAULT_DRAIN_WORKERS,
         retention_s: float = DEFAULT_RETENTION_S,
         high_water_bytes: int = DEFAULT_HIGH_WATER_BYTES,
+        manifest_dir: Path | None = None,
     ) -> None:
+        """`manifest_dir` (the receiver passes `<stage root>/.drain_manifests`)
+        makes retention survive a restart: each drained session is recorded
+        there until its staging copies are evicted, and `start()` reloads the
+        records. Without it, retention lives only in this process, and on
+        2026-09-24 one opym-receive restart left 110 GB of drained copies on
+        /dev/shm with nothing to evict them."""
+        self._manifest_dir = Path(manifest_dir) if manifest_dir else None
         self._num_workers = num_workers
         self._retention_s = retention_s
         self._high_water_bytes = high_water_bytes
@@ -103,6 +112,7 @@ class DrainPool:
     def start(self) -> None:
         if self._threads:
             return
+        self._load_manifests()
         for i in range(self._num_workers):
             t = threading.Thread(
                 target=self._worker_loop, name=f"OpymDrainWorker-{i}", daemon=True
@@ -194,6 +204,7 @@ class DrainPool:
                 drained_at=time.monotonic(),
                 size_bytes=total_bytes,
             )
+        self._write_manifest(job.session_id, [s for s, _ in job.items], total_bytes)
         logger.info(
             "Drained session %s: %d item(s), %.2f GB, verified byte-for-byte",
             job.session_id,
@@ -251,11 +262,62 @@ class DrainPool:
             with self._lock:
                 self._drained.setdefault(session_id, entry)
             return
+        if self._manifest_dir is not None:
+            (self._manifest_dir / f"{session_id}.json").unlink(missing_ok=True)
         logger.debug(
             "Evicted RAM disk staging copies for %s (%d item(s))",
             session_id,
             len(entry.stage_dirs),
         )
+
+    # --- restart-safe retention ------------------------------------------------
+
+    def _write_manifest(
+        self, session_id: str, stage_dirs: list[Path], size: int
+    ) -> None:
+        if self._manifest_dir is None:
+            return
+        try:
+            self._manifest_dir.mkdir(parents=True, exist_ok=True)
+            path = self._manifest_dir / f"{session_id}.json"
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "stage_dirs": [str(d) for d in stage_dirs],
+                        "drained_at": time.time(),
+                        "size_bytes": size,
+                    }
+                )
+            )
+            tmp.replace(path)
+        except OSError:
+            logger.exception("Could not record drain manifest for %s", session_id)
+
+    def _load_manifests(self) -> None:
+        """Re-adopt sessions a previous process drained but hadn't evicted
+        yet, keeping their original drain time for the retention clock."""
+        if self._manifest_dir is None or not self._manifest_dir.is_dir():
+            return
+        now_wall, now_mono = time.time(), time.monotonic()
+        for path in self._manifest_dir.glob("*.json"):
+            try:
+                rec = json.loads(path.read_text())
+                entry = _DrainedEntry(
+                    stage_dirs=[Path(d) for d in rec["stage_dirs"]],
+                    drained_at=now_mono - max(0.0, now_wall - float(rec["drained_at"])),
+                    size_bytes=int(rec["size_bytes"]),
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("Ignoring unreadable drain manifest %s", path)
+                continue
+            with self._lock:
+                self._drained.setdefault(path.stem, entry)
+        if self._drained:
+            logger.info(
+                "Re-adopted %d drained session(s) awaiting RAM-disk eviction",
+                len(self._drained),
+            )
 
 
 def _tree_stats(root: Path) -> tuple[int, int]:

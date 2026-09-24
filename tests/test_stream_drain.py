@@ -183,3 +183,33 @@ def test_concurrent_sweeps_evict_each_session_exactly_once(
 
     assert evicted.count(str(stage_dir)) == 1
     assert not [r for r in caplog.records if "Failed to evict" in r.getMessage()]
+
+
+
+def test_retention_survives_a_restart(tmp_path):
+    """A drained session's RAM copy must still be evicted after the process
+    that drained it restarts (2026-09-24: one restart orphaned 110 GB)."""
+    stage_dir = tmp_path / "stage" / "sample"
+    dest_dir = tmp_path / "raw" / "sample"
+    manifests = tmp_path / "stage" / ".drain_manifests"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+
+    first = DrainPool(num_workers=1, retention_s=9999, high_water_bytes=10**12,
+                      manifest_dir=manifests)
+    first.start()
+    try:
+        first.enqueue(DrainJob("sess-1", [(stage_dir, dest_dir)]))
+        assert _wait_until(lambda: (manifests / "sess-1.json").exists())
+    finally:
+        first.stop()
+    assert stage_dir.exists()  # retention not yet expired when it "died"
+
+    restarted = DrainPool(num_workers=1, retention_s=0.05, high_water_bytes=10**12,
+                          manifest_dir=manifests)
+    restarted.start()
+    try:
+        assert _wait_until(lambda: not stage_dir.exists(), timeout=5.0)
+        assert _wait_until(lambda: not (manifests / "sess-1.json").exists())
+    finally:
+        restarted.stop()
+    assert (dest_dir / "a.bin").read_bytes() == b"hello"
