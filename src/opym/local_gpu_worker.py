@@ -15,6 +15,12 @@ Supervisor for the PetaKit job queue: one PetaKit5D MATLAB server
 - A claim whose dataDir has had no file written for `hang_after_s` is
   flagged; with `kill_hung`, its server is killed, which requeues the ticket
   and frees the GPU.
+- Live work goes first (see opym.lanes). Servers are started as soon as a
+  live lease appears, and if a live ticket has waited `preempt_after_s`
+  while a server works on a backfill ticket, that server is killed and its
+  backfill ticket requeued (not counted against its requeue cap), so the
+  GPU switches to live work. One server per cooldown, so a single queued
+  live ticket never takes down both.
 
 Each server records the ticket it holds in claims/S<id>.json (written by
 run_petakit_server.m right after it claims one, removed when that ticket
@@ -31,14 +37,16 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
+from opym import lanes
 from opym.consolidate import run_pending_consolidations
 
 # Dynamically locate the opym installation directory
 OPYM_DIR = Path(__file__).parent.resolve()
 
 # PETAKIT_JOBS_DIR matches run_petakit_server.m's override, for test servers.
-BASE_DIR = Path(os.environ.get("PETAKIT_JOBS_DIR", "/dev/shm/petakit_jobs"))
+BASE_DIR = lanes.jobs_dir()
 QUEUE_DIR = BASE_DIR / "queue"
 
 # If a Matlab server exits nonzero (e.g. a license checkout failure kills
@@ -60,6 +68,7 @@ MAX_REQUEUES = 2
 DEFAULT_HANG_AFTER_S = 60 * 60
 HANG_CHECK_EVERY_S = 300.0
 ORPHAN_SWEEP_EVERY_S = 60.0
+DEFAULT_PREEMPT_AFTER_S = 30.0
 KILL_GRACE_S = 20.0
 
 
@@ -85,14 +94,18 @@ def has_claimable_work(queue_dir: Path) -> bool:
 
 
 def requeue_claim(
-    active_path: Path, reason: str, max_requeues: int = MAX_REQUEUES
+    active_path: Path,
+    reason: str,
+    max_requeues: int = MAX_REQUEUES,
+    count: bool = True,
 ) -> str:
-    """Put a claimed ticket (`queue/.active_<name>`) back as `queue/<name>`.
+    """Put a claimed ticket (`<lane>/.active_<name>`) back as `<lane>/<name>`.
 
     The ticket's `requeueCount` goes up by one each time; once it reaches
     `max_requeues`, the ticket goes to failed/ with a `.log` giving `reason`.
-    An unreadable ticket goes straight to failed/. Returns "requeued" or
-    "failed".
+    `count=False` (preemption: the ticket did nothing wrong) records the
+    requeue without counting it. An unreadable ticket goes straight to
+    failed/. Returns "requeued" or "failed".
 
     The new ticket is written under a dot-name first and the claim removed
     before the rename, so a server can never claim `<name>` while
@@ -105,22 +118,23 @@ def requeue_claim(
         ticket = json.loads(active_path.read_text())
     except (OSError, ValueError):
         ticket = None
-    count = (
+    n_requeues = (
         int(ticket.get("requeueCount", 0)) if isinstance(ticket, dict) else max_requeues
     )
 
-    if not isinstance(ticket, dict) or count >= max_requeues:
+    if not isinstance(ticket, dict) or (count and n_requeues >= max_requeues):
         failed_dir.mkdir(parents=True, exist_ok=True)
         os.replace(active_path, failed_dir / name)
         (failed_dir / f"{name}.log").write_text(
-            f"Moved to failed/ by the opym-serve supervisor after {count} requeue(s).\n"
-            f"Last reason: {reason}\n"
+            "Moved to failed/ by the opym-serve supervisor after "
+            f"{n_requeues} requeue(s).\nLast reason: {reason}\n"
         )
         return "failed"
 
-    ticket["requeueCount"] = count + 1
+    if count:
+        ticket["requeueCount"] = n_requeues + 1
     ticket.setdefault("requeueHistory", []).append(
-        {"at": time.time(), "reason": reason}
+        {"at": time.time(), "reason": reason, "counted": count}
     )
     staging = queue_dir / f".requeue_{name}"
     staging.write_text(json.dumps(ticket, indent=2))
@@ -165,6 +179,30 @@ def _any_server_alive() -> bool:
     return any(_server_pids(sid) for sid, _ in SERVERS)
 
 
+class Claim(NamedTuple):
+    """The ticket a server holds, per its claims/S<id>.json record."""
+
+    ticket: str
+    claimed_at: float
+    lane: str  # the queue directory it was claimed from ("queue_live" / "queue")
+
+    def active_path(self, base_dir: Path) -> Path:
+        return base_dir / self.lane / f".active_{self.ticket}"
+
+
+def oldest_claimable_age(queue_dir: Path, now: float) -> float | None:
+    """Seconds the oldest claimable ticket in `queue_dir` has waited."""
+    mtimes = []
+    for p in queue_dir.glob("*.json"):
+        if p.name.startswith("."):
+            continue
+        try:
+            mtimes.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    return now - min(mtimes) if mtimes else None
+
+
 @dataclass
 class ServerSlot:
     server_id: str
@@ -175,12 +213,14 @@ class ServerSlot:
     last_hang_check: float = 0.0
     idle_s: float | None = None
     hang_flagged_ticket: str | None = None
+    preempting: bool = False
 
 
 class ServerSupervisor:
     """Drives the servers one `tick()` at a time; `process_queue` loops it.
 
-    `launch(slot) -> Popen` and `clock() -> float` are injectable for tests.
+    `launch(slot) -> Popen`, `clock() -> float`, `any_server_alive()` and
+    `lease_active()` are injectable for tests.
     """
 
     def __init__(
@@ -193,10 +233,20 @@ class ServerSupervisor:
         launch: Callable[[ServerSlot], subprocess.Popen] | None = None,
         clock: Callable[[], float] = time.time,
         any_server_alive: Callable[[], bool] = _any_server_alive,
+        preempt: bool = True,
+        preempt_after_s: float = DEFAULT_PREEMPT_AFTER_S,
+        lease_active: Callable[[], bool] | None = None,
     ) -> None:
         self.base_dir = Path(base_dir)
-        self.queue_dir = self.base_dir / "queue"
+        self.queue_dir = lanes.backfill_queue_dir(self.base_dir)
+        self.live_queue_dir = lanes.live_queue_dir(self.base_dir)
         self.claims_dir = self.base_dir / "claims"
+        self.preempt = preempt
+        self.preempt_after_s = preempt_after_s
+        self._lease_active = lease_active or (
+            lambda: lanes.live_lease_active(self.base_dir)
+        )
+        self._last_preempt = float("-inf")
         self.idle_timeout_sec = idle_timeout_sec
         self.hang_after_s = hang_after_s
         self.kill_hung = kill_hung
@@ -208,6 +258,7 @@ class ServerSupervisor:
         self._last_orphan_sweep = float("-inf")
         for d in (
             self.queue_dir,
+            self.live_queue_dir,
             self.base_dir / "completed",
             self.base_dir / "failed",
             self.claims_dir,
@@ -230,7 +281,13 @@ class ServerSupervisor:
                 self._clean_exit_pending_consolidation = False
                 self._run_consolidations()
 
-        if has_claimable_work(self.queue_dir):
+        # A fresh live lease starts servers even before its first ticket
+        # lands: Matlab plus its parpool take about a minute to come up.
+        if (
+            has_claimable_work(self.live_queue_dir)
+            or has_claimable_work(self.queue_dir)
+            or self._lease_active()
+        ):
             for slot in self.slots:
                 if slot.proc is None and now >= slot.next_launch_at:
                     print(
@@ -248,6 +305,9 @@ class ServerSupervisor:
                 slot.last_hang_check = now
                 self._check_hang(slot, now)
 
+        if self.preempt:
+            self._maybe_preempt(now)
+
         self._write_status(now)
 
     # --- exits and claims -----------------------------------------------------
@@ -257,6 +317,17 @@ class ServerSupervisor:
         slot.proc = None
         slot.idle_s = None
         slot.hang_flagged_ticket = None
+        if slot.preempting:
+            # Our own kill, to hand the GPU to live work: not a failure, so no
+            # backoff, and the backfill ticket's requeue doesn't count.
+            slot.preempting = False
+            slot.next_launch_at = now
+            self._requeue_claim_of(slot, reason="preempted for live work", count=False)
+            print(
+                f"🔁 Server {slot.server_id} preempted; relaunching for live work.",
+                flush=True,
+            )
+            return
         self._requeue_claim_of(
             slot, reason=f"server {slot.server_id} exited with rc={rc}"
         )
@@ -286,24 +357,30 @@ class ServerSupervisor:
     def _claim_path(self, slot: ServerSlot) -> Path:
         return self.claims_dir / f"S{slot.server_id}.json"
 
-    def _read_claim(self, slot: ServerSlot) -> tuple[str, float] | None:
-        """(ticket name, claim time) this server holds, or None."""
+    def _read_claim(self, slot: ServerSlot) -> Claim | None:
+        """The ticket this server holds, or None. Records written before
+        lanes existed have no "queue" field and came from the backfill queue."""
         path = self._claim_path(slot)
         try:
             rec = json.loads(path.read_text())
-            return str(rec["ticket"]), path.stat().st_mtime
-        except (OSError, ValueError, KeyError, TypeError):
+            lane = str(rec.get("queue") or lanes.BACKFILL_QUEUE_NAME)
+            if lane not in (lanes.LIVE_QUEUE_NAME, lanes.BACKFILL_QUEUE_NAME):
+                lane = lanes.BACKFILL_QUEUE_NAME
+            return Claim(str(rec["ticket"]), path.stat().st_mtime, lane)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return None
 
-    def _requeue_claim_of(self, slot: ServerSlot, reason: str) -> None:
+    def _requeue_claim_of(
+        self, slot: ServerSlot, reason: str, count: bool = True
+    ) -> None:
         claim = self._read_claim(slot)
         self._claim_path(slot).unlink(missing_ok=True)
         if claim is None:
             return
-        active = self.queue_dir / f".active_{claim[0]}"
+        active = claim.active_path(self.base_dir)
         if active.exists():
-            outcome = requeue_claim(active, reason)
-            print(f"♻️  {claim[0]}: {outcome} ({reason})", flush=True)
+            outcome = requeue_claim(active, reason, count=count)
+            print(f"♻️  {claim.ticket}: {outcome} ({reason})", flush=True)
 
     def _reclaim_unowned(self) -> None:
         """With no server process alive at all, nothing can legitimately hold
@@ -311,11 +388,12 @@ class ServerSupervisor:
         requeue interrupted between its write and its rename."""
         if self._any_server_alive():
             return  # e.g. a server launched by hand outside this supervisor
-        for staging in self.queue_dir.glob(".requeue_*.json"):
-            os.replace(staging, self.queue_dir / staging.name.removeprefix(".requeue_"))
-        for active in sorted(self.queue_dir.glob(".active_*.json")):
-            outcome = requeue_claim(active, "orphaned claim: no server was running")
-            print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
+        for lane_dir in (self.live_queue_dir, self.queue_dir):
+            for staging in lane_dir.glob(".requeue_*.json"):
+                os.replace(staging, lane_dir / staging.name.removeprefix(".requeue_"))
+            for active in sorted(lane_dir.glob(".active_*.json")):
+                outcome = requeue_claim(active, "orphaned claim: no server was running")
+                print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
         for rec in self.claims_dir.glob("S*.json"):
             rec.unlink(missing_ok=True)
 
@@ -326,9 +404,9 @@ class ServerSupervisor:
         if claim is None:
             slot.idle_s = None
             return
-        ticket, claimed_at = claim
+        ticket, claimed_at = claim.ticket, claim.claimed_at
         try:
-            data_dir = json.loads((self.queue_dir / f".active_{ticket}").read_text())[
+            data_dir = json.loads(claim.active_path(self.base_dir).read_text())[
                 "dataDir"
             ]
         except (OSError, ValueError, KeyError, TypeError):
@@ -350,6 +428,49 @@ class ServerSupervisor:
                 flush=True,
             )
             self._kill(slot)
+
+    # --- preemption -----------------------------------------------------------
+
+    def _maybe_preempt(self, now: float) -> None:
+        """If a live ticket has waited `preempt_after_s` and no idle or
+        starting server is free to take it, kill one server that is working on
+        a backfill ticket. At most one per `preempt_after_s`, so work
+        escalates to the second GPU only while live tickets keep piling up."""
+        waited = oldest_claimable_age(self.live_queue_dir, now)
+        if waited is None or waited < self.preempt_after_s:
+            return
+        if now - self._last_preempt < self.preempt_after_s:
+            return
+        # A running server with no claim is idle or still starting (Matlab
+        # takes about a minute) and will take a live ticket next; only
+        # preempt for live tickets beyond what those can absorb.
+        free = sum(
+            1
+            for slot in self.slots
+            if slot.proc is not None
+            and not slot.preempting
+            and self._read_claim(slot) is None
+        )
+        waiting = sum(
+            1 for p in self.live_queue_dir.glob("*.json") if not p.name.startswith(".")
+        )
+        if waiting <= free:
+            return
+        for slot in self.slots:
+            if slot.proc is None or slot.preempting:
+                continue
+            claim = self._read_claim(slot)
+            if claim is None or claim.lane != lanes.BACKFILL_QUEUE_NAME:
+                continue
+            print(
+                f"⏩ Live ticket waiting {waited:.0f}s: preempting server "
+                f"{slot.server_id} (backfill {claim.ticket}).",
+                flush=True,
+            )
+            slot.preempting = True
+            self._last_preempt = now
+            self._kill(slot)
+            return
 
     def _kill(self, slot: ServerSlot) -> None:
         """Terminate the server's whole process tree: the bash wrapper,
@@ -412,20 +533,36 @@ class ServerSupervisor:
                     "pid": slot.proc.pid if slot.proc is not None else None,
                     "consecutive_failures": slot.consecutive_failures,
                     "next_launch_at": slot.next_launch_at,
-                    "ticket": claim[0] if claim else None,
-                    "claimed_at": claim[1] if claim else None,
+                    "ticket": claim.ticket if claim else None,
+                    "lane": claim.lane if claim else None,
+                    "claimed_at": claim.claimed_at if claim else None,
                     "idle_s": slot.idle_s,
                     "suspected_hang": slot.hang_flagged_ticket is not None,
                 }
             )
         tmp = self.base_dir / ".supervisor_status.json.tmp"
-        tmp.write_text(json.dumps({"updated_at": now, "servers": servers}, indent=1))
+        status = {
+            "updated_at": now,
+            "live_lease_active": self._lease_active(),
+            "live_queued": sum(
+                1
+                for p in self.live_queue_dir.glob("*.json")
+                if not p.name.startswith(".")
+            ),
+            "backfill_queued": sum(
+                1 for p in self.queue_dir.glob("*.json") if not p.name.startswith(".")
+            ),
+            "servers": servers,
+        }
+        tmp.write_text(json.dumps(status, indent=1))
         os.replace(tmp, self.base_dir / "supervisor_status.json")
 
 
 def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     """Supervise the servers until interrupted. Hang handling is set by
-    OPYM_SERVE_HANG_MIN (default 60) and OPYM_SERVE_KILL_HUNG (default 1)."""
+    OPYM_SERVE_HANG_MIN (default 60) and OPYM_SERVE_KILL_HUNG (default 1);
+    live preemption by OPYM_LIVE_PREEMPT (default 1) and
+    OPYM_LIVE_PREEMPT_AFTER_S (default 30)."""
     hang_after_s = (
         float(os.environ.get("OPYM_SERVE_HANG_MIN", DEFAULT_HANG_AFTER_S / 60)) * 60
     )
@@ -434,17 +571,24 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
         "false",
         "",
     )
+    preempt = os.environ.get("OPYM_LIVE_PREEMPT", "1").strip() not in ("0", "false", "")
+    preempt_after_s = float(
+        os.environ.get("OPYM_LIVE_PREEMPT_AFTER_S", DEFAULT_PREEMPT_AFTER_S)
+    )
     sup = ServerSupervisor(
         BASE_DIR,
         idle_timeout_sec=idle_timeout_sec,
         hang_after_s=hang_after_s,
         kill_hung=kill_hung,
+        preempt=preempt,
+        preempt_after_s=preempt_after_s,
     )
 
     print("=" * 60)
     print(" 🚀 OPYM PetaKit GPU Supervisor Initialized")
     print("=" * 60)
-    print(f" 📂 Queue Directory: {sup.queue_dir}")
+    print(f" 📂 Live Queue:      {sup.live_queue_dir} (claimed first)")
+    print(f" 📂 Backfill Queue:  {sup.queue_dir}")
     print(
         " 🖥️  Servers:         "
         + ", ".join(f"{s.server_id}->GPU {s.cuda_device}" for s in sup.slots)
@@ -458,6 +602,10 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     print(
         f" 🧊 Hang Handling:   flag after {hang_after_s / 60:.0f} min idle, "
         f"kill={'on' if kill_hung else 'off'}"
+    )
+    print(
+        f" ⏩ Live Preemption: {'on' if preempt else 'off'}, after a live ticket "
+        f"waits {preempt_after_s:.0f}s"
     )
     print(f" 🔧 Backend Script:  {OPYM_DIR}/run_petakit_server.m")
     print("=" * 60, flush=True)

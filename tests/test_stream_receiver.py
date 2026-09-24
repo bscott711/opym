@@ -662,3 +662,26 @@ def test_session_end_appends_staging_profile(tmp_path, receiver, client, monkeyp
     assert record["decon_staging"] is True
     assert record["raw_write_s"]["p95"] >= 0
     assert record["tiff_write_s"]["max"] >= record["tiff_write_s"]["p50"] >= 0
+
+
+def test_live_lease_held_only_while_a_session_is_open(tmp_path, receiver, client, monkeypatch):
+    from opym import lanes
+
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    session_id = "sess-lease"
+    sock = client(session_id)
+    _start_session(sock, session_id, receiver, _session_header(tmp_path / "raw"))
+    assert lanes.live_lease_active()
+
+    sock.send_multipart(pack_message(MSG_SESSION_END, session_id, {"reason": "complete"}))
+    _drive(receiver)
+    assert not lanes.lease_path().exists()
+
+
+def test_no_live_lease_unless_the_live_lane_is_enabled(tmp_path, receiver, client, monkeypatch):
+    from opym import lanes
+
+    monkeypatch.delenv("OPYM_LIVE_LANE", raising=False)
+    sock = client("sess-nolease")
+    _start_session(sock, "sess-nolease", receiver, _session_header(tmp_path / "raw"))
+    assert not lanes.lease_path().exists()

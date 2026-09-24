@@ -56,6 +56,7 @@ from typing import Any
 import numpy as np
 import zmq
 
+from opym import lanes
 from opym.stream import drain, rawmirror
 from opym.stream.protocol import (
     MSG_ACK,
@@ -97,6 +98,16 @@ _DECON_PSF_ENV_VAR = "OPYM_DECON_PSF"
 # own per-session-read pattern -- both are toggled per-test via monkeypatch,
 # and neither is expected to change mid-process in production.
 _STAGE_ROOT_ENV_VAR = "OPYM_STREAM_STAGE_ROOT"
+
+
+# Holding the live lease (opym.lanes) makes the GPU servers and the backfill
+# yield to this acquisition. Off by default: until live tickets exist
+# (Phase 2), holding it would only park the backfill with the GPUs idle.
+_LIVE_LANE_ENV_VAR = "OPYM_LIVE_LANE"
+
+
+def _live_lane_enabled() -> bool:
+    return os.environ.get(_LIVE_LANE_ENV_VAR, "").strip() in ("1", "true", "yes")
 
 
 def _decon_enabled() -> bool:
@@ -241,6 +252,7 @@ class StreamReceiver:
             high_water_bytes=drain_high_water_bytes,
         )
         self._drain_pool.start()
+        self._lease = lanes.LeaseKeeper()
 
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
@@ -258,6 +270,7 @@ class StreamReceiver:
         self._poller.register(self._socket, zmq.POLLIN)
 
     def close(self) -> None:
+        self._lease.update([])
         self._socket.close(linger=0)
         # Deliberately not draining the queue first: shutdown must not block
         # on GPFS copies. Any not-yet-drained session's staging copy stays
@@ -286,6 +299,9 @@ class StreamReceiver:
             self._handle_incoming()
         self._flush_pending_acks()
         self._sweep_idle_sessions()
+        # Held while any session is open; refreshed every few seconds so it
+        # goes stale (and frees the GPUs) within a minute if we crash.
+        self._lease.update(self.sessions.keys() if _live_lane_enabled() else ())
 
     def _handle_incoming(self) -> None:
         identity, *rest = self._socket.recv_multipart()

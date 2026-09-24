@@ -57,6 +57,12 @@ done_dir  = fullfile(base_queue_dir, 'completed');
 fail_dir  = fullfile(base_queue_dir, 'failed');
 
 if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
+% Priority lanes (see opym/lanes.py): live (streaming) tickets in queue_live
+% are always claimed first; backfill tickets in queue only while no live
+% acquisition holds a fresh LIVE_LEASE.json.
+live_queue_dir = fullfile(base_queue_dir, 'queue_live');
+if ~exist(live_queue_dir, 'dir'), mkdir(live_queue_dir); end
+leasePath = fullfile(base_queue_dir, 'LIVE_LEASE.json');
 if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
@@ -161,12 +167,7 @@ end
 idleTimer = 0;
 
 while true
-    jobFiles = dir(fullfile(queue_dir, '*.json'));
-    
-    % Filter out hidden or locked files (e.g. .active_...)
-    if ~isempty(jobFiles)
-        jobFiles = jobFiles(~startsWith({jobFiles.name}, '.'));
-    end
+    [jobFiles, claim_dir] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
 
     if isempty(jobFiles)
         pause(2);
@@ -183,8 +184,9 @@ while true
     idleTimer = 0;
 
     currentFile = jobFiles(1).name;
-    srcPath = fullfile(queue_dir, currentFile);
-    activePath = fullfile(queue_dir, ['.active_' currentFile]);
+    [~, claimLane] = fileparts(claim_dir);
+    srcPath = fullfile(claim_dir, currentFile);
+    activePath = fullfile(claim_dir, ['.active_' currentFile]);
 
     % Atomic file lock (prevents both GPUs from grabbing same job)
     [status, ~] = movefile(srcPath, activePath);
@@ -193,10 +195,10 @@ while true
         continue;
     end
 
-    logMsg('[Server] >>> Processing job: %s', currentFile);
-    writeClaim(claimPath, envServerId, currentFile);
+    logMsg('[Server] >>> Processing job: %s (%s)', currentFile, claimLane);
+    writeClaim(claimPath, envServerId, currentFile, claimLane);
     tTicket = tic;
-    prof = struct('ticket', currentFile, 'server_id', envServerId, ...
+    prof = struct('ticket', currentFile, 'lane', claimLane, 'server_id', envServerId, ...
         'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
         'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
         'decon_s', NaN, 'dsr_s', NaN, 'total_s', NaN, 'status', '', 'error', '');
@@ -799,10 +801,41 @@ while true
     writeProfile(profiling_dir, envServerId, prof);
 end
 
-function writeClaim(claimPath, serverId, ticketName)
+function [jobFiles, fromDir] = nextJobFiles(liveDir, backfillDir, leasePath)
+    % Claimable tickets, oldest name first, from the live queue if it has
+    % any, else from the backfill queue unless a live lease is fresh.
+    fromDir = liveDir;
+    jobFiles = claimableIn(liveDir);
+    if ~isempty(jobFiles) || liveLeaseActive(leasePath)
+        return;
+    end
+    fromDir = backfillDir;
+    jobFiles = claimableIn(backfillDir);
+end
+
+function files = claimableIn(dirPath)
+    % Dot-files are claims (.active_*) or in-progress requeues (.requeue_*).
+    files = dir(fullfile(dirPath, '*.json'));
+    if isempty(files), return; end
+    files = files(~startsWith({files.name}, '.'));
+    if isempty(files), return; end
+    [~, order] = sort({files.name});
+    files = files(order);
+end
+
+function tf = liveLeaseActive(leasePath)
+    % Fresh = rewritten within 60 s (opym.lanes.LEASE_MAX_AGE_S), so a
+    % crashed receiver can never park the backfill for longer than that.
+    d = dir(leasePath);
+    tf = ~isempty(d) && (now - d(1).datenum) * 86400 <= 60;
+end
+
+function writeClaim(claimPath, serverId, ticketName, lane)
     % See claims_dir above. Written via a temp file so the supervisor never
-    % reads a half-written record.
-    rec = struct('server_id', serverId, 'ticket', ticketName, 'pid', feature('getpid'));
+    % reads a half-written record. `queue` names the lane directory the
+    % ticket was claimed from, so it can be requeued into the same one.
+    rec = struct('server_id', serverId, 'ticket', ticketName, 'queue', lane, ...
+        'pid', feature('getpid'));
     tmpPath = [claimPath '.tmp'];
     fid = fopen(tmpPath, 'w');
     fprintf(fid, '%s', jsonencode(rec));
