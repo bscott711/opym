@@ -212,6 +212,28 @@ class DrainPool:
             total_bytes / 1e9,
         )
 
+    def release(self, stage_paths: list[Path]) -> None:
+        """Evicts now, instead of when retention expires, every drained
+        session whose staging copies include any of `stage_paths`, so a new
+        session can take over that name in the (flat, shared) staging root.
+
+        Safe to do early: a drained session's GPFS copy is already verified
+        byte-for-byte, and nothing but the receiver itself reads the staging
+        root. A path that is still draining, or whose drain failed, is not in
+        `_drained` and is left alone -- the caller treats it as taken.
+        """
+        wanted = {Path(p) for p in stage_paths}
+        with self._lock:
+            hits = [
+                (sid, e)
+                for sid, e in self._drained.items()
+                if wanted & set(e.stage_dirs)
+            ]
+            for sid, _ in hits:
+                del self._drained[sid]
+        for sid, entry in hits:
+            self._evict(sid, entry)
+
     def _sweep_retention(self) -> None:
         now = time.monotonic()
         to_evict: list[tuple[str, _DrainedEntry]] = []

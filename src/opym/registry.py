@@ -361,6 +361,26 @@ class StatusRegistry:
                 (dataset_key, stage, status, _now(), _now(), output_path, ticket_path, error),
             )
 
+    def reset_stage(self, dataset_key: str, stage: str) -> None:
+        """Marks a stage as needing to run again ('pending', no finish time)
+        because something upstream of it is being redone -- e.g. a new
+        deskew ticket makes the existing MIPs out of date.
+
+        Keeps `output_path`, deliberately: the old output is still on disk
+        until the stage re-runs, and opym-dashboard uses a pending row with
+        an output_path to label that dataset "reprocessing" rather than
+        either "done" (wrong: the output is stale) or "never processed"
+        (wrong: there is something to look at). No-op when the stage has no
+        row yet.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """UPDATE stage_status
+                   SET status='pending', finished_at=NULL, error_message=NULL
+                   WHERE dataset_key=? AND stage=?""",
+                (dataset_key, stage),
+            )
+
     def get_stage(self, dataset_key: str, stage: str) -> dict | None:
         with self._cursor() as cur:
             cur.execute(

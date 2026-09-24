@@ -78,6 +78,10 @@ ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
 POLL_TIMEOUT_MS = 500
+# `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
+# thousand earlier acquisitions under one name means something is wrong
+# with naming, not a genuine collision; reject the session and say so.
+_MAX_NAME_SUFFIX = 999
 
 # Per-session staging timings are appended here as JSON lines (see
 # `_write_stage_profile`), beside run_petakit_server.m's per-ticket
@@ -114,6 +118,13 @@ def _live_lane_enabled() -> bool:
 
 def _decon_enabled() -> bool:
     return bool(os.environ.get(_DECON_PSF_ENV_VAR, "").strip())
+
+
+def _holds_files(path: Path) -> bool:
+    """True if any regular file exists anywhere under `path`. An empty
+    directory tree (e.g. a staging leaf whose files the live lane already
+    removed) doesn't block reusing its name."""
+    return path.is_dir() and any(p.is_file() for p in path.rglob("*"))
 
 
 def _stage_root_from_env() -> Path | None:
@@ -391,6 +402,9 @@ class StreamReceiver:
                         "tmpfs overflow"
                     )
 
+            base_name = self._resolve_base_name(
+                session_id, base_name, channel_names, raw_root, write_root
+            )
             channel_store_paths = {
                 c: rawmirror.store_path_for_channel(write_root, base_name, name)
                 for c, name in zip(channels, channel_names)
@@ -435,6 +449,74 @@ class StreamReceiver:
             session.write_root != session.raw_root,
         )
         self._send_ack(session)
+
+    def _resolve_base_name(
+        self,
+        session_id: str,
+        requested: str,
+        channel_names: list[str],
+        raw_root: Path,
+        write_root: Path,
+    ) -> str:
+        """The name this session is written under: `requested`, or
+        `requested_001`, `_002`, ... when an earlier acquisition already
+        used it (pymmcore's own `_001` convention).
+
+        Two sessions must never share storage. On 2026-09-24 a 100-timepoint
+        Cell_001 started three minutes after a 1-timepoint test of the same
+        name: `create_channel_store` reopened the test's `[1, ...]` array,
+        every frame was rejected, and the drain re-copied the stale test --
+        the acquisition was lost. Had the shapes matched (Cell_004 was also
+        started twice that day), the second run would have silently
+        overwritten the first instead.
+
+        A name is taken if one of its channel stores or its leaf directory
+        exists under `raw_root` (an earlier acquisition landed there), or is
+        still occupied under the staging root. Staging copies of already-
+        drained sessions are released first (`DrainPool.release`), since the
+        staging root is flat across every `raw_root` and a retained copy from
+        another experiment folder would otherwise force a needless rename.
+        Stores tagged with this `session_id` are this session's own -- a
+        SESSION_START resent after a receiver restart -- and keep their name.
+        """
+        existing = self.sessions.get(session_id)
+        if existing is not None:
+            return existing.base_name
+        staging = write_root != raw_root
+        for n in range(_MAX_NAME_SUFFIX + 1):
+            name = requested if n == 0 else f"{requested}_{n:03d}"
+            stage_stores = [
+                rawmirror.store_path_for_channel(write_root, name, ch)
+                for ch in channel_names
+            ]
+            if any(rawmirror.read_session_id(p) == session_id for p in stage_stores):
+                return name
+            dest_stores = [
+                rawmirror.store_path_for_channel(raw_root, name, ch)
+                for ch in channel_names
+            ]
+            taken = any(p.exists() for p in dest_stores) or (raw_root / name).exists()
+            if staging and not taken:
+                stage_leaf = write_root / name
+                self._drain_pool.release([*stage_stores, stage_leaf / "decon_stage"])
+                taken = any(p.exists() for p in stage_stores) or _holds_files(
+                    stage_leaf
+                )
+            if not taken:
+                if n:
+                    logger.warning(
+                        "Session %s: base_name %r is already used by an earlier "
+                        "acquisition under %s -- writing this one as %r instead",
+                        session_id,
+                        requested,
+                        raw_root,
+                        name,
+                    )
+                return name
+        raise ValueError(
+            f"base_name {requested!r} and all of its _001.._{_MAX_NAME_SUFFIX:03d} "
+            f"variants are already used under {raw_root}"
+        )
 
     def _maybe_start_live(self, session: SessionState) -> None:
         """Hand a time-lapse session to the live lane when it's enabled
@@ -536,6 +618,7 @@ class StreamReceiver:
                 dtype=dtype,
                 z_step_um=session.z_step_um,
                 output_format=session.output_format,
+                session_id=session.session_id,
             )
             session.channel_arrays[c] = arr
         rawmirror.write_timepoint(arr, t, raw)
@@ -644,6 +727,24 @@ class StreamReceiver:
                     (session.decon_stage_dir, session.dest_leaf_dir / "decon_stage")
                 )
             items = [(s, d) for s, d in items if s.exists()]
+            # Never drain a store another session wrote. `_resolve_base_name`
+            # already keeps sessions apart; this is the backstop for the
+            # 2026-09-24 failure, where a session that staged nothing still
+            # re-drained an earlier session's same-named store over GPFS.
+            foreign = [
+                s
+                for s, _ in items
+                if s.name.endswith(".ome.zarr")
+                and rawmirror.read_session_id(s) != session.session_id
+            ]
+            for s in foreign:
+                logger.error(
+                    "Session %s: not draining %s -- it was written by session %s",
+                    session.session_id,
+                    s,
+                    rawmirror.read_session_id(s),
+                )
+            items = [(s, d) for s, d in items if s not in foreign]
 
             if items:
                 # Enqueue is a cheap, non-blocking `queue.put`; the actual

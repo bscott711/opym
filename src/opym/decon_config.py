@@ -94,6 +94,40 @@ def decon_params_fingerprint() -> str:
     )
 
 
+def ticket_decon_fingerprint(params: dict) -> str | None:
+    """`decon_params_fingerprint`'s format, computed from a submitted ticket's
+    `parameters` instead of the current settings -- i.e. what a finished
+    ticket's output was actually made with. None for a deskew-only ticket.
+
+    Each value is rendered with the type of its constant above, so a ticket
+    made with the current settings fingerprints identically: the ticket
+    stores `damp_factor` as 2.0 (`petakit._apply_omw_params` casts to float)
+    where the constant is the int 2. A knob the ticket doesn't carry at all
+    (tickets from before it was set explicitly) renders as `?`, which can
+    never match a real fingerprint.
+    """
+    if not params.get("run_decon") and not params.get("psf_path"):
+        return None
+
+    def num(key: str, like: float | int) -> str:
+        value = params.get(key)
+        if value is None:
+            return "?"
+        as_like = type(like)(value)
+        return str(as_like) if float(value) == as_like else str(value)
+
+    hann = params.get("hann_win_bounds")
+    lo, hi = DECON_HANN_WIN_BOUNDS
+    if hann and len(hann) == 2:
+        hann_str = f"{type(lo)(hann[0])}-{type(hi)(hann[1])}"
+    else:
+        hann_str = "?"
+    alpha = num("wiener_alpha", DECON_WIENER_ALPHA)
+    otf = num("otf_cum_thresh", DECON_OTF_CUM_THRESH)
+    damp = num("damp_factor", DECON_DAMP_FACTOR)
+    return f"a{alpha}_o{otf}_h{hann_str}_d{damp}"
+
+
 def deskew_decon_kwargs(psf: Path | None) -> dict:
     """Keyword arguments shared by `opym.petakit.submit_remote_deskew_job` and
     `submit_live_frames_job`. The decon knobs are ignored by a deskew-only
