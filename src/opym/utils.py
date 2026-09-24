@@ -236,7 +236,14 @@ def write_decon_staged_tiff(volume_zyx: np.ndarray, dst: Path) -> None:
     # Write-then-rename so a crash mid-write never leaves a half-written
     # TIFF at the real destination name (see docstring above).
     tmp = dst.with_name(dst.name + ".tmp")
-    tifffile.imwrite(tmp, oriented, compression="zlib")
+    # ome=True explicitly: tifffile only auto-writes OME-XML when the path it
+    # is given ends in .ome.tif, and `tmp` never does -- so a single-timepoint
+    # file named `<store>.ome.tif` used to carry a plain JSON description,
+    # which OME-aware readers (ChimeraX) reject outright. Pages are unchanged,
+    # so PetaKit5D's `readtiff` sees exactly the same pixels either way.
+    tifffile.imwrite(
+        tmp, oriented, compression="zlib", ome=True, metadata={"axes": "ZYX"}
+    )
     os.replace(tmp, dst)
 
 

@@ -48,6 +48,23 @@ _ZATTRS = {
     ]
 }
 
+# Final-output formats a client may request for the processed (DSR) result.
+# Recorded on the raw store as `.zattrs["opym"]["output_format"]` so the
+# choice travels with the data through the drain to GPFS, where
+# `bioimaging.backfill`'s viewer export reads it back.
+OUTPUT_FORMATS = ("tiff", "ome-zarr", "both")
+
+
+def read_output_format(store_path: Path) -> str | None:
+    """The `output_format` a stream client recorded on this raw store, or
+    None if none was (e.g. a Globus-landed acquisition)."""
+    try:
+        attrs = json.loads((Path(store_path) / ".zattrs").read_text())
+    except (OSError, ValueError):
+        return None
+    fmt = attrs.get("opym", {}).get("output_format")
+    return fmt if fmt in OUTPUT_FORMATS else None
+
 
 def create_channel_store(
     store_path: Path,
@@ -56,6 +73,7 @@ def create_channel_store(
     shape_zyx: tuple[int, int, int],
     dtype: str,
     z_step_um: float,
+    output_format: str | None = None,
 ) -> zarr.Array:
     """Creates (or reopens) one channel's raw zarr store at `store_path` and
     returns its `p0` pixel array, shaped `(num_timepoints, *shape_zyx)`.
@@ -97,7 +115,10 @@ def create_channel_store(
     _write_z_coordinate(store_path / "z", nz, z_step_um)
 
     # Written last -- see docstring.
-    (store_path / ".zattrs").write_text(json.dumps(_ZATTRS))
+    attrs = dict(_ZATTRS)
+    if output_format is not None:
+        attrs["opym"] = {"output_format": output_format}
+    (store_path / ".zattrs").write_text(json.dumps(attrs))
     return arr
 
 

@@ -430,6 +430,67 @@ def test_decon_stage_written_with_correct_orientation_when_enabled(
     )
 
 
+def test_single_timepoint_staged_tiff_is_valid_ome(
+    tmp_path, receiver, client, monkeypatch
+):
+    """Rig 2026-09-23: a single-timepoint session stages `<store>.ome.tif`,
+    which ChimeraX rejected because it carried tifffile's JSON description
+    instead of OME-XML. Pixels (what PetaKit5D's readtiff sees) must not
+    change."""
+    monkeypatch.setenv("OPYM_DECON_PSF", "/fake/psf.tif")
+    session_id = "sess-ome"
+    raw_root = tmp_path / "raw"
+    sock = client(session_id)
+    _start_session(
+        sock, session_id, receiver,
+        _session_header(raw_root, num_timepoints=1, channels=(0,),
+                        channel_names=["GFP_488"]),
+    )
+    header, vol = _frame(t=0, c=0, frame_index=0)
+    sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
+    _drive(receiver)
+    _recv_ack(sock)
+
+    staged = raw_root / "sample" / "decon_stage" / "sample_GFP_488.ome.tif"
+    with tifffile.TiffFile(staged) as tf:
+        assert tf.is_ome
+        assert tf.pages[0].description.startswith("<?xml")
+        assert len(tf.pages) == SHAPE_ZYX[0]
+        np.testing.assert_array_equal(tf.asarray(), orient_zyx_for_decon_tiff(vol))
+
+
+@pytest.mark.parametrize(
+    ("requested", "recorded"),
+    [("ome-zarr", "ome-zarr"), ("tiff", "tiff"), ("both", "both"),
+     ("bogus", None), (None, None)],
+)
+def test_output_format_recorded_on_raw_store(
+    tmp_path, receiver, client, requested, recorded
+):
+    from opym.stream.rawmirror import read_output_format
+
+    session_id = f"sess-fmt-{requested}"
+    raw_root = tmp_path / "raw"
+    sock = client(session_id)
+    header = _session_header(raw_root, num_timepoints=1, channels=(0,))
+    if requested is not None:
+        header["output_format"] = requested
+    _start_session(sock, session_id, receiver, header)
+    frame_header, vol = _frame(t=0, c=0, frame_index=0)
+    sock.send_multipart(
+        pack_message(MSG_FRAME, session_id, frame_header, vol.tobytes())
+    )
+    _drive(receiver)
+    _recv_ack(sock)
+
+    store = _raw_store_path(raw_root, "sample", "C0")
+    assert read_output_format(store) == recorded
+    # An unknown format must never cost the acquisition itself.
+    np.testing.assert_array_equal(
+        _read_raw_timepoint(raw_root, "sample", "C0", t=0), vol
+    )
+
+
 def _wait_until(predicate, timeout=5.0, interval=0.02):
     deadline = time.time() + timeout
     while time.time() < deadline:

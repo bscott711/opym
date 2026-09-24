@@ -80,6 +80,12 @@ _VALID_TYPES = frozenset(
 #                               array, the only z-step source
 #                               opym.metadata.parse_zarr_z_step_from_store
 #                               trusts (see its docstring)
+#   output_format    str    -- OPTIONAL, one of "tiff", "ome-zarr", "both"
+#                               (rawmirror.OUTPUT_FORMATS): the format the
+#                               processed DSR result is kept in. Recorded on
+#                               each raw store's .zattrs["opym"]; an unknown
+#                               value is logged and ignored. Omitted -> the
+#                               backfill's OPYM_OUTPUT_FORMAT default.
 #
 # Decon parameters (PSF, wiener_alpha, edge_erosion, rl_method) are NOT
 # part of this handshake -- they're resolved server-side by the batch

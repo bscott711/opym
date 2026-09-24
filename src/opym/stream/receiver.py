@@ -101,6 +101,23 @@ def _stage_root_from_env() -> Path | None:
     return Path(val) if val else None
 
 
+def _requested_output_format(header: dict[str, Any], session_id: str) -> str | None:
+    """SESSION_START's optional `output_format`. An unrecognized value is
+    logged and ignored (falls back to the backfill default) rather than
+    rejecting the session -- losing a whole acquisition over a display
+    preference would be the wrong trade."""
+    fmt = header.get("output_format")
+    if fmt is None or fmt in rawmirror.OUTPUT_FORMATS:
+        return fmt
+    logger.warning(
+        "Session %s: ignoring unknown output_format %r (expected one of %s)",
+        session_id,
+        fmt,
+        rawmirror.OUTPUT_FORMATS,
+    )
+    return None
+
+
 def _estimate_session_bytes(header: dict[str, Any]) -> int:
     """Rough pre-flight size estimate from SESSION_START's declared shape --
     used only to guard against starting a session RAM-disk staging can't
@@ -142,6 +159,10 @@ class SessionState:
     channel_cidx: dict[int, int]
     z_step_um: float
     decon_enabled: bool
+    output_format: str | None = None
+    """The client's requested final-output format (one of
+    `rawmirror.OUTPUT_FORMATS`), recorded on each raw store; None leaves it
+    to the backfill's own default."""
     channel_arrays: dict[int, Any] = field(default_factory=dict)
     received_pairs: set[tuple[int, int]] = field(default_factory=set)
     processed_frame_indices: set[int] = field(default_factory=set)
@@ -349,6 +370,7 @@ class StreamReceiver:
                 channel_cidx=channel_cidx,
                 z_step_um=header["z_step_um"],
                 decon_enabled=_decon_enabled(),
+                output_format=_requested_output_format(header, session_id),
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
@@ -441,6 +463,7 @@ class StreamReceiver:
                 shape_zyx=shape_zyx,
                 dtype=dtype,
                 z_step_um=session.z_step_um,
+                output_format=session.output_format,
             )
             session.channel_arrays[c] = arr
         rawmirror.write_timepoint(arr, t, raw)
