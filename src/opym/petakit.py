@@ -16,11 +16,13 @@ from pathlib import Path
 
 import ipywidgets as widgets
 
+from .decon_config import DSR_INTERP_METHOD
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
 from .utils import resolve_output_base
 
 # Constants
 BASE_DIR = Path("/dev/shm/petakit_jobs")
+
 QUEUE_DIR = BASE_DIR / "queue"
 DONE_DIR = BASE_DIR / "completed"
 FAIL_DIR = BASE_DIR / "failed"
@@ -451,6 +453,84 @@ def submit_remote_deskew_job(
     }
 
     return _write_ticket(payload, base_name, "DESKEW", queue_dir)
+
+
+def submit_live_frames_job(
+    frames: list[str | Path],
+    decon_dir: Path,
+    erode_mask_source: str | Path,
+    psf_paths: list[str | Path],
+    channel_patterns: list[str],
+    z_step_um: float,
+    *,
+    ticket_name: str,
+    queue_dir: Path,
+    xy_pixel_size: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+    dsr_dir_name: str = "DSR_decon",
+    interp_method: str = DSR_INTERP_METHOD,
+    reverse: bool = True,
+    rl_method: str = "omw",
+    n_iters: int | None = None,
+    gpu_decon: bool = True,
+    background: float | None = None,
+    edge_erosion: int | None = None,
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
+    damp_factor: float | None = None,
+    keep_decon: bool = False,
+) -> Path:
+    """Queue a 'live' ticket: decon -> deskew/rotate of `frames` (staged
+    (y, x, z) TIFFs, see `opym.utils.write_decon_staged_tiff`) through the
+    same per-frame PetaKit5D functions a decon 'deskew' ticket's wrappers
+    call, without the wrappers (see run_live_frames.m).
+
+    Every ticket of one acquisition must share `decon_dir`: the generated
+    PSF, the OMW back projector and the first-time-point edge-erosion mask
+    (built from `erode_mask_source`, the session's first C0 frame, as the
+    batch path's erodeByFTP does) are made once there and reused. Output:
+    `<decon_dir>/<dsr_dir_name>/<frame>.tif` plus `MIPs/`, the same names
+    the batch path writes. Defaults match `submit_remote_deskew_job`, so a
+    caller passing the same decon parameters gets the same result.
+    """
+    psfs = _resolve_psf_paths(None, list(psf_paths), channel_patterns)
+    if not psfs or len(psfs) != len(channel_patterns):
+        raise ValueError("psf_paths needs one PSF per channel pattern")
+    rl_method = _normalize_rl_method(rl_method)
+    params = {
+        "frames": [str(f) for f in frames],
+        "channel_patterns": list(channel_patterns),
+        "psf_paths": psfs,
+        "decon_dir": str(decon_dir),
+        "erode_mask_source": str(erode_mask_source),
+        "keep_decon": keep_decon,
+        "dsr_dir_name": dsr_dir_name,
+        "interp_method": interp_method,
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+        "reverse": reverse,
+        "objective_scan": False,
+        "z_stage_scan": False,
+        "rl_method": rl_method,
+        "decon_iter": n_iters if n_iters is not None else (2 if rl_method == "omw" else 25),
+        "gpu_decon": gpu_decon,
+    }
+    if background is not None:
+        params["background"] = float(background)
+    if edge_erosion is not None:
+        params["edge_erosion"] = int(edge_erosion)
+    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
+    payload = {
+        "jobType": "live",
+        # The supervisor's hang check watches this directory for new files.
+        "dataDir": str(decon_dir),
+        "baseName": ticket_name,
+        "parameters": params,
+    }
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    return _write_ticket(payload, ticket_name, "LIVE", queue_dir)
 
 
 def submit_remote_decon_job(

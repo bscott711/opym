@@ -537,6 +537,16 @@ while true
                     'cpusPerTask', numCPUs ...
                 );
 
+            case 'live'
+                % Streamed timepoints (opym.stream.live): decon -> DSR per
+                % frame through the same frame functions the wrappers below
+                % call, minus the wrappers. See run_live_frames.m.
+                logMsg('[Server] Live: %d frame(s) -> %s', numel(cellstr(p.frames)), char(p.decon_dir));
+                liveStats = run_live_frames(p, numCPUs);
+                prof.n_input_tifs = liveStats.frames;
+                prof.decon_s = liveStats.decon_s;
+                prof.dsr_s = liveStats.dsr_s;
+
             otherwise
                 % --- DESKEW / DECONVOLUTION / ROTATION PIPELINE ---
 
