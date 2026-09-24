@@ -185,7 +185,8 @@ def test_session_finalizes_complete_with_provenance(tmp_path, psf):
     assert status["decon_params"] == "a0.2_o0.9_h0.4-1.0_d2"
     assert status["interp_method"] == "linear"
     assert not s.work_dir.exists()
-    assert not s.frame(0, 0).exists()
+    assert not s.frames_dir.exists()
+    assert not s.work_dir.parent.exists()  # the RAM stage leaf is gone too
     assert not lane.busy()
 
 

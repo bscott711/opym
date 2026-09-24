@@ -339,8 +339,15 @@ class LiveLane:
         )
         state = "complete" if full and not session.failed else "failed"
         self._write_status(session, state)
+        # The staged TIFFs aren't drained in live mode, so nothing else would
+        # ever evict leftovers (e.g. a failed timepoint's). A batch fallback
+        # rebuilds them from the raw stores on GPFS.
         shutil.rmtree(session.work_dir, ignore_errors=True)
-        session.frame(0, 0).unlink(missing_ok=True)
+        shutil.rmtree(session.frames_dir, ignore_errors=True)
+        try:
+            session.work_dir.parent.rmdir()  # the stage leaf, if now empty
+        except OSError:
+            pass
         del self.sessions[session.session_id]
         logger.info(
             "Live lane: session %s %s, %d/%d timepoint(s) processed live",
