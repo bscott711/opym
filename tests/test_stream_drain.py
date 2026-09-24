@@ -144,3 +144,42 @@ def test_drained_session_evicted_after_retention_expires(tmp_path):
         assert (dest_dir / "a.bin").read_bytes() == b"hello"
     finally:
         pool.stop()
+
+
+def test_concurrent_sweeps_evict_each_session_exactly_once(
+    tmp_path, monkeypatch, caplog
+):
+    """Every idle worker sweeps retention about once a second. Eviction used to
+    run after the lock was released, so several workers rmtree'd the same
+    session at once and all but one logged FileNotFoundError (seen in
+    production on 2026-09-23). A slowed-down rmtree makes those sweeps overlap
+    deterministically."""
+    import logging
+    import shutil
+
+    real_rmtree = shutil.rmtree
+    evicted = []
+
+    def slow_rmtree(path, *args, **kwargs):
+        evicted.append(str(path))
+        time.sleep(0.3)
+        real_rmtree(path, *args, **kwargs)
+
+    stage_dir = tmp_path / "stage" / "sample"
+    dest_dir = tmp_path / "raw" / "sample"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+
+    pool = DrainPool(num_workers=4, retention_s=0.05, high_water_bytes=10**12)
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-1", [(stage_dir, dest_dir)]))
+        assert _wait_until(lambda: dest_dir.exists())
+        monkeypatch.setattr(shutil, "rmtree", slow_rmtree)
+        with caplog.at_level(logging.ERROR, logger="opym.stream.drain"):
+            assert _wait_until(lambda: not stage_dir.exists(), timeout=5.0)
+            time.sleep(2.5)  # let every other worker complete a sweep
+    finally:
+        pool.stop()
+
+    assert evicted.count(str(stage_dir)) == 1
+    assert not [r for r in caplog.records if "Failed to evict" in r.getMessage()]

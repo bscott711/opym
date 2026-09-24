@@ -30,7 +30,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -215,6 +215,11 @@ class DrainPool:
                     to_evict.append((session_id, entry))
                     total -= entry.size_bytes
                     over_budget = total > self._high_water_bytes
+            # Claim them while still holding the lock. Every idle worker
+            # sweeps about once a second, so otherwise several of them rmtree
+            # the same session at once; `_evict` hands back any it can't remove.
+            for session_id, _ in to_evict:
+                del self._drained[session_id]
 
         for session_id, entry in to_evict:
             self._evict(session_id, entry)
@@ -231,8 +236,9 @@ class DrainPool:
         failed = False
         for stage_dir in entry.stage_dirs:
             try:
-                if stage_dir.exists():
-                    shutil.rmtree(stage_dir)
+                shutil.rmtree(stage_dir)
+            except FileNotFoundError:
+                pass  # already gone is what eviction wants
             except Exception:
                 logger.exception(
                     "Failed to evict RAM disk staging copy for session %s "
@@ -242,9 +248,9 @@ class DrainPool:
                 )
                 failed = True
         if failed:
+            with self._lock:
+                self._drained.setdefault(session_id, entry)
             return
-        with self._lock:
-            self._drained.pop(session_id, None)
         logger.debug(
             "Evicted RAM disk staging copies for %s (%d item(s))",
             session_id,
