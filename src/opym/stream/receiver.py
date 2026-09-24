@@ -57,7 +57,9 @@ import numpy as np
 import zmq
 
 from opym import lanes
+from opym.decon_config import resolve_decon_psf
 from opym.stream import drain, rawmirror
+from opym.stream.live import LiveLane
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -192,6 +194,8 @@ class SessionState:
     # Seconds spent writing each frame's raw store / staged decon TIFF, on
     # this poll loop -- ingest keeps pace only while their sum per timepoint
     # stays under the acquisition interval.
+    live: bool = False
+    """Processed timepoint by timepoint by the live lane (opym.stream.live)."""
     stage_raw_s: list[float] = field(default_factory=list)
     stage_tiff_s: list[float] = field(default_factory=list)
     staged_bytes: int = 0
@@ -253,6 +257,9 @@ class StreamReceiver:
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
+        # Created on the first live session (see _maybe_start_live), so the
+        # env switches stay readable per session like the others here.
+        self._live: LiveLane | None = None
 
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
@@ -271,6 +278,8 @@ class StreamReceiver:
 
     def close(self) -> None:
         self._lease.update([])
+        if self._live is not None:
+            self._live.close()
         self._socket.close(linger=0)
         # Deliberately not draining the queue first: shutdown must not block
         # on GPFS copies. Any not-yet-drained session's staging copy stays
@@ -301,7 +310,11 @@ class StreamReceiver:
         self._sweep_idle_sessions()
         # Held while any session is open; refreshed every few seconds so it
         # goes stale (and frees the GPUs) within a minute if we crash.
-        self._lease.update(self.sessions.keys() if _live_lane_enabled() else ())
+        if self._live is not None:
+            self._live.pump()
+        # The lease also covers live work still in flight after SESSION_END.
+        busy = set(self.sessions) | set(self._live.sessions if self._live else ())
+        self._lease.update(busy if _live_lane_enabled() else ())
 
     def _handle_incoming(self) -> None:
         identity, *rest = self._socket.recv_multipart()
@@ -407,6 +420,7 @@ class StreamReceiver:
             return
 
         self.sessions[session_id] = session
+        self._maybe_start_live(session)
         logger.info(
             "Session %s started: base_name=%s grid=%dT x %dC -> %s "
             "(decon_enabled=%s, staging=%s)",
@@ -419,6 +433,31 @@ class StreamReceiver:
             session.write_root != session.raw_root,
         )
         self._send_ack(session)
+
+    def _maybe_start_live(self, session: SessionState) -> None:
+        """Hand a time-lapse session to the live lane when it's enabled
+        (OPYM_LIVE_LANE=1) and decon is on: its per-timepoint input is the
+        decon_stage/ TIFFs this receiver already writes."""
+        if not (_live_lane_enabled() and session.decon_enabled):
+            return
+        if session.num_timepoints <= 1:
+            return
+        psf = resolve_decon_psf()
+        if psf is None:
+            return
+        if self._live is None:
+            self._live = LiveLane(psf)
+        self._live.start_session(
+            session.session_id,
+            base_name=session.base_name,
+            num_timepoints=session.num_timepoints,
+            n_channels=len(session.channels),
+            frames_dir=session.decon_stage_dir,
+            stage_leaf=session.leaf_dir,
+            dest_leaf=session.dest_leaf_dir,
+            z_step_um=session.z_step_um,
+        )
+        session.live = True
 
     def _handle_frame(
         self, session_id: str, header: dict[str, Any], payload: bytes | None
@@ -504,6 +543,8 @@ class StreamReceiver:
             dst = self._decon_stage_path(session, c, t)
             dst.parent.mkdir(parents=True, exist_ok=True)
             write_decon_staged_tiff(raw, dst)
+            if session.live:
+                self._live.frame_staged(session.session_id, t, session.channel_cidx[c])
         session.stage_raw_s.append(t_raw - t_start)
         session.stage_tiff_s.append(time.perf_counter() - t_raw)
         session.staged_bytes += raw.nbytes
@@ -560,6 +601,8 @@ class StreamReceiver:
             session.write_root,
         )
         _write_stage_profile(session, reason)
+        if session.live:
+            self._live.end_session(session.session_id)
         # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
         # see protocol.py's ACK docs) previously had no way to learn about
         # this session's LAST batch of frames if SESSION_END arrived before
@@ -590,7 +633,11 @@ class StreamReceiver:
                 )
                 for c, name in zip(session.channels, session.channel_names)
             ]
-            if session.decon_enabled:
+            # A live session's staged TIFFs are consumed (and deleted) by the
+            # live lane, which writes its DSR output into the GPFS
+            # decon_stage/ itself; draining them would copy a derivable
+            # intermediate and, worse, rmtree+replace that live output.
+            if session.decon_enabled and not session.live:
                 items.append(
                     (session.decon_stage_dir, session.dest_leaf_dir / "decon_stage")
                 )
