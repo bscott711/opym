@@ -30,7 +30,8 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     ip.addParameter('Background', 100, @isnumeric);
     ip.addParameter('wienerAlpha', 0.005, @isnumeric);
     ip.addParameter('OTFCumThresh', 0.9, @isnumeric);
-    
+    ip.addParameter('hannWinBounds', [0.8, 1.0], @isnumeric);
+
     % DSR params
     ip.addParameter('SkewAngle', 60.0, @isnumeric);
     ip.addParameter('interpMethod', 'cubic', @ischar);
@@ -85,6 +86,8 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
     % silently reuse a PSF resampled for a *different* angle's geometry.
     persistent cached_psf
     persistent cached_psf_key
+    persistent cached_psf_b
+    persistent cached_bp_key
 
     psf_cache_key = sprintf('%s_%.6f_%.6f', PSFfn, pr.dzPSF, dz_data_skewed);
 
@@ -103,24 +106,50 @@ function outputFn = run_gpu_pipeline(shm_path, outputFn, PSFfn, varargin)
         psf = cached_psf;
     end
 
-    % Back projector (simplification for omw)
-    % In a true pipeline we should generate this once. For now we use the raw PSF as back projector 
-    % or we can just use simplified method if OMW back projector isn't provided.
-    % To match user's RLMethod='omw', we should generate it or use simplified. 
-    % Let's use simplified for maximum speed and simplicity if no backprojector exists,
-    % or we can use omw if we generate it. Let's use 'simplified' as fallback.
-    
+    % --- OMW (OTF-masked Wiener) back projector ---
+    % For RLMethod='omw', deconvolve with a distinct Wiener-Butterworth back
+    % projector generated from the resampled, normalized forward PSF (mirrors
+    % RLdecon.m's omw path). This is what suppresses the RL noise/streak
+    % amplification that plain RL produces on an imperfect PSF. Generation
+    % depends only on (psf, wienerAlpha, OTFCumThresh, hannWinBounds), so it is
+    % cached separately from the forward PSF and only regenerated when one of
+    % those changes (e.g. across a wienerAlpha sweep). skewed=true: this
+    % pipeline deconvolves in skewed OPM space, matching XR_decon_data_wrapper's
+    % 'skewed' flag on the validated standalone path.
+    use_omw = strcmpi(pr.RLMethod, 'omw');
+    if use_omw
+        bp_cache_key = sprintf('%s_a%.8f_t%.6f_h%.4f-%.4f', psf_cache_key, ...
+            pr.wienerAlpha, pr.OTFCumThresh, pr.hannWinBounds(1), pr.hannWinBounds(2));
+        if isempty(cached_psf_b) || ~strcmp(cached_bp_key, bp_cache_key)
+            fprintf('[GPU_Pipeline] Generating OMW back projector (alpha=%.4g, OTFCumThresh=%.3g, hann=[%.2f %.2f])...\n', ...
+                pr.wienerAlpha, pr.OTFCumThresh, pr.hannWinBounds(1), pr.hannWinBounds(2));
+            cached_psf_b = omw_backprojector_generation(psf, pr.wienerAlpha, true, ...
+                'OTFCumThresh', pr.OTFCumThresh, 'hannWinBounds', pr.hannWinBounds);
+            cached_bp_key = bp_cache_key;
+        end
+        psf_b = cached_psf_b;
+    end
+
     %% 3. GPU TRANSFER & DECONVOLUTION
     fprintf('[GPU_Pipeline] Starting %s Deconvolution (%d iters) on GPU...\n', pr.RLMethod, pr.DeconIter);
-    
-    % decon_lucy_function automatically handles gpuArray transfer if useGPU=true
-    [deconvolved, err_mat, iter_run] = decon_lucy_function(...
-        rawdata, psf, pr.DeconIter, ...
-        'Background', pr.Background, ...
-        'useGPU', true, ...
-        'save16bit', pr.save16bit, ...
-        'debug', false);
-        
+
+    % Both decon functions handle gpuArray transfer internally when useGPU=true.
+    if use_omw
+        [deconvolved, err_mat] = decon_lucy_omw_function(...
+            rawdata, psf, psf_b, pr.DeconIter, ...
+            'Background', pr.Background, ...
+            'useGPU', true, ...
+            'save16bit', pr.save16bit, ...
+            'debug', false);
+    else
+        [deconvolved, err_mat, iter_run] = decon_lucy_function(...
+            rawdata, psf, pr.DeconIter, ...
+            'Background', pr.Background, ...
+            'useGPU', true, ...
+            'save16bit', pr.save16bit, ...
+            'debug', false);
+    end
+
     fprintf('[GPU_Pipeline] Deconvolution completed\n');
     clear rawdata psf; % Free up memory
     

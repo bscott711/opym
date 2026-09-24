@@ -5,6 +5,7 @@ Core utilities, definitions, and path helpers for the OPM Cropper.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +13,41 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+
+# Env var to override where redirected output lands when the raw acquisition
+# directory itself isn't writable (see `resolve_output_base`). Must match
+# whatever the opym-dashboard repo's `registry_reader.py` mirrors this as --
+# that's a schema contract, not shared code (same reasoning as `STAGES`
+# there), so keep both in sync by hand if this ever changes.
+MIRROR_ROOT_ENV = "OPYM_OUTPUT_MIRROR_ROOT"
+DEFAULT_MIRROR_ROOT = Path("/mmfs2/scratch/SDSMT.LOCAL/bscott/opym_backfill/outputs")
+
+
+def mirror_root() -> Path:
+    return Path(os.environ.get(MIRROR_ROOT_ENV, str(DEFAULT_MIRROR_ROOT)))
+
+
+def resolve_output_base(leaf_dir: Path) -> Path:
+    """Returns `leaf_dir` itself when it's writable -- the normal case, and
+    the one every already-processed dataset was written under -- else a
+    mirrored location under `mirror_root()` reproducing `leaf_dir`'s full
+    absolute path.
+
+    Some raw acquisition directories (e.g. a lab-mate's read-only-to-us
+    `jacks.local` upload) can never be written to, so writing output as a
+    sibling of the raw file there always fails with `PermissionError`.
+    Falling back only when unwritable -- rather than always mirroring --
+    keeps the documented "output lives next to the raw data" convention
+    (bioimaging/CLAUDE.md) for the common case and never relocates output
+    for a dataset that already has it written in place.
+
+    Reproducing the full path (not a hash) under the mirror root keeps the
+    result human-navigable: `<mirror_root>/mmfs1/scratch/jacks.local/.../Cell_1/`.
+    """
+    leaf_dir = Path(leaf_dir)
+    if os.access(leaf_dir, os.W_OK):
+        return leaf_dir
+    return mirror_root() / str(leaf_dir.resolve()).lstrip("/")
 
 
 class OutputFormat(str, Enum):
@@ -71,7 +107,14 @@ def sanitize_filename(name: str) -> str:
 
 
 def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
-    """Derives all associated input and output paths from the base file."""
+    """Derives all associated input and output paths from the base file.
+
+    Input paths (`metadata_file`) always stay next to the raw file -- it's
+    read-only input, always readable if `base_file` itself is. Only
+    `output_dir` goes through `resolve_output_base`, so it redirects to the
+    mirror only when `base_file.parent` (the raw acquisition dir) can't
+    actually be written to.
+    """
     base_name_no_ext = base_file.name.replace(".ome.tif", "")
     sanitized_name = sanitize_filename(base_file.name)
     metadata_file = base_file.parent / (base_name_no_ext + "_metadata.txt")
@@ -81,7 +124,7 @@ def derive_paths(base_file: Path, output_format: OutputFormat) -> DerivedPaths:
     else:
         output_dir_name = "processed_tiff_series_split"
 
-    output_dir = base_file.parent / output_dir_name
+    output_dir = resolve_output_base(base_file.parent) / output_dir_name
     output_log = output_dir / (sanitized_name + "_processing_log.json")
 
     return DerivedPaths(
@@ -128,6 +171,80 @@ def orient_zyx_for_dsr(volume: np.ndarray) -> np.ndarray:
     """
     rotated = np.rot90(volume, k=1, axes=(-2, -1))
     return np.moveaxis(rotated, 0, -1)
+
+
+def orient_zyx_for_decon_tiff(volume: np.ndarray) -> np.ndarray:
+    """
+    Reorders a (Z, Y, X) numpy crop into the (nz, ny, nx) layout a TIFF must
+    be written in so that MATLAB's `readtiff` hands PetaKit5D (ny, nx, nz).
+
+    This is `orient_zyx_for_dsr` MINUS its trailing `moveaxis(0, -1)` -- TIFF
+    paging performs that step for you. `tifffile.imwrite` of a numpy (a, b, c)
+    array writes `a` pages of `b x c`, and `readtiff` returns
+    (rows, cols, pages) == (b, c, a). So writing `orient_zyx_for_dsr`'s own
+    output would give `ny` pages and reach MATLAB as (nx, nz, ny) -- wrong.
+
+    Why this matters for deconvolution specifically: decon is a 3D
+    convolution, and PetaKit5D's decon path
+    (XR_decon_data_wrapper -> XR_RLdeconFrame3D -> RLdecon) has NO
+    axis-order parameter -- it convolves the array exactly as stored, before
+    XR_deskewRotateFrame's `inputAxisOrder` permute ever happens. Two of its
+    internals hard-code dim 3 == scan Z: `psf_gen_new` takes its background
+    from `psf(:, :, [1:5, end-4:end])` and FFT-resamples dim 3 from dz_psf to
+    dz_data, and `omw_backprojector_generation` with `skewed=true` builds the
+    skewed OTF mask as `cat(3, mask_r, mask_c, mask_l)` -- the three lobes
+    must separate along dim 3. So a zarr-mirror store presented as (z, y, x)
+    cannot be deconvolved in place, and permuting the PSF instead does not
+    rescue it: the data itself has to be materialized in this order.
+
+    The rot90 (rather than a plain transpose) is deliberate and load-bearing.
+    It matches the legacy MATLAB BigTiff cropper, and -- critically -- the
+    measured PSF carries the SAME rot90 (psf_tools/extract_bead_psf.py applies
+    `np.rot90(avg_psf, k=1, axes=(1, 2))` with `rotate_90=True` by default).
+    A plain transpose, which is what the deskew-only zarr path's
+    `inputAxisOrder='zxy'` performs, differs from this by a flip of the ny
+    (coverslip) axis -- i.e. it is a mirror image. Pinned by
+    tests/test_decon_staging_geometry.py.
+    """
+    return np.rot90(volume, k=1, axes=(-2, -1))
+
+
+def write_decon_staged_tiff(volume_zyx: np.ndarray, dst: Path) -> None:
+    """Writes one raw (Z, Y, X) volume as a decon-ready staged TIFF at `dst`,
+    in the `orient_zyx_for_decon_tiff` orientation PetaKit5D's decon path
+    requires (see that function's docstring for why).
+
+    Shared by `bioimaging.backfill.pipeline.build_decon_staging_dir` (batch
+    path: materializes a whole zarr-precropped acquisition after the fact)
+    and `opym.stream.receiver` (live path: stages each frame as it arrives)
+    so the two never drift on the write-then-rename contract below.
+
+    No-ops if `dst` already exists -- a half-written TIFF is not merely
+    incomplete, it poisons every subsequent retry, because PetaKit5D's
+    `readtiff` raises on it and a naive retry would keep handing it back;
+    skip-if-present also makes re-delivery of an already-staged frame (a
+    stream client's reconnect resend, or a batch re-run) a safe no-op.
+    """
+    import os
+
+    import tifffile
+
+    dst = Path(dst)
+    if dst.exists():
+        return
+    oriented = orient_zyx_for_decon_tiff(np.asarray(volume_zyx))
+    # Write-then-rename so a crash mid-write never leaves a half-written
+    # TIFF at the real destination name (see docstring above).
+    tmp = dst.with_name(dst.name + ".tmp")
+    # ome=True explicitly: tifffile only auto-writes OME-XML when the path it
+    # is given ends in .ome.tif, and `tmp` never does -- so a single-timepoint
+    # file named `<store>.ome.tif` used to carry a plain JSON description,
+    # which OME-aware readers (ChimeraX) reject outright. Pages are unchanged,
+    # so PetaKit5D's `readtiff` sees exactly the same pixels either way.
+    tifffile.imwrite(
+        tmp, oriented, compression="zlib", ome=True, metadata={"axes": "ZYX"}
+    )
+    os.replace(tmp, dst)
 
 
 def scan_channel_patterns(directory: Path) -> str:

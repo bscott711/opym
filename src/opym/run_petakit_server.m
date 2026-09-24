@@ -36,7 +36,12 @@ else
     end
 end
 
-base_queue_dir = '/dev/shm/petakit_jobs';
+% Overridable so a test server can run against its own queue without
+% touching production's (local_gpu_worker.py honors the same variable).
+base_queue_dir = getenv('PETAKIT_JOBS_DIR');
+if isempty(base_queue_dir)
+    base_queue_dir = '/dev/shm/petakit_jobs';
+end
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('PETAKIT_CPUS');
@@ -67,6 +72,20 @@ for si = 1:numel(staleLocks)
     delete(fullfile(gpu_lock_dir, staleLocks(si).name));
 end
 
+% Which ticket this server holds, for local_gpu_worker.py: a ticket claimed by
+% a server that then dies (crash, OOM, kill) is put back in the queue instead
+% of sitting as an orphaned .active_ claim forever. Written right after a
+% claim, removed once the ticket resolves.
+claims_dir = fullfile(base_queue_dir, 'claims');
+if ~exist(claims_dir, 'dir'), mkdir(claims_dir); end
+claimPath = fullfile(claims_dir, sprintf('S%s.json', envServerId));
+
+% One JSON line per ticket (stage timings, frame count, outcome) in
+% profiling/S<id>.jsonl -- the numbers the live lane's throughput budget is
+% measured against. Never allowed to break a job: see writeProfile.
+profiling_dir = fullfile(base_queue_dir, 'profiling');
+if ~exist(profiling_dir, 'dir'), mkdir(profiling_dir); end
+
 % --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
@@ -76,6 +95,16 @@ if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     end
 end
 addpath(fullfile(fileparts(mfilename('fullpath')), 'patches'));
+% Shadow-patched parallelReadZarr: the shared PetaKit5D build
+% (/cm/shared/apps_local/petakit5d, not writable by this account) can't
+% parse a spec-legal `"compressor": null` (uncompressed) zarr v2 array --
+% both its blosc and gzip metadata-parsing attempts throw on JSON null,
+% and it mislabels the result "Metadata is incomplete. Check the .zarray
+% file" (confirmed against zarr.cpp's compressor-parsing try/catch).
+% Prepending our patched build here (source + patch notes in
+% patches/cpp-zarr/) shadows the shared one via normal MATLAB path order,
+% without touching the shared install other users share.
+addpath(fullfile(fileparts(mfilename('fullpath')), 'patches', 'cpp-zarr', 'linux'));
 
 % --- VERIFY MEX ---
 verify_mex();
@@ -165,6 +194,16 @@ while true
     end
 
     logMsg('[Server] >>> Processing job: %s', currentFile);
+    writeClaim(claimPath, envServerId, currentFile);
+    tTicket = tic;
+    prof = struct('ticket', currentFile, 'server_id', envServerId, ...
+        'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
+        'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
+        'decon_s', NaN, 'dsr_s', NaN, 'total_s', NaN, 'status', '', 'error', '');
+    % Defined before the try: the catch block reads it, and a ticket that fails
+    % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
+    % an undefined-variable error from inside the catch and kill the server.
+    jobType = '';
 
     try
         fid = fopen(activePath);
@@ -179,6 +218,17 @@ while true
         end
 
         jobType = safelyGetParam(job, 'jobType', 'deskew');
+        prof.job_type = jobType;
+        prof.data_dir = safelyGetParam(job, 'dataDir', '');
+
+        % Echo the revision of the opym checkout that BUILT this ticket. This
+        % MATLAB process loads run_petakit_server.m exactly once at startup,
+        % so after a code change without `systemctl --user restart opym-serve`
+        % a stale server silently interprets new tickets. Printing the
+        % submitter's rev next to the server's own startup banner makes that
+        % mismatch visible in the log instead of inferred hours later.
+        logMsg('[Server] Ticket built by opym rev %s (jobType=%s)', ...
+            safelyGetParam(job, 'submitterRev', 'unknown'), jobType);
 
         switch jobType
             case 'crop'
@@ -207,7 +257,7 @@ while true
                 val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'simple'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -281,6 +331,12 @@ while true
                 % (see the performance plan's Phase 1.1). So both caches
                 % already stay warm across same-PSF jobs without needing a
                 % dedicated single-worker pool; no dispatch change was made.
+                % OMW back-projector knobs (used only when rl_method='omw';
+                % defaults reproduce PetaKit5D's stock behavior otherwise).
+                val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
+                val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
+                val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+
                 f = parfeval(pool, @run_gpu_pipeline_async, 0, activePath, done_dir, fail_dir, val_shm, outFn, psfFn, gpu_lock_dir, currentFile, ...
                     'xyPixelSize', val_xyPix, ...
                     'z_step_um', val_zStep, ...
@@ -290,6 +346,9 @@ while true
                     'interpMethod', val_interp, ...
                     'saveZarr', val_zarr, ...
                     'debug', val_debug, ...
+                    'wienerAlpha', val_wAlpha, ...
+                    'OTFCumThresh', val_otfCT, ...
+                    'hannWinBounds', val_hann, ...
                     'dzPSF', val_dzPSF);
 
             case 'pipeline_batch'
@@ -308,7 +367,7 @@ while true
                 val_zStep  = safelyGetParam(p, 'z_step_um', 0.3);
                 val_angle  = safelyGetParam(p, 'sheet_angle_deg', 60.0);
                 val_interp = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'simple'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -362,6 +421,11 @@ while true
                     end
                 end
 
+                % OMW back-projector knobs (see 'pipeline' case above).
+                val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
+                val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
+                val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+
                 f = parfeval(pool, @run_gpu_pipeline_batch_async, 0, activePath, done_dir, fail_dir, val_items, psfFn, gpu_lock_dir, currentFile, ...
                     'xyPixelSize', val_xyPix, ...
                     'z_step_um', val_zStep, ...
@@ -371,6 +435,9 @@ while true
                     'interpMethod', val_interp, ...
                     'saveZarr', val_zarr, ...
                     'debug', val_debug, ...
+                    'wienerAlpha', val_wAlpha, ...
+                    'OTFCumThresh', val_otfCT, ...
+                    'hannWinBounds', val_hann, ...
                     'dzPSF', val_dzPSF);
 
             case 'decon'
@@ -379,7 +446,9 @@ while true
                 val_resDir = safelyGetParam(p, 'result_dir_name', 'decon');
                 val_chans  = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 val_psfs   = safelyGetParam(p, 'psf_paths', {});
-                val_method = safelyGetParam(p, 'rl_method', 'simple');
+                % Default 'omw' matches petakit.py's submit_remote_decon_job;
+                % this jobType reaches RLdecon.m's switch.
+                val_method = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'omw'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -392,12 +461,54 @@ while true
 
                 if isstring(val_chans), val_chans = cellstr(val_chans); end
                 if isstring(val_psfs), val_psfs = cellstr(val_psfs); end
+                if ischar(val_psfs), val_psfs = {val_psfs}; end
+                if isempty(val_psfs)
+                    error(['decon job has no "psf_paths". XR_decon_data_wrapper ', ...
+                        'would fail indexing dc_psfFullpaths{psfMapping} several ', ...
+                        'steps later, which reads as a PSF-file problem rather ', ...
+                        'than a missing parameter.']);
+                end
 
                 % Ensure number of PSFs matches number of channels
                 if numel(val_chans) > 1 && numel(val_psfs) == 1
                     logMsg('         [Decon] Broadcasting single PSF to %d channels.', numel(val_chans));
                     val_psfs = repmat(val_psfs, 1, numel(val_chans));
                 end
+
+                val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
+                val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
+                val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+                % Only has an effect when > 1 (decon_lucy_omw_function.m),
+                % where it caps a decon value's departure from its own input
+                % -- PetaKit5D's own remedy for isolated over-sharpened
+                % voxel spikes. Default 1 matches PetaKit5D's own default
+                % (off), so a ticket that omits it is unchanged.
+                val_damp   = safelyGetParam(p, 'damp_factor', 1);
+
+                % Geometry. XR_decon_data_wrapper defaults dz=0.5 and
+                % dzPSF=0.1, and psf_gen_new FFT-decimates the PSF's dim 3 by
+                % dz/dzPSF whenever that ratio is > 1. Deconvolving data that
+                % has ALREADY been deskewed and rotated means data and PSF
+                % share one isotropic lab grid, so both must be the lab voxel
+                % size -- otherwise the PSF is silently shrunk 5x and the
+                % result looks merely disappointing rather than wrong.
+                val_xy     = safelyGetParam(p, 'xy_pixel_size', 0.108);
+                val_dz     = safelyGetParam(p, 'z_step_um', []);
+                val_dzPSF  = safelyGetParam(p, 'dz_psf', []);
+                val_bg     = safelyGetParam(p, 'background', []);
+                val_erode  = safelyGetParam(p, 'edge_erosion', 0);
+                % Required, same as the pipeline branches above: this jobType
+                % always deconvolves, so there is no case where guessing the
+                % geometry is better than refusing to run.
+                if isempty(val_dz) || isempty(val_dzPSF)
+                    error(['decon job is missing required "z_step_um" and/or "dz_psf" ', ...
+                        '(the data''s and the PSF''s z-steps, in um). psf_gen_new ', ...
+                        'decimates the PSF by z_step_um/dz_psf, so a wrong default ', ...
+                        'silently shrinks the PSF instead of failing.']);
+                end
+                logMsg(['         [Decon] method=%s iter=%d skewed=%d alpha=%g ' ...
+                        'xy=%g dz=%g dzPSF=%g erode=%d'], val_method, val_iter, ...
+                        val_skewed, val_wAlpha, val_xy, val_dz, val_dzPSF, val_erode);
 
                 XR_decon_data_wrapper( ...
                     {job.dataDir}, ...
@@ -408,6 +519,15 @@ while true
                     'GPUJob', val_gpu, ...
                     'skewed', val_skewed, ...
                     'RLMethod', val_method, ...
+                    'wienerAlpha', val_wAlpha, ...
+                    'OTFCumThresh', val_otfCT, ...
+                    'hannWinBounds', val_hann, ...
+                    'dampFactor', val_damp, ...
+                    'xyPixelSize', val_xy, ...
+                    'dz', val_dz, ...
+                    'dzPSF', val_dzPSF, ...
+                    'background', val_bg, ...
+                    'edgeErosion', val_erode, ...
                     'save16bit', val_16bit, ...
                     'parseCluster', false, ...
                     'parseParfor', true, ...
@@ -419,9 +539,19 @@ while true
                 % --- DESKEW / DECONVOLUTION / ROTATION PIPELINE ---
 
                 % 1. Extract Shared Parameters
+                % These defaults are a backstop only -- every real ticket
+                % sets all three. `z_step_um` used to default to 1.0 here
+                % while the two branches above defaulted to 0.3, so the same
+                % missing field meant different geometry depending on job
+                % type; aligned to 0.3. Geometry is logged below because a
+                % wrong-but-plausible step produces output that looks fine
+                % and is silently the wrong size.
                 val_xy        = safelyGetParam(p, 'xy_pixel_size', 0.136);
-                val_dz        = safelyGetParam(p, 'z_step_um', 1.0);
+                val_dz        = safelyGetParam(p, 'z_step_um', 0.3);
                 val_ang       = safelyGetParam(p, 'sheet_angle_deg', 60.0);
+                if ~isfield(p, 'z_step_um') || isempty(p.z_step_um)
+                    logMsg('[Server] WARNING: ticket set no z_step_um; falling back to %g um', val_dz);
+                end
                 val_chans     = safelyGetParam(p, 'channel_patterns', {job.baseName});
                 if ischar(val_chans) || isstring(val_chans)
                     val_chans = {val_chans};
@@ -434,7 +564,8 @@ while true
                 val_deskew    = safelyGetParam(p, 'deskew', true);
                 val_rotate    = safelyGetParam(p, 'rotate', true);
                 val_interp    = safelyGetParam(p, 'interp_method', 'cubic');
-                val_method    = safelyGetParam(p, 'rl_method', 'simple');
+                % Default 'omw' matches petakit.py's submit_remote_deskew_job.
+                val_method    = normalizeRLMethod(safelyGetParam(p, 'rl_method', 'omw'));
                 if strcmp(val_method, 'omw')
                     default_iter = 2;
                 else
@@ -443,6 +574,17 @@ while true
                 val_iter      = safelyGetParam(p, 'decon_iter', default_iter);
                 val_dsDir     = safelyGetParam(p, 'ds_dir_name', 'DS');
                 val_dsrDir    = safelyGetParam(p, 'dsr_dir_name', 'DSR');
+                val_saveMIP   = safelyGetParam(p, 'save_mip', false); % preserve prior default for existing callers
+                % Newer pymmcore-based acquisitions write already-cropped,
+                % per-channel data straight to zarr instead of the legacy
+                % Micro-Manager OME-TIFF format. Both
+                % XR_decon_data_wrapper and XR_deskew_rotate_data_wrapper
+                % accept a 'zarrFile' flag that changes how they discover
+                % input files by channelPatterns (.zarr instead of .tif);
+                % XR_deskewRotateFrame itself already reads either
+                % (readtiff/readzarr, dispatched on file extension).
+                % Default false preserves every existing caller's behavior.
+                val_zarrInput = safelyGetParam(p, 'zarr_input', false);
 
                 % ✅ Axis Order Parameters
                 val_inputAxis  = safelyGetParam(p, 'input_axis_order', 'yxz');
@@ -450,21 +592,74 @@ while true
 
                 % 2. Execution logic
                 current_input_dir = job.dataDir;
+                prof.n_input_tifs = numel(dir(fullfile(job.dataDir, '*.tif')));
 
                 if val_runDecon && ~isempty(val_psfPath)
                     % --- STEP A: Deconvolution (Skewed) ---
                     logMsg('         Type: Deconvolution (Skewed Mode)');
                     deconDirName = 'Decon'; % Consistent output name for pipeline
 
-                    % Ensure number of PSFs matches number of channels
-                    val_psfs = {val_psfPath};
-                    if numel(val_chans) > 1
-                        logMsg('         [Decon] Broadcasting single PSF to %d channels.', numel(val_chans));
-                        val_psfs = repmat(val_psfs, 1, numel(val_chans));
+                    % PetaKit5D indexes psfFullpaths by channel, in the same
+                    % order as channelPatterns. A ticket may supply either
+                    % `psf_paths` (per-channel, preferred) or the single
+                    % `psf_path` shorthand, which we broadcast.
+                    val_psfList = safelyGetParam(p, 'psf_paths', {});
+                    if ischar(val_psfList) || isstring(val_psfList)
+                        val_psfList = {char(val_psfList)};
+                    elseif iscell(val_psfList)
+                        val_psfList = reshape(cellfun(@char, val_psfList, ...
+                            'UniformOutput', false), 1, []);
+                    end
+                    if ~isempty(val_psfList)
+                        if numel(val_psfList) ~= numel(val_chans)
+                            error('run_petakit_server:psfChannelMismatch', ...
+                                ['psf_paths has %d entries but channel_patterns ' ...
+                                 'has %d; PetaKit5D indexes psfFullpaths by ' ...
+                                 'channel.'], numel(val_psfList), numel(val_chans));
+                        end
+                        val_psfs = val_psfList;
+                        logMsg('         [Decon] Using %d per-channel PSFs.', numel(val_psfs));
+                    else
+                        val_psfs = {val_psfPath};
+                        if numel(val_chans) > 1
+                            logMsg('         [Decon] Broadcasting single PSF to %d channels.', numel(val_chans));
+                            val_psfs = repmat(val_psfs, 1, numel(val_chans));
+                        end
+                    end
+                    for pi = 1:numel(val_psfs)
+                        if ~exist(val_psfs{pi}, 'file')
+                            error('run_petakit_server:psfNotFound', ...
+                                'PSF not found: %s', val_psfs{pi});
+                        end
                     end
 
                     val_gpuDecon = safelyGetParam(p, 'gpu_decon', false);
+                    % Camera offset subtracted before decon. Left empty,
+                    % XR_decon_data_wrapper resolves its own default of 100,
+                    % which matches this microscope's measured dark level; for
+                    % 'omw'/'simplified' it is subtracted inside the decon
+                    % kernel rather than up front.
+                    val_bg       = safelyGetParam(p, 'background', []);
+                    % RLdecon edge-tapers each z-PLANE laterally but never
+                    % along z, so a short scan rings at its z faces. Eroding
+                    % the result's boundary is PetaKit5D's own remedy.
+                    val_erode    = safelyGetParam(p, 'edge_erosion', 0);
 
+                    val_wAlpha = safelyGetParam(p, 'wiener_alpha', 0.005);
+                    val_otfCT  = safelyGetParam(p, 'otf_cum_thresh', 0.9);
+                    val_hann   = safelyGetParam(p, 'hann_win_bounds', [0.8, 1.0]);
+                    % Only has an effect when > 1 (decon_lucy_omw_function.m),
+                    % where it caps a decon value's departure from its own
+                    % input -- PetaKit5D's own remedy for isolated
+                    % over-sharpened voxel spikes. Default 1 matches
+                    % PetaKit5D's own default (off).
+                    val_damp   = safelyGetParam(p, 'damp_factor', 1);
+
+                    logMsg(['[Server] Decon: method=%s, iters=%d, wienerAlpha=%g, ' ...
+                        'OTFCumThresh=%g, dampFactor=%g, edgeErosion=%d, skewed=1, psf=%s'], val_method, val_iter, ...
+                        val_wAlpha, val_otfCT, val_damp, val_erode, val_psfs{1});
+
+                    tDecon = tic;
                     XR_decon_data_wrapper( ...
                         {current_input_dir}, ...
                         'channelPatterns', val_chans, ...
@@ -474,16 +669,24 @@ while true
                         'dz', val_dz, ...
                         'skewAngle', val_ang, ...
                         'skewed', true, ...
+                        'background', val_bg, ...
+                        'edgeErosion', val_erode, ...
                         'GPUJob', val_gpuDecon, ...
                         'RLMethod', val_method, ...
+                        'wienerAlpha', val_wAlpha, ...
+                        'OTFCumThresh', val_otfCT, ...
+                        'hannWinBounds', val_hann, ...
+                        'dampFactor', val_damp, ...
                         'save16bit', true, ...
                         'resultDirName', deconDirName, ...
+                        'zarrFile', val_zarrInput, ...
                         'parseCluster', false, ...
                         'parseParfor', true, ...
                         'masterCompute', true, ...
                         'cpusPerTask', numCPUs ...
                     );
 
+                    prof.decon_s = toc(tDecon);
                     % Update input for the next step to point to the deconvolved results
                     current_input_dir = fullfile(job.dataDir, deconDirName);
                 end
@@ -497,6 +700,34 @@ while true
                     val_zStage    = safelyGetParam(p, 'z_stage_scan', false);
                     val_reverse   = safelyGetParam(p, 'reverse', false);
 
+                    % zarr_input describes job.dataDir (the ORIGINAL raw
+                    % input), not necessarily current_input_dir. If decon
+                    % ran first (same gating condition as the decon branch
+                    % above: val_runDecon && ~isempty(val_psfPath)), this
+                    % stage reads FROM decon's own output directory instead,
+                    % which XR_decon_data_wrapper writes as TIFF by default
+                    % (its 'saveZarr' isn't threaded from our ticket, so
+                    % it's always false here) -- so only pass zarrFile
+                    % through when decon did NOT actually run and
+                    % current_input_dir is still the original raw zarr dir.
+                    val_deconRan = val_runDecon && ~isempty(val_psfPath);
+                    val_deskewZarrInput = val_zarrInput && ~val_deconRan;
+
+                    % Echo the geometry actually in force. A zarr mirror is
+                    % (z,y,x) on disk and needs inputAxisOrder 'zxy' to
+                    % reach PetaKit5D as (y,x,z) in this microscope's
+                    % convention (the tilted axis and the coverslip axis are
+                    % named the opposite way round from what PetaKit5D
+                    % means by them -- see the comment in petakit.py's
+                    % submit_remote_deskew_job); 'yxz' on a zarr input means
+                    % the scan planes are being sheared as image rows.
+                    logMsg('[Server] DSR geometry: xyPixelSize=%g um, dz=%g um, skewAngle=%g deg, inputAxisOrder=%s, zarrFile=%d', ...
+                        val_xy, val_dz, val_ang, val_inputAxis, val_deskewZarrInput);
+                    if val_deskewZarrInput && strcmpi(val_inputAxis, 'yxz')
+                        logMsg('[Server] WARNING: zarr input with inputAxisOrder=yxz -- DSR output will be the wrong size.');
+                    end
+
+                    tDsr = tic;
                     XR_deskew_rotate_data_wrapper( ...
                         {current_input_dir}, ...
                         'DSDirName', val_dsDir, ...
@@ -516,14 +747,17 @@ while true
                         'DSRCombined', true, ...
                         'save16bit', true, ...
                         'save3DStack', true, ...
-                        'saveMIP', false, ...
+                        'saveMIP', val_saveMIP, ...
+                        'zarrFile', val_deskewZarrInput, ...
                         'parseCluster', false, ...
                         'parseParfor', false, ...
                         'masterCompute', true, ...
                         'cpusPerTask', numCPUs ...
                     );
+                    prof.dsr_s = toc(tDsr);
                 end
         end % End switch jobType
+        prof.status = 'done';
 
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(done_dir, currentFile));
@@ -542,6 +776,8 @@ while true
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
+        prof.status = 'failed';
+        prof.error = ME.message;
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(fail_dir, currentFile));
             errLog = fullfile(fail_dir, [currentFile '.log']);
@@ -558,6 +794,36 @@ while true
             end
         end
     end
+    clearClaim(claimPath);
+    prof.total_s = toc(tTicket);
+    writeProfile(profiling_dir, envServerId, prof);
+end
+
+function writeClaim(claimPath, serverId, ticketName)
+    % See claims_dir above. Written via a temp file so the supervisor never
+    % reads a half-written record.
+    rec = struct('server_id', serverId, 'ticket', ticketName, 'pid', feature('getpid'));
+    tmpPath = [claimPath '.tmp'];
+    fid = fopen(tmpPath, 'w');
+    fprintf(fid, '%s', jsonencode(rec));
+    fclose(fid);
+    movefile(tmpPath, claimPath, 'f');
+end
+
+function writeProfile(profiling_dir, serverId, prof)
+    % Best effort: a profiling write must never fail a ticket or the server.
+    try
+        fid = fopen(fullfile(profiling_dir, sprintf('S%s.jsonl', serverId)), 'a');
+        fprintf(fid, '%s\n', jsonencode(prof));
+        fclose(fid);
+    catch
+    end
+end
+
+function clearClaim(claimPath)
+    if exist(claimPath, 'file')
+        delete(claimPath);
+    end
 end
 
 function val = safelyGetParam(structure, fieldName, defaultValue)
@@ -568,6 +834,31 @@ function val = safelyGetParam(structure, fieldName, defaultValue)
         end
     else
         val = defaultValue;
+    end
+end
+
+% --- HELPER: Map an RL method name onto one PetaKit5D actually implements ---
+% PetaKit5D's RLdecon.m dispatches RLMethod through two `switch` statements
+% that have NO `otherwise` branch, over {original, simplified, omw, cudagen}.
+% `deconvolved` is initialized to [] at the top of that function, so an
+% unrecognized name means nothing ever assigns it and an EMPTY volume is
+% written -- silently, after background subtraction has already run.
+%
+% Our historical default, 'simple', is exactly such a name. It never bit
+% because the pipeline/pipeline_batch jobTypes go through run_gpu_pipeline.m,
+% which dispatches on strcmpi(RLMethod,'omw') itself and never reaches that
+% switch. The 'decon' and 'deskew'-with-decon jobTypes DO reach it.
+function method = normalizeRLMethod(method)
+    valid = {'original', 'simplified', 'omw', 'cudagen'};
+    method = lower(char(method));
+    if strcmp(method, 'simple')
+        method = 'simplified';
+    end
+    if ~ismember(method, valid)
+        error('run_petakit_server:badRLMethod', ...
+            ['Unknown rl_method ''%s''. PetaKit5D recognizes {original, ' ...
+             'simplified, omw, cudagen} and silently writes an EMPTY volume ' ...
+             'for anything else.'], method);
     end
 end
 

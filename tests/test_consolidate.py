@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 import zarr
 
 from opym.consolidate import consolidate_to_ome_zarr
@@ -52,3 +53,37 @@ def test_consolidate_reorders_axes_with_zero_data_copy(tmp_path):
     for (t, c), vol in volumes.items():
         expected = np.transpose(vol, (2, 1, 0))  # (X,Y,Z) -> (Z,Y,X)
         np.testing.assert_array_equal(consolidated[t, c], expected)
+
+
+def test_consolidate_rejects_mismatched_channel_shapes(tmp_path):
+    # Every acquisition is expected to produce same-sized per-channel
+    # volumes (fixed at capture time) -- if that's ever violated (upstream
+    # bug, misconfigured ROI, etc.), the hardlink-no-copy trick this
+    # function relies on would otherwise silently declare one shape for
+    # the whole unified array while linking in chunk data whose actual
+    # size doesn't match, corrupting the array for any later reader. This
+    # must fail loudly here instead.
+    base_name = "sample"
+
+    vol_c0 = np.zeros((7, 5, 3), dtype=np.uint16)
+    zarr.save_array(
+        str(tmp_path / f"{base_name}_T0000_C0.zarr"), vol_c0, chunks=vol_c0.shape
+    )
+
+    vol_c1 = np.zeros((9, 11, 3), dtype=np.uint16)  # different Y/X than C0
+    zarr.save_array(
+        str(tmp_path / f"{base_name}_T0000_C1.zarr"), vol_c1, chunks=vol_c1.shape
+    )
+
+    with pytest.raises(ValueError, match="Shape/dtype mismatch"):
+        consolidate_to_ome_zarr(
+            decon_dir=tmp_path,
+            base_name=base_name,
+            z_step_um=0.3,
+            xy_pixel_um=0.116,
+            t_interval_s=1.0,
+            channel_names=["C0", "C1"],
+        )
+
+    # Refuses to write anything, rather than a partially-correct store.
+    assert not (tmp_path / f"{base_name}.ome.zarr").exists()
