@@ -632,3 +632,33 @@ def test_decon_stage_cidx_matches_sorted_store_order_not_channel_index(
         tifffile.imread(decon_dir / "sample_C0_T000.tif"),
         orient_zyx_for_decon_tiff(vol_c1),
     )
+
+
+def test_session_end_appends_staging_profile(tmp_path, receiver, client, monkeypatch):
+    """Per-session raw/TIFF write timings land in <jobs dir>/profiling so the
+    ingest side of the keep-pace budget is measured, not guessed."""
+    import json
+
+    monkeypatch.setenv("OPYM_DECON_PSF", "/fake/psf.tif")
+    monkeypatch.setenv("PETAKIT_JOBS_DIR", str(tmp_path / "jobs"))
+    session_id = "sess-prof"
+    sock = client(session_id)
+    _start_session(
+        sock, session_id, receiver,
+        _session_header(tmp_path / "raw", num_timepoints=2, channels=(0,)),
+    )
+    for t in range(2):
+        header, vol = _frame(t=t, c=0, frame_index=t)
+        sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
+        _drive(receiver)
+        _recv_ack(sock)
+    sock.send_multipart(pack_message(MSG_SESSION_END, session_id, {"reason": "complete"}))
+    _drive(receiver)
+
+    lines = (tmp_path / "jobs" / "profiling" / "receiver.jsonl").read_text().splitlines()
+    record = json.loads(lines[-1])
+    assert record["session_id"] == session_id
+    assert record["frames"] == 2
+    assert record["decon_staging"] is True
+    assert record["raw_write_s"]["p95"] >= 0
+    assert record["tiff_write_s"]["max"] >= record["tiff_write_s"]["p50"] >= 0

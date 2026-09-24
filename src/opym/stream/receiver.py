@@ -44,6 +44,7 @@ no drain, no behavior change at all.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -74,6 +75,12 @@ ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
 POLL_TIMEOUT_MS = 500
+
+# Per-session staging timings are appended here as JSON lines (see
+# `_write_stage_profile`), beside run_petakit_server.m's per-ticket
+# profiling/S<id>.jsonl; PETAKIT_JOBS_DIR is the same override both honor.
+_JOBS_DIR_ENV_VAR = "PETAKIT_JOBS_DIR"
+_DEFAULT_JOBS_DIR = "/dev/shm/petakit_jobs"
 
 # Same environment variable bioimaging.backfill.pipeline.resolve_decon_psf
 # reads to decide whether the batch pass decons at all. Read directly
@@ -171,6 +178,13 @@ class SessionState:
     last_ack_time: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
     ended: bool = False
+    # Seconds spent writing each frame's raw store / staged decon TIFF, on
+    # this poll loop -- ingest keeps pace only while their sum per timepoint
+    # stays under the acquisition interval.
+    stage_raw_s: list[float] = field(default_factory=list)
+    stage_tiff_s: list[float] = field(default_factory=list)
+    staged_bytes: int = 0
+    started_at: float = field(default_factory=time.time)
 
     @property
     def leaf_dir(self) -> Path:
@@ -450,6 +464,7 @@ class StreamReceiver:
         dtype = header.get("dtype") or session.dtype
 
         raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
+        t_start = time.perf_counter()
 
         arr = session.channel_arrays.get(c)
         if arr is None:
@@ -467,11 +482,15 @@ class StreamReceiver:
             )
             session.channel_arrays[c] = arr
         rawmirror.write_timepoint(arr, t, raw)
+        t_raw = time.perf_counter()
 
         if session.decon_enabled:
             dst = self._decon_stage_path(session, c, t)
             dst.parent.mkdir(parents=True, exist_ok=True)
             write_decon_staged_tiff(raw, dst)
+        session.stage_raw_s.append(t_raw - t_start)
+        session.stage_tiff_s.append(time.perf_counter() - t_raw)
+        session.staged_bytes += raw.nbytes
 
         logger.debug(
             "Staged T=%d C=%d for session %s -> %s",
@@ -524,6 +543,7 @@ class StreamReceiver:
             session.base_name,
             session.write_root,
         )
+        _write_stage_profile(session, reason)
         # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
         # see protocol.py's ACK docs) previously had no way to learn about
         # this session's LAST batch of frames if SESSION_END arrived before
@@ -620,6 +640,51 @@ class StreamReceiver:
         for session in list(self.sessions.values()):
             if now - session.last_activity >= self.idle_timeout_sec:
                 self._finalize_session(session, reason="idle_timeout")
+
+
+def _stage_stats(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"p50": None, "p95": None, "max": None}
+    arr = np.asarray(values)
+    return {
+        "p50": round(float(np.percentile(arr, 50)), 4),
+        "p95": round(float(np.percentile(arr, 95)), 4),
+        "max": round(float(arr.max()), 4),
+    }
+
+
+def _write_stage_profile(session: SessionState, reason: str) -> None:
+    """Log and append one JSON line of this session's staging timings to
+    `<jobs dir>/profiling/receiver.jsonl`. Best effort: never raises."""
+    try:
+        record = {
+            "session_id": session.session_id,
+            "base_name": session.base_name,
+            "reason": reason,
+            "started_at": session.started_at,
+            "ended_at": time.time(),
+            "frames": len(session.stage_raw_s),
+            "staged_gb": round(session.staged_bytes / 1e9, 3),
+            "decon_staging": session.decon_enabled,
+            "raw_write_s": _stage_stats(session.stage_raw_s),
+            "tiff_write_s": _stage_stats(session.stage_tiff_s),
+        }
+        logger.info(
+            "Session %s staging: %d frame(s), %.2f GB, raw write p95 %s s, "
+            "decon TIFF write p95 %s s",
+            session.session_id,
+            record["frames"],
+            record["staged_gb"],
+            record["raw_write_s"]["p95"],
+            record["tiff_write_s"]["p95"],
+        )
+        jobs_dir = Path(os.environ.get(_JOBS_DIR_ENV_VAR) or _DEFAULT_JOBS_DIR)
+        prof_dir = jobs_dir / "profiling"
+        prof_dir.mkdir(parents=True, exist_ok=True)
+        with open(prof_dir / "receiver.jsonl", "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:  # noqa: BLE001 - profiling must never break ingest
+        logger.debug("Could not write staging profile", exc_info=True)
 
 
 def main() -> None:
