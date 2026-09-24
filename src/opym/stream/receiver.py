@@ -58,7 +58,7 @@ import zmq
 
 from opym import lanes
 from opym.decon_config import resolve_decon_psf
-from opym.stream import drain, rawmirror
+from opym.stream import drain, live, rawmirror
 from opym.stream.live import LiveLane
 from opym.stream.protocol import (
     MSG_ACK,
@@ -540,6 +540,13 @@ class StreamReceiver:
             stage_leaf=session.leaf_dir,
             dest_leaf=session.dest_leaf_dir,
             z_step_um=session.z_step_um,
+            channel_labels=[
+                live.channel_label(name)
+                for _, name in sorted(
+                    zip(session.channels, session.channel_names),
+                    key=lambda cn: session.channel_cidx[cn[0]],
+                )
+            ],
         )
         session.live = True
 

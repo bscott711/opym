@@ -9,7 +9,9 @@ import json
 import os
 import time
 
+import numpy as np
 import pytest
+import tifffile
 
 from opym import lanes
 from opym.stream import live as live_mod
@@ -59,6 +61,15 @@ def _tickets(jobs):
     return out
 
 
+DSR_SHAPE = (6, 8, 10)
+
+
+def _dsr_volume(stem):
+    """A small deterministic DSR volume per frame name."""
+    seed = sum(map(ord, stem))
+    return np.random.default_rng(seed).integers(0, 4000, DSR_SHAPE, dtype=np.uint16)
+
+
 def _complete(jobs, s, ticket_path, psf_dir="DSR_decon"):
     """What the MATLAB server + run_live_frames.m leave behind."""
     ticket = json.loads(ticket_path.read_text())
@@ -66,8 +77,8 @@ def _complete(jobs, s, ticket_path, psf_dir="DSR_decon"):
     (dsr / "MIPs").mkdir(parents=True, exist_ok=True)
     for f in ticket["parameters"]["frames"]:
         stem = os.path.basename(f)[:-4]
-        (dsr / f"{stem}.tif").write_bytes(b"dsr " + stem.encode())
-        (dsr / "MIPs" / f"{stem}_MIP_z.tif").write_bytes(b"mip")
+        tifffile.imwrite(dsr / f"{stem}.tif", _dsr_volume(stem))
+        tifffile.imwrite(dsr / "MIPs" / f"{stem}_MIP_z.tif", _dsr_volume(stem).max(0))
     os.replace(ticket_path, jobs / "completed" / ticket_path.name)
 
 
@@ -140,7 +151,9 @@ def test_completed_ticket_is_copied_to_gpfs_and_freed_from_ram(tmp_path, psf):
     for t in (0, 1):
         for c in range(2):
             name = f"Cell_002_C{c}_T{t:03d}"
-            assert (s.dsr_dir / f"{name}.tif").read_bytes() == b"dsr " + name.encode()
+            assert np.array_equal(
+                tifffile.imread(s.dsr_dir / f"{name}.tif"), _dsr_volume(name)
+            )
             assert (s.dsr_dir / "MIPs" / f"{name}_MIP_z.tif").exists()
             assert not (s.decon_dir / "DSR_decon" / f"{name}.tif").exists()
     # Staged input is freed, except the erosion-mask source (first C0 frame).
@@ -269,3 +282,58 @@ def test_receiver_hands_time_lapse_sessions_to_the_live_lane(
         sock.close(linger=0)
     finally:
         recv.close()
+
+
+def test_viewer_store_grows_as_timepoints_finish(tmp_path, psf):
+    """napari's store: the backfill export's path and layout, every finished
+    (t, c) written at full resolution, progress recorded as it goes."""
+    import zarr
+
+    from opym.ome_zarr_writer import complete_timepoints, read_progress
+
+    lane, jobs = _lane(tmp_path, psf)
+    s = lane.start_session(
+        "sess",
+        base_name="Cell_002",
+        num_timepoints=3,
+        n_channels=2,
+        frames_dir=(tmp_path / "stage" / "Cell_002" / "decon_stage"),
+        stage_leaf=tmp_path / "stage" / "Cell_002",
+        dest_leaf=tmp_path / "gpfs" / "session_dir" / "Cell_002",
+        z_step_um=0.5,
+        channel_labels=["GFP 488", "mScarlet 561"],
+    )
+    s.frames_dir.mkdir(parents=True)
+    assert s.zarr_path == (
+        tmp_path
+        / "gpfs"
+        / "session_dir"
+        / "Cell_002"
+        / "viewer"
+        / "Cell_002_dsr.ome.zarr"
+    )
+    latest = json.loads((jobs / "live_latest.json").read_text())
+    assert latest["store"] == str(s.zarr_path)
+
+    for c in range(2):
+        _stage(lane, s, 0, c)
+    lane.pump()
+    [(path, _)] = _tickets(jobs)
+    _complete(jobs, s, path)
+    assert _pump_until(lane, lambda: s.done == {0})
+
+    root = zarr.open_group(str(s.zarr_path), mode="r")
+    assert root["0"].shape == (3, 2) + DSR_SHAPE
+    for c in range(2):
+        assert np.array_equal(root["0"][0, c], _dsr_volume(f"Cell_002_C{c}_T000"))
+    assert not root["0"][1].any()  # not yet written: zeros
+    assert [ch["label"] for ch in root.attrs["omero"]["channels"]] == [
+        "GFP 488",
+        "mScarlet 561",
+    ]
+    progress = read_progress(s.zarr_path)
+    assert progress["state"] == "running" and complete_timepoints(progress) == [0]
+
+    lane.end_session("sess")
+    assert _pump_until(lane, lambda: "sess" not in lane.sessions)
+    assert read_progress(s.zarr_path)["state"] == "complete"
