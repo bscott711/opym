@@ -84,11 +84,7 @@ for k = 1:numel(psfs)
     end
     tmpFn = sprintf('%s/%s_%s.tif', psfgenDir, psfFsn, get_uuid());
     writetiff(psf, tmpFn);
-    if ~exist(psfgenFn, 'file')
-        movefile(tmpFn, psfgenFn);
-    else
-        delete(tmpFn);   % another server of this session got there first
-    end
+    publishOnce(tmpFn, psfgenFn, false);
 end
 
 % --- once per session: the first-time-point erosion mask (erodeByFTP) ---
@@ -103,11 +99,7 @@ if erode > 0
         im_bw_erode = decon_mask_edge_erosion(readtiff(src) > 0, erode);
         tmpMask = sprintf('%s/%s_eroded_%s.zarr', maskDir, srcFsn, get_uuid());
         writezarr(uint8(im_bw_erode), tmpMask, 'blockSize', [256, 256, 256]);
-        if ~exist(maskFn, 'dir')
-            movefile(tmpMask, maskFn);
-        else
-            rmdir(tmpMask, 's');
-        end
+        publishOnce(tmpMask, maskFn, true);
     end
 end
 
@@ -153,6 +145,40 @@ for f = 1:nF
     if ~keepDecon
         delete(deconFrame);
     end
+end
+end
+
+function publishOnce(tmpPath, finalPath, isDir)
+% Rename a freshly built per-session artifact (generated PSF, erosion mask)
+% into place. Both GPU servers can build the same one at once, on a
+% session's first tickets. Whoever renames second finds it already there,
+% which is success: identical content. Before this, a check-then-rename
+% left a window where the second rename failed with "already exists" and
+% failed its live ticket (2026-09-24, Cell_006).
+if isDir
+    present = @() exist(finalPath, 'dir') == 7;
+else
+    present = @() exist(finalPath, 'file') == 2;
+end
+if present()
+    discard(tmpPath, isDir);
+    return;
+end
+try
+    movefile(tmpPath, finalPath);
+catch ME
+    if ~present()
+        rethrow(ME);
+    end
+    discard(tmpPath, isDir);
+end
+end
+
+function discard(path, isDir)
+if isDir
+    if exist(path, 'dir'), rmdir(path, 's'); end
+elseif exist(path, 'file')
+    delete(path);
 end
 end
 

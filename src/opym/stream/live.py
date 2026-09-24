@@ -122,7 +122,7 @@ class LiveSession:
     num_timepoints: int
     n_channels: int
     frames_dir: Path  # the receiver's decon_stage/ (RAM disk when staging)
-    work_dir: Path  # <stage leaf>/live
+    work_dir: Path  # <stage leaf>/live/<session_id>, this session's own
     dsr_dir: Path  # final DSR dir on GPFS
     z_step_um: float
     zarr_path: Path  # napari store on GPFS
@@ -139,6 +139,13 @@ class LiveSession:
     last_status_write: float = 0.0
     zarr_lock: threading.Lock = field(default_factory=threading.Lock)
     zarr_created: bool = False
+    superseded: bool = False
+    inherited: set[tuple[int, int]] = field(default_factory=set)
+    """(t, cidx) frames staged by sessions this one superseded; deleted at
+    this session's finalize, since nobody else will."""
+    """A newer session for the same dataset started (a re-run acquisition
+    with the same name). It then owns the output and the staged frame names;
+    this one only waits out its in-flight tickets and discards them."""
 
     @property
     def decon_dir(self) -> Path:
@@ -149,6 +156,8 @@ class LiveSession:
 
     def settled(self) -> bool:
         """Every fully staged timepoint is done or failed, nothing in flight."""
+        if self.superseded:
+            return not self.tickets and not self.copying
         full = {t for t, cs in self.staged.items() if len(cs) == self.n_channels}
         return (
             self.ended
@@ -219,12 +228,18 @@ class LiveLane:
             num_timepoints=num_timepoints,
             n_channels=n_channels,
             frames_dir=Path(frames_dir),
-            work_dir=Path(stage_leaf) / "live",
+            work_dir=Path(stage_leaf) / "live" / session_id,
             dsr_dir=live_dsr_dir(Path(dest_leaf), self.psf),
             z_step_um=z_step_um,
             zarr_path=live_viewer_store(Path(dest_leaf)),
             channel_labels=list(channel_labels or [f"C{c}" for c in range(n_channels)]),
         )
+        for other in self.sessions.values():
+            if other.dsr_dir == session.dsr_dir and not other.superseded:
+                self._supersede(other, by=session_id)
+                session.inherited |= other.inherited | {
+                    (t, c) for t, cs in other.staged.items() for c in cs
+                }
         session.dsr_dir.mkdir(parents=True, exist_ok=True)
         (session.dsr_dir / "MIPs").mkdir(exist_ok=True)
         self.sessions[session_id] = session
@@ -245,6 +260,22 @@ class LiveLane:
         cs.add(cidx)
         if len(cs) == session.n_channels:
             session.ready.append(t)
+
+    def _supersede(self, session: LiveSession, *, by: str) -> None:
+        """Same dataset re-acquired under the same name: the newer session
+        writes the output from now on. On 2026-09-24 an empty re-run of
+        Cell_004 finalized first and deleted the shared staged frames under
+        the earlier run's queued tickets."""
+        session.superseded = True
+        session.ended = True
+        session.ready.clear()
+        logger.warning(
+            "Live lane: session %s (%s) superseded by %s; discarding its "
+            "remaining live work",
+            session.session_id,
+            session.base_name,
+            by,
+        )
 
     def end_session(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
@@ -268,6 +299,8 @@ class LiveLane:
         return sum(len(s.tickets) for s in self.sessions.values())
 
     def _dispatch(self, session: LiveSession) -> None:
+        if session.superseded:
+            return
         free = self.max_outstanding - self._in_flight()
         if free <= 0 or not session.ready:
             return
@@ -305,10 +338,14 @@ class LiveLane:
         for name, ticket in list(session.tickets.items()):
             if (self.jobs / "completed" / name).exists():
                 del session.tickets[name]
+                if session.superseded:
+                    continue
                 for t in ticket.timepoints:
                     session.copying[t] = self._pool.submit(self._copy_out, session, t)
             elif (self.jobs / "failed" / name).exists():
                 del session.tickets[name]
+                if session.superseded:
+                    continue
                 if ticket.attempt < MAX_ATTEMPTS:
                     logger.warning(
                         "Live ticket %s failed; retrying timepoints %s",
@@ -364,7 +401,7 @@ class LiveLane:
         ome_zarr_writer.write_timepoint(session.zarr_path, t, c, vol)
 
     def _write_viewer_progress(self, session: LiveSession, state: str) -> None:
-        if not session.zarr_created:
+        if not session.zarr_created or session.superseded:
             return
         done = [[t, c] for t in sorted(session.done) for c in range(session.n_channels)]
         try:
@@ -422,6 +459,12 @@ class LiveLane:
             self._write_viewer_progress(session, "running")
 
     def _finalize(self, session: LiveSession) -> None:
+        if session.superseded:
+            # The frame names and output belong to the newer session now.
+            shutil.rmtree(session.work_dir, ignore_errors=True)
+            del self.sessions[session.session_id]
+            logger.info("Live lane: superseded session %s closed", session.session_id)
+            return
         full = sorted(
             t for t, cs in session.staged.items() if len(cs) == session.n_channels
         )
@@ -432,11 +475,19 @@ class LiveLane:
         # ever evict leftovers (e.g. a failed timepoint's). A batch fallback
         # rebuilds them from the raw stores on GPFS.
         shutil.rmtree(session.work_dir, ignore_errors=True)
-        shutil.rmtree(session.frames_dir, ignore_errors=True)
-        try:
-            session.work_dir.parent.rmdir()  # the stage leaf, if now empty
-        except OSError:
-            pass
+        own = {(t, c) for t, cs in session.staged.items() for c in cs}
+        for t, c in own | session.inherited:
+            session.frame(t, c).unlink(missing_ok=True)
+        # Only if now empty: another session may be using the same leaf.
+        for d in (
+            session.frames_dir,
+            session.work_dir.parent,
+            session.work_dir.parent.parent,
+        ):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
         del self.sessions[session.session_id]
         logger.info(
             "Live lane: session %s %s, %d/%d timepoint(s) processed live",
@@ -447,6 +498,8 @@ class LiveLane:
         )
 
     def _write_status(self, session: LiveSession, state: str) -> None:
+        if session.superseded:
+            return
         now = self._clock()
         status = {
             "state": state,
