@@ -80,6 +80,12 @@ claims_dir = fullfile(base_queue_dir, 'claims');
 if ~exist(claims_dir, 'dir'), mkdir(claims_dir); end
 claimPath = fullfile(claims_dir, sprintf('S%s.json', envServerId));
 
+% One JSON line per ticket (stage timings, frame count, outcome) in
+% profiling/S<id>.jsonl -- the numbers the live lane's throughput budget is
+% measured against. Never allowed to break a job: see writeProfile.
+profiling_dir = fullfile(base_queue_dir, 'profiling');
+if ~exist(profiling_dir, 'dir'), mkdir(profiling_dir); end
+
 % --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
     if exist(fullfile(petakit_source_path, 'setup.m'), 'file')
@@ -189,6 +195,11 @@ while true
 
     logMsg('[Server] >>> Processing job: %s', currentFile);
     writeClaim(claimPath, envServerId, currentFile);
+    tTicket = tic;
+    prof = struct('ticket', currentFile, 'server_id', envServerId, ...
+        'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
+        'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
+        'decon_s', NaN, 'dsr_s', NaN, 'total_s', NaN, 'status', '', 'error', '');
     % Defined before the try: the catch block reads it, and a ticket that fails
     % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
     % an undefined-variable error from inside the catch and kill the server.
@@ -207,6 +218,8 @@ while true
         end
 
         jobType = safelyGetParam(job, 'jobType', 'deskew');
+        prof.job_type = jobType;
+        prof.data_dir = safelyGetParam(job, 'dataDir', '');
 
         % Echo the revision of the opym checkout that BUILT this ticket. This
         % MATLAB process loads run_petakit_server.m exactly once at startup,
@@ -579,6 +592,7 @@ while true
 
                 % 2. Execution logic
                 current_input_dir = job.dataDir;
+                prof.n_input_tifs = numel(dir(fullfile(job.dataDir, '*.tif')));
 
                 if val_runDecon && ~isempty(val_psfPath)
                     % --- STEP A: Deconvolution (Skewed) ---
@@ -645,6 +659,7 @@ while true
                         'OTFCumThresh=%g, dampFactor=%g, edgeErosion=%d, skewed=1, psf=%s'], val_method, val_iter, ...
                         val_wAlpha, val_otfCT, val_damp, val_erode, val_psfs{1});
 
+                    tDecon = tic;
                     XR_decon_data_wrapper( ...
                         {current_input_dir}, ...
                         'channelPatterns', val_chans, ...
@@ -671,6 +686,7 @@ while true
                         'cpusPerTask', numCPUs ...
                     );
 
+                    prof.decon_s = toc(tDecon);
                     % Update input for the next step to point to the deconvolved results
                     current_input_dir = fullfile(job.dataDir, deconDirName);
                 end
@@ -711,6 +727,7 @@ while true
                         logMsg('[Server] WARNING: zarr input with inputAxisOrder=yxz -- DSR output will be the wrong size.');
                     end
 
+                    tDsr = tic;
                     XR_deskew_rotate_data_wrapper( ...
                         {current_input_dir}, ...
                         'DSDirName', val_dsDir, ...
@@ -737,8 +754,10 @@ while true
                         'masterCompute', true, ...
                         'cpusPerTask', numCPUs ...
                     );
+                    prof.dsr_s = toc(tDsr);
                 end
         end % End switch jobType
+        prof.status = 'done';
 
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(done_dir, currentFile));
@@ -757,6 +776,8 @@ while true
 
     catch ME
         logMsg('[Server] !!! ERROR on %s: %s', currentFile, ME.message);
+        prof.status = 'failed';
+        prof.error = ME.message;
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(fail_dir, currentFile));
             errLog = fullfile(fail_dir, [currentFile '.log']);
@@ -774,6 +795,8 @@ while true
         end
     end
     clearClaim(claimPath);
+    prof.total_s = toc(tTicket);
+    writeProfile(profiling_dir, envServerId, prof);
 end
 
 function writeClaim(claimPath, serverId, ticketName)
@@ -785,6 +808,16 @@ function writeClaim(claimPath, serverId, ticketName)
     fprintf(fid, '%s', jsonencode(rec));
     fclose(fid);
     movefile(tmpPath, claimPath, 'f');
+end
+
+function writeProfile(profiling_dir, serverId, prof)
+    % Best effort: a profiling write must never fail a ticket or the server.
+    try
+        fid = fopen(fullfile(profiling_dir, sprintf('S%s.jsonl', serverId)), 'a');
+        fprintf(fid, '%s\n', jsonencode(prof));
+        fclose(fid);
+    catch
+    end
 end
 
 function clearClaim(claimPath)
