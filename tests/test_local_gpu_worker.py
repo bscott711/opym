@@ -93,12 +93,15 @@ def _ticket(queue_dir, name, data_dir="/nonexistent", **extra):
     return path
 
 
-def _claim(sup, server_id, ticket_name):
-    """What run_petakit_server.m does on a claim: rename to .active_ and
-    record it in claims/S<id>.json."""
-    os.replace(sup.queue_dir / ticket_name, sup.queue_dir / f".active_{ticket_name}")
+def _claim(sup, server_id, ticket_name, lane="queue"):
+    """What run_petakit_server.m does on a claim: rename to .active_ in its
+    lane and record it in claims/S<id>.json."""
+    lane_dir = sup.base_dir / lane
+    os.replace(lane_dir / ticket_name, lane_dir / f".active_{ticket_name}")
     (sup.claims_dir / f"S{server_id}.json").write_text(
-        json.dumps({"server_id": server_id, "ticket": ticket_name, "pid": 1})
+        json.dumps(
+            {"server_id": server_id, "ticket": ticket_name, "queue": lane, "pid": 1}
+        )
     )
 
 
@@ -299,3 +302,133 @@ def test_consolidation_runs_once_after_servers_spin_down_cleanly(tmp_path, monke
     sup.tick()
     sup.tick()
     assert len(calls) == 1
+
+
+# --- priority lanes -------------------------------------------------------
+
+
+def test_live_claim_of_a_dead_server_is_requeued_into_the_live_lane(tmp_path):
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.live_queue_dir, "LIVE_t000.json")
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "LIVE_t000.json", lane="queue_live")
+    procs["1"].exit(137)
+    sup.tick()
+    assert (sup.live_queue_dir / "LIVE_t000.json").exists()
+    assert not (sup.queue_dir / "LIVE_t000.json").exists()
+
+
+def test_claim_record_without_a_queue_field_is_the_backfill_lane(tmp_path):
+    """Records written by servers from before lanes existed."""
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "old.json")
+    sup.tick()
+    os.replace(sup.queue_dir / "old.json", sup.queue_dir / ".active_old.json")
+    (sup.claims_dir / "S2.json").write_text(json.dumps({"ticket": "old.json"}))
+    dict(launched)["2"].exit(1)
+    sup.tick()
+    assert (sup.queue_dir / "old.json").exists()
+
+
+def test_live_lease_starts_servers_before_any_ticket(tmp_path):
+    lease = {"active": False}
+    sup, launched, _ = _make_supervisor(tmp_path, lease_active=lambda: lease["active"])
+    sup.tick()
+    assert launched == []
+    lease["active"] = True
+    sup.tick()
+    assert sorted(sid for sid, _ in launched) == ["1", "2"]
+
+
+def _busy_with_backfill_and_live_waiting(tmp_path, waited_s, **kwargs):
+    sup, launched, clock = _make_supervisor(tmp_path, preempt_after_s=30, **kwargs)
+    _ticket(sup.queue_dir, "bf_a.json")
+    _ticket(sup.queue_dir, "bf_b.json")
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "bf_a.json")
+    _claim(sup, "2", "bf_b.json")
+    live = _ticket(sup.live_queue_dir, "LIVE_t000.json")
+    os.utime(live, (clock.t - waited_s, clock.t - waited_s))
+    killed = []
+
+    def fake_kill(slot):
+        killed.append(slot.server_id)
+        procs[slot.server_id].exit(-15)
+
+    sup._kill = fake_kill
+    return sup, launched, clock, procs, killed
+
+
+def test_no_preemption_before_a_live_ticket_has_waited_long_enough(tmp_path):
+    sup, _, _, _, killed = _busy_with_backfill_and_live_waiting(tmp_path, waited_s=10)
+    sup.tick()
+    assert killed == []
+
+
+def test_waiting_live_ticket_preempts_one_backfill_server(tmp_path):
+    sup, launched, clock, procs, killed = _busy_with_backfill_and_live_waiting(
+        tmp_path, waited_s=31
+    )
+    sup.tick()
+    assert killed == ["1"]  # one server only
+
+    sup.tick()  # reap: requeued without counting, relaunched with no backoff
+    requeued = json.loads((sup.queue_dir / "bf_a.json").read_text())
+    assert "requeueCount" not in requeued
+    assert requeued["requeueHistory"][-1]["counted"] is False
+    assert sup.slots[0].consecutive_failures == 0
+    assert [sid for sid, _ in launched] == ["1", "2", "1"]
+
+    # Server 1 is relaunching (no claim yet) and will take the waiting live
+    # ticket, so server 2 keeps its backfill work even after the cooldown.
+    clock.t += 40
+    sup.tick()
+    assert killed == ["1"]
+
+    # Live tickets pile up beyond what the starting server can take: escalate
+    # to the second GPU, but not within the cooldown of the last preemption.
+    for t in (1, 2):
+        extra = _ticket(sup.live_queue_dir, f"LIVE_t00{t}.json")
+        os.utime(extra, (clock.t - 60, clock.t - 60))
+    sup._last_preempt = clock.t - 10
+    sup.tick()
+    assert killed == ["1"]
+    clock.t += 30
+    sup.tick()
+    assert killed == ["1", "2"]
+
+
+def test_servers_on_live_work_are_never_preempted(tmp_path):
+    sup, launched, clock = _make_supervisor(tmp_path, preempt_after_s=30)
+    _ticket(sup.live_queue_dir, "LIVE_t000.json")
+    _ticket(sup.live_queue_dir, "LIVE_t001.json")
+    sup.tick()
+    _claim(sup, "1", "LIVE_t000.json", lane="queue_live")
+    _claim(sup, "2", "LIVE_t001.json", lane="queue_live")
+    waiting = _ticket(sup.live_queue_dir, "LIVE_t002.json")
+    os.utime(waiting, (clock.t - 120, clock.t - 120))
+    killed = []
+    sup._kill = lambda slot: killed.append(slot.server_id)
+    sup.tick()
+    assert killed == []
+
+
+def test_preemption_can_be_turned_off(tmp_path):
+    sup, _, _, _, killed = _busy_with_backfill_and_live_waiting(
+        tmp_path, waited_s=300, preempt=False
+    )
+    sup.tick()
+    assert killed == []
+
+
+def test_status_reports_lanes(tmp_path):
+    sup, _, _ = _make_supervisor(tmp_path, lease_active=lambda: True)
+    _ticket(sup.live_queue_dir, "LIVE_t000.json")
+    _ticket(sup.queue_dir, "bf.json")
+    sup.tick()
+    status = json.loads((sup.base_dir / "supervisor_status.json").read_text())
+    assert status["live_lease_active"] is True
+    assert status["live_queued"] == 1
+    assert status["backfill_queued"] == 1

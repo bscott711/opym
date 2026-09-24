@@ -84,3 +84,12 @@ def matlab_engine():
 
     yield eng
     eng.quit()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_petakit_jobs_dir(tmp_path, monkeypatch):
+    """Code that falls back to production's /dev/shm/petakit_jobs when
+    PETAKIT_JOBS_DIR is unset (e.g. the receiver's per-session profile) must
+    never write there from a test. That happened once on 2026-09-24:
+    receiver tests appended fake sessions to the live profiling/receiver.jsonl."""
+    monkeypatch.setenv("PETAKIT_JOBS_DIR", str(tmp_path / "petakit_jobs"))
