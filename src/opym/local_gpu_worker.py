@@ -1,16 +1,35 @@
 # opym/local_gpu_worker.py
 """
-Watchdog for PetaKit job queue.
-Spins up the Matlab server when jobs are present and waits for it
-to auto-shutdown on idle to release GPU resources.
+Supervisor for the PetaKit job queue: one PetaKit5D MATLAB server
+(run_petakit_server.m) per GPU, each kept alive independently.
+
+- A server is launched whenever claimable tickets exist and it isn't
+  running. Servers still shut themselves down after PETAKIT_IDLE_TIMEOUT.
+- A server that dies (crash, OOM, kill) is relaunched on its own. The
+  previous watchdog waited on BOTH servers before doing anything, so one dead
+  server silently halved throughput until the other also exited. On
+  2026-09-23 server 1 died at 13:29, server 2 hung at 15:47, and nothing ran
+  for 43 hours.
+- A ticket held by a server that dies goes back in the queue
+  (`requeue_claim`), at most MAX_REQUEUES times, then to failed/.
+- A claim whose dataDir has had no file written for `hang_after_s` is
+  flagged; with `kill_hung`, its server is killed, which requeues the ticket
+  and frees the GPU.
+
+Each server records the ticket it holds in claims/S<id>.json (written by
+run_petakit_server.m right after it claims one, removed when that ticket
+resolves). Current state for dashboards: supervisor_status.json.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess  # nosec B404
 import time
-import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from opym.consolidate import run_pending_consolidations
@@ -18,17 +37,30 @@ from opym.consolidate import run_pending_consolidations
 # Dynamically locate the opym installation directory
 OPYM_DIR = Path(__file__).parent.resolve()
 
-BASE_DIR = Path("/dev/shm/petakit_jobs")
+# PETAKIT_JOBS_DIR matches run_petakit_server.m's override, for test servers.
+BASE_DIR = Path(os.environ.get("PETAKIT_JOBS_DIR", "/dev/shm/petakit_jobs"))
 QUEUE_DIR = BASE_DIR / "queue"
 
-# If both Matlab servers exit nonzero (e.g. a license checkout failure kills
-# Matlab before it ever reaches run_petakit_server.m), retrying on the normal
-# short poll_interval would hot-loop launching Matlab -- and re-attempting a
-# license checkout -- forever until whatever's broken gets fixed. Back off
-# exponentially instead, capped, so a stuck license degrades gracefully
-# rather than hammering the license server and spamming logs.
+# If a Matlab server exits nonzero (e.g. a license checkout failure kills
+# Matlab before it ever reaches run_petakit_server.m), relaunching it on the
+# normal short poll interval would hot-loop re-attempting a license checkout
+# until whatever's broken gets fixed. Back off exponentially instead, capped,
+# so a stuck license degrades gracefully rather than hammering the license
+# server and spamming logs.
 FAILURE_BACKOFF_BASE_SEC = 15
 FAILURE_BACKOFF_CAP_SEC = 300
+
+# (PETAKIT_SERVER_ID, CUDA_VISIBLE_DEVICES): one server per physical GPU.
+SERVERS: tuple[tuple[str, str], ...] = (("1", "0"), ("2", "1"))
+
+# A ticket that has taken down its server this many times goes to failed/
+# instead of back in the queue, so one poisonous dataset can't keep a GPU
+# busy failing forever.
+MAX_REQUEUES = 2
+DEFAULT_HANG_AFTER_S = 60 * 60
+HANG_CHECK_EVERY_S = 300.0
+ORPHAN_SWEEP_EVERY_S = 60.0
+KILL_GRACE_S = 20.0
 
 
 def _next_backoff_sec(
@@ -41,136 +73,407 @@ def _next_backoff_sec(
     return min(base * (2 ** (consecutive_failures - 1)), cap)
 
 
-def _ensure_directories():
-    """Ensures all necessary job directories exist."""
-    for directory in (
-        QUEUE_DIR,
-        BASE_DIR / "completed",
-        BASE_DIR / "failed",
-    ):
-        directory.mkdir(parents=True, exist_ok=True)
+def has_claimable_work(queue_dir: Path) -> bool:
+    """True if `queue_dir` holds a ticket a server could claim.
+
+    Path.glob("*.json") also matches dotfiles (".active_*" claims,
+    ".requeue_*" in-progress requeues) -- unlike the shell, pathlib doesn't
+    hide them. run_petakit_server.m skips anything starting with '.', so
+    mirror that: an orphaned claim must not look like new work.
+    """
+    return any(not p.name.startswith(".") for p in queue_dir.glob("*.json"))
+
+
+def requeue_claim(
+    active_path: Path, reason: str, max_requeues: int = MAX_REQUEUES
+) -> str:
+    """Put a claimed ticket (`queue/.active_<name>`) back as `queue/<name>`.
+
+    The ticket's `requeueCount` goes up by one each time; once it reaches
+    `max_requeues`, the ticket goes to failed/ with a `.log` giving `reason`.
+    An unreadable ticket goes straight to failed/. Returns "requeued" or
+    "failed".
+
+    The new ticket is written under a dot-name first and the claim removed
+    before the rename, so a server can never claim `<name>` while
+    `.active_<name>` still exists (its movefile would collide with it).
+    """
+    queue_dir = active_path.parent
+    failed_dir = queue_dir.parent / "failed"
+    name = active_path.name.removeprefix(".active_")
+    try:
+        ticket = json.loads(active_path.read_text())
+    except (OSError, ValueError):
+        ticket = None
+    count = (
+        int(ticket.get("requeueCount", 0)) if isinstance(ticket, dict) else max_requeues
+    )
+
+    if not isinstance(ticket, dict) or count >= max_requeues:
+        failed_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(active_path, failed_dir / name)
+        (failed_dir / f"{name}.log").write_text(
+            f"Moved to failed/ by the opym-serve supervisor after {count} requeue(s).\n"
+            f"Last reason: {reason}\n"
+        )
+        return "failed"
+
+    ticket["requeueCount"] = count + 1
+    ticket.setdefault("requeueHistory", []).append(
+        {"at": time.time(), "reason": reason}
+    )
+    staging = queue_dir / f".requeue_{name}"
+    staging.write_text(json.dumps(ticket, indent=2))
+    active_path.unlink(missing_ok=True)
+    os.replace(staging, queue_dir / name)
+    return "requeued"
+
+
+def newest_mtime(root: Path) -> float | None:
+    """Newest file mtime anywhere under `root`, or None if it has no files."""
+    newest = None
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            try:
+                m = os.stat(os.path.join(dirpath, fn)).st_mtime
+            except OSError:
+                continue
+            if newest is None or m > newest:
+                newest = m
+    return newest
+
+
+def _server_pids(server_id: str) -> list[int]:
+    """Pids of this user's processes launched for PETAKIT_SERVER_ID=`server_id`
+    (the server's bash wrapper, MATLAB itself, and its parpool workers, which
+    all inherit the variable). Processes we can't read are skipped."""
+    marker = f"PETAKIT_SERVER_ID={server_id}".encode()
+    pids = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/environ", "rb") as f:
+                if marker in f.read().split(b"\0"):
+                    pids.append(int(entry.name))
+        except OSError:
+            continue
+    return pids
+
+
+def _any_server_alive() -> bool:
+    return any(_server_pids(sid) for sid, _ in SERVERS)
+
+
+@dataclass
+class ServerSlot:
+    server_id: str
+    cuda_device: str
+    proc: subprocess.Popen | None = None
+    consecutive_failures: int = 0
+    next_launch_at: float = 0.0
+    last_hang_check: float = 0.0
+    idle_s: float | None = None
+    hang_flagged_ticket: str | None = None
+
+
+class ServerSupervisor:
+    """Drives the servers one `tick()` at a time; `process_queue` loops it.
+
+    `launch(slot) -> Popen` and `clock() -> float` are injectable for tests.
+    """
+
+    def __init__(
+        self,
+        base_dir: Path,
+        *,
+        idle_timeout_sec: int = 300,
+        hang_after_s: float = DEFAULT_HANG_AFTER_S,
+        kill_hung: bool = True,
+        launch: Callable[[ServerSlot], subprocess.Popen] | None = None,
+        clock: Callable[[], float] = time.time,
+        any_server_alive: Callable[[], bool] = _any_server_alive,
+    ) -> None:
+        self.base_dir = Path(base_dir)
+        self.queue_dir = self.base_dir / "queue"
+        self.claims_dir = self.base_dir / "claims"
+        self.idle_timeout_sec = idle_timeout_sec
+        self.hang_after_s = hang_after_s
+        self.kill_hung = kill_hung
+        self.slots = [ServerSlot(sid, dev) for sid, dev in SERVERS]
+        self._launch = launch or self._launch_matlab
+        self._clock = clock
+        self._any_server_alive = any_server_alive
+        self._clean_exit_pending_consolidation = False
+        self._last_orphan_sweep = float("-inf")
+        for d in (
+            self.queue_dir,
+            self.base_dir / "completed",
+            self.base_dir / "failed",
+            self.claims_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+    # --- one supervision pass -------------------------------------------------
+
+    def tick(self) -> None:
+        now = self._clock()
+        for slot in self.slots:
+            if slot.proc is not None and slot.proc.poll() is not None:
+                self._on_exit(slot, now)
+
+        if not any(s.proc is not None for s in self.slots):
+            if now - self._last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
+                self._last_orphan_sweep = now
+                self._reclaim_unowned()
+            if self._clean_exit_pending_consolidation:
+                self._clean_exit_pending_consolidation = False
+                self._run_consolidations()
+
+        if has_claimable_work(self.queue_dir):
+            for slot in self.slots:
+                if slot.proc is None and now >= slot.next_launch_at:
+                    print(
+                        f"🚀 Launching server {slot.server_id} "
+                        f"on GPU {slot.cuda_device}...",
+                        flush=True,
+                    )
+                    slot.proc = self._launch(slot)
+
+        for slot in self.slots:
+            if (
+                slot.proc is not None
+                and now - slot.last_hang_check >= HANG_CHECK_EVERY_S
+            ):
+                slot.last_hang_check = now
+                self._check_hang(slot, now)
+
+        self._write_status(now)
+
+    # --- exits and claims -----------------------------------------------------
+
+    def _on_exit(self, slot: ServerSlot, now: float) -> None:
+        rc = slot.proc.returncode
+        slot.proc = None
+        slot.idle_s = None
+        slot.hang_flagged_ticket = None
+        self._requeue_claim_of(
+            slot, reason=f"server {slot.server_id} exited with rc={rc}"
+        )
+        if rc == 0:
+            slot.consecutive_failures = 0
+            slot.next_launch_at = now
+            self._clean_exit_pending_consolidation = True
+            print(
+                f"🛑 Server {slot.server_id} spun down after "
+                f"{self.idle_timeout_sec}s idle.",
+                flush=True,
+            )
+            return
+        # run_petakit_server.m wraps all per-job work in try/catch and exits 0
+        # on its idle timeout, so a nonzero exit means Matlab itself died:
+        # license/module failure at launch, OOM, a crash, or our own kill.
+        slot.consecutive_failures += 1
+        backoff = _next_backoff_sec(slot.consecutive_failures)
+        slot.next_launch_at = now + backoff
+        print(
+            f"❌ Server {slot.server_id} exited with rc={rc}. Relaunching it alone in "
+            f"{backoff:.0f}s (consecutive failures: {slot.consecutive_failures}); "
+            "other servers are unaffected.",
+            flush=True,
+        )
+
+    def _claim_path(self, slot: ServerSlot) -> Path:
+        return self.claims_dir / f"S{slot.server_id}.json"
+
+    def _read_claim(self, slot: ServerSlot) -> tuple[str, float] | None:
+        """(ticket name, claim time) this server holds, or None."""
+        path = self._claim_path(slot)
+        try:
+            rec = json.loads(path.read_text())
+            return str(rec["ticket"]), path.stat().st_mtime
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _requeue_claim_of(self, slot: ServerSlot, reason: str) -> None:
+        claim = self._read_claim(slot)
+        self._claim_path(slot).unlink(missing_ok=True)
+        if claim is None:
+            return
+        active = self.queue_dir / f".active_{claim[0]}"
+        if active.exists():
+            outcome = requeue_claim(active, reason)
+            print(f"♻️  {claim[0]}: {outcome} ({reason})", flush=True)
+
+    def _reclaim_unowned(self) -> None:
+        """With no server process alive at all, nothing can legitimately hold
+        a claim, so every `.active_` ticket is an orphan. Also finishes any
+        requeue interrupted between its write and its rename."""
+        if self._any_server_alive():
+            return  # e.g. a server launched by hand outside this supervisor
+        for staging in self.queue_dir.glob(".requeue_*.json"):
+            os.replace(staging, self.queue_dir / staging.name.removeprefix(".requeue_"))
+        for active in sorted(self.queue_dir.glob(".active_*.json")):
+            outcome = requeue_claim(active, "orphaned claim: no server was running")
+            print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
+        for rec in self.claims_dir.glob("S*.json"):
+            rec.unlink(missing_ok=True)
+
+    # --- hang detection -------------------------------------------------------
+
+    def _check_hang(self, slot: ServerSlot, now: float) -> None:
+        claim = self._read_claim(slot)
+        if claim is None:
+            slot.idle_s = None
+            return
+        ticket, claimed_at = claim
+        try:
+            data_dir = json.loads((self.queue_dir / f".active_{ticket}").read_text())[
+                "dataDir"
+            ]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        last_write = max(claimed_at, newest_mtime(Path(data_dir)) or 0.0)
+        slot.idle_s = now - last_write
+        if slot.idle_s < self.hang_after_s or slot.hang_flagged_ticket == ticket:
+            return
+        slot.hang_flagged_ticket = ticket
+        print(
+            f"⚠️  Server {slot.server_id} looks hung on {ticket}: nothing written under "
+            f"{data_dir} for {slot.idle_s / 60:.0f} min.",
+            flush=True,
+        )
+        if self.kill_hung:
+            print(
+                f"🔪 Killing server {slot.server_id} so its GPU comes back; "
+                "the ticket is requeued.",
+                flush=True,
+            )
+            self._kill(slot)
+
+    def _kill(self, slot: ServerSlot) -> None:
+        """Terminate the server's whole process tree: the bash wrapper,
+        Matlab, and its parpool workers (all carry its PETAKIT_SERVER_ID)."""
+        for sig, wait_s in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, 5.0)):
+            pids = _server_pids(slot.server_id)
+            if slot.proc is not None and slot.proc.poll() is None:
+                pids.append(slot.proc.pid)
+            if not pids:
+                return
+            for pid in set(pids):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            deadline = time.time() + wait_s
+            while time.time() < deadline and _server_pids(slot.server_id):
+                time.sleep(0.5)
+
+    # --- process launch, consolidation, status --------------------------------
+
+    def _launch_matlab(self, slot: ServerSlot) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["PETAKIT_IDLE_TIMEOUT"] = str(self.idle_timeout_sec)
+        env["PETAKIT_SERVER_ID"] = slot.server_id
+        # Matlab's gpuDevice index is 1-based within CUDA_VISIBLE_DEVICES,
+        # which exposes exactly one physical GPU to each server.
+        env["PETAKIT_GPU_ID"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = slot.cuda_device
+        env["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
+        # Use bash to load the matlab module so licensing works correctly
+        cmd_str = (
+            "module load matlab/R2024b && "
+            f"matlab -nodisplay -sd {OPYM_DIR} -batch run_petakit_server"
+        )
+        return subprocess.Popen(["bash", "-c", cmd_str], env=env)  # nosec B603
+
+    def _run_consolidations(self) -> None:
+        print("\n🔗 Checking for pending OME-Zarr consolidations...", flush=True)
+        try:
+            n = run_pending_consolidations(self.base_dir)
+            print(
+                f"✅ Consolidated {n} dataset(s) into OME-Zarr"
+                if n
+                else "   No pending consolidations found",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - never let this kill the supervisor
+            print(f"⚠️  Consolidation error: {exc}", flush=True)
+
+    def _write_status(self, now: float) -> None:
+        servers = []
+        for slot in self.slots:
+            claim = self._read_claim(slot) if slot.proc is not None else None
+            servers.append(
+                {
+                    "server_id": slot.server_id,
+                    "cuda_device": slot.cuda_device,
+                    "running": slot.proc is not None,
+                    "pid": slot.proc.pid if slot.proc is not None else None,
+                    "consecutive_failures": slot.consecutive_failures,
+                    "next_launch_at": slot.next_launch_at,
+                    "ticket": claim[0] if claim else None,
+                    "claimed_at": claim[1] if claim else None,
+                    "idle_s": slot.idle_s,
+                    "suspected_hang": slot.hang_flagged_ticket is not None,
+                }
+            )
+        tmp = self.base_dir / ".supervisor_status.json.tmp"
+        tmp.write_text(json.dumps({"updated_at": now, "servers": servers}, indent=1))
+        os.replace(tmp, self.base_dir / "supervisor_status.json")
 
 
 def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
-    """
-    Watches the queue. If jobs exist, launches the persistent Matlab server.
-    The Matlab server handles the jobs and shuts itself down after `idle_timeout_sec`.
-    """
-    _ensure_directories()
-    
+    """Supervise the servers until interrupted. Hang handling is set by
+    OPYM_SERVE_HANG_MIN (default 60) and OPYM_SERVE_KILL_HUNG (default 1)."""
+    hang_after_s = (
+        float(os.environ.get("OPYM_SERVE_HANG_MIN", DEFAULT_HANG_AFTER_S / 60)) * 60
+    )
+    kill_hung = os.environ.get("OPYM_SERVE_KILL_HUNG", "1").strip() not in (
+        "0",
+        "false",
+        "",
+    )
+    sup = ServerSupervisor(
+        BASE_DIR,
+        idle_timeout_sec=idle_timeout_sec,
+        hang_after_s=hang_after_s,
+        kill_hung=kill_hung,
+    )
+
     print("=" * 60)
-    print(" 🚀 OPYM PetaKit GPU Watchdog Initialized")
+    print(" 🚀 OPYM PetaKit GPU Supervisor Initialized")
     print("=" * 60)
-    print(f" 📂 Queue Directory: {QUEUE_DIR}")
+    print(f" 📂 Queue Directory: {sup.queue_dir}")
+    print(
+        " 🖥️  Servers:         "
+        + ", ".join(f"{s.server_id}->GPU {s.cuda_device}" for s in sup.slots)
+    )
     print(f" ⏱️  Idle Timeout:    {idle_timeout_sec} seconds")
     print(f" 🔍 Polling Rate:    Every {poll_interval} seconds")
     print(
         f" ⚠️  Failure Backoff: {FAILURE_BACKOFF_BASE_SEC}s-{FAILURE_BACKOFF_CAP_SEC}s "
-        "(exponential, if Matlab exits with an error)"
+        "(exponential, per server)"
+    )
+    print(
+        f" 🧊 Hang Handling:   flag after {hang_after_s / 60:.0f} min idle, "
+        f"kill={'on' if kill_hung else 'off'}"
     )
     print(f" 🔧 Backend Script:  {OPYM_DIR}/run_petakit_server.m")
-    print("=" * 60)
-    print("👀 Listening for incoming jobs...\n")
-
-    # Pass the timeout to Matlab via environment variables
-    env = os.environ.copy()
-    env["PETAKIT_IDLE_TIMEOUT"] = str(idle_timeout_sec)
-
-    consecutive_failures = 0
+    print("=" * 60, flush=True)
 
     try:
         while True:
-            # Check if there are any *claimable* JSON tickets in the queue.
-            # Path.glob("*.json") also matches ".active_*.json" files (an
-            # in-progress or orphaned ticket a MATLAB server already claimed
-            # via movefile) -- unlike the shell, pathlib doesn't hide
-            # dotfiles. run_petakit_server.m explicitly excludes those
-            # (~startsWith(name, '.')) when deciding what it can pick up, so
-            # mirror that here: an orphaned .active_ ticket left behind by a
-            # crashed server shouldn't make the watchdog spin up fresh
-            # servers that will just idle-timeout without touching it.
-            if any(
-                p for p in QUEUE_DIR.glob("*.json") if not p.name.startswith(".")
-            ):
-                print("\n🚀 Jobs detected. Spinning up PetaKit Matlab Server...")
-
-                env1 = env.copy()
-                env1["PETAKIT_SERVER_ID"] = "1"
-                env1["PETAKIT_GPU_ID"] = "1"
-                env1["CUDA_VISIBLE_DEVICES"] = "0"
-                env1["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
-                
-                env2 = env.copy()
-                env2["PETAKIT_SERVER_ID"] = "2"
-                env2["PETAKIT_GPU_ID"] = "1"  # Both use GPU index 1 because CUDA restricts visibility to 1 device
-                env2["CUDA_VISIBLE_DEVICES"] = "1"
-                env2["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
-
-                # Use bash to load the matlab module so licensing works correctly
-                cmd_str = f"module load matlab/R2024b && matlab -nodisplay -sd {OPYM_DIR} -batch run_petakit_server"
-                
-                cmd = ["bash", "-c", cmd_str]
-
-                print("➡️  Launching Server 1 on GPU 1...")
-                p1 = subprocess.Popen(cmd, env=env1)
-                
-                print("➡️  Launching Server 2 on GPU 2...")
-                p2 = subprocess.Popen(cmd, env=env2)
-
-                # This will block until both Matlab scripts complete
-                # their queues AND their timeouts
-                p1.wait()
-                p2.wait()
-
-                # run_petakit_server.m wraps all per-job work in try/catch and
-                # exits 0 on a clean idle-timeout `break`, so a nonzero exit
-                # code here only happens when Matlab itself failed to get
-                # running (license checkout, verify_mex(), a top-level crash)
-                # -- never a job-level failure. Treat that as a launch failure
-                # and back off instead of relaunching on the normal short
-                # poll_interval.
-                if p1.returncode != 0 or p2.returncode != 0:
-                    consecutive_failures += 1
-                    backoff = _next_backoff_sec(consecutive_failures)
-                    print(
-                        f"\n❌ Matlab server(s) exited with an error "
-                        f"(server1={p1.returncode}, server2={p2.returncode}) -- "
-                        "Matlab likely failed to start (check the log above for a "
-                        "license/module error). The queued ticket(s) are untouched "
-                        f"and will be retried automatically. Backing off {backoff:.0f}s "
-                        f"before the next attempt (consecutive failures: {consecutive_failures})."
-                    )
-                    time.sleep(backoff)
-                    continue
-
-                consecutive_failures = 0
-
-                print(
-                    f"🛑 Matlab server spun down after {idle_timeout_sec}s "
-                    "of inactivity. GPUs released."
-                )
-
-                print("\n🔗 Checking for pending OME-Zarr consolidations...")
-                try:
-                    n = run_pending_consolidations(BASE_DIR)
-                    if n:
-                        print(f"✅ Consolidated {n} dataset(s) into OME-Zarr")
-                    else:
-                        print("   No pending consolidations found")
-                except Exception as exc:
-                    print(f"⚠️  Consolidation error: {exc}")
-
-                print(f"👀 Watchdog resuming listening on {QUEUE_DIR}...")
-
+            sup.tick()
             time.sleep(poll_interval)
-
     except KeyboardInterrupt:
-        print("\n🛑 Watchdog gracefully shut down.")
+        print("\n🛑 Supervisor shut down.", flush=True)
 
 
 def main():
-    # 300 seconds = 5 minutes of idle time before releasing the GPU
+    # 3600 seconds = 1 hour of idle time before a server releases its GPU
     process_queue(idle_timeout_sec=3600)
+
 
 if __name__ == "__main__":
     main()

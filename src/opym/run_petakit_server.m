@@ -36,7 +36,12 @@ else
     end
 end
 
-base_queue_dir = '/dev/shm/petakit_jobs';
+% Overridable so a test server can run against its own queue without
+% touching production's (local_gpu_worker.py honors the same variable).
+base_queue_dir = getenv('PETAKIT_JOBS_DIR');
+if isempty(base_queue_dir)
+    base_queue_dir = '/dev/shm/petakit_jobs';
+end
 
 % --- DYNAMIC CPU DETECTION -----------------------------------------------
 envCPUs = getenv('PETAKIT_CPUS');
@@ -66,6 +71,14 @@ staleLocks = dir(fullfile(gpu_lock_dir, '*.lock'));
 for si = 1:numel(staleLocks)
     delete(fullfile(gpu_lock_dir, staleLocks(si).name));
 end
+
+% Which ticket this server holds, for local_gpu_worker.py: a ticket claimed by
+% a server that then dies (crash, OOM, kill) is put back in the queue instead
+% of sitting as an orphaned .active_ claim forever. Written right after a
+% claim, removed once the ticket resolves.
+claims_dir = fullfile(base_queue_dir, 'claims');
+if ~exist(claims_dir, 'dir'), mkdir(claims_dir); end
+claimPath = fullfile(claims_dir, sprintf('S%s.json', envServerId));
 
 % --- INITIALIZATION ------------------------------------------------------
 if ~exist('XR_deskew_rotate_data_wrapper', 'file')
@@ -175,6 +188,11 @@ while true
     end
 
     logMsg('[Server] >>> Processing job: %s', currentFile);
+    writeClaim(claimPath, envServerId, currentFile);
+    % Defined before the try: the catch block reads it, and a ticket that fails
+    % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
+    % an undefined-variable error from inside the catch and kill the server.
+    jobType = '';
 
     try
         fid = fopen(activePath);
@@ -754,6 +772,24 @@ while true
             catch
             end
         end
+    end
+    clearClaim(claimPath);
+end
+
+function writeClaim(claimPath, serverId, ticketName)
+    % See claims_dir above. Written via a temp file so the supervisor never
+    % reads a half-written record.
+    rec = struct('server_id', serverId, 'ticket', ticketName, 'pid', feature('getpid'));
+    tmpPath = [claimPath '.tmp'];
+    fid = fopen(tmpPath, 'w');
+    fprintf(fid, '%s', jsonencode(rec));
+    fclose(fid);
+    movefile(tmpPath, claimPath, 'f');
+end
+
+function clearClaim(claimPath)
+    if exist(claimPath, 'file')
+        delete(claimPath);
     end
 end
 
