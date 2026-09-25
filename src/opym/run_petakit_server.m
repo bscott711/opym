@@ -204,7 +204,7 @@ while true
     prof = struct('ticket', currentFile, 'lane', claimLane, 'server_id', envServerId, ...
         'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
         'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
-        'decon_s', NaN, 'dsr_s', NaN, 'read_s', NaN, 'write_s', NaN, ...
+        'decon_s', NaN, 'dsr_s', NaN, 'read_s', NaN, 'view_s', NaN, 'write_s', NaN, ...
         'total_s', NaN, 'status', '', 'error', '');
     % Defined before the try: the catch block reads it, and a ticket that fails
     % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
@@ -552,6 +552,7 @@ while true
                 prof.decon_s = liveStats.decon_s;
                 prof.dsr_s = liveStats.dsr_s;
                 prof.write_s = liveStats.write_s;
+                prof.view_s = liveStats.view_s;
 
             case 'live'
                 % Streamed timepoints (opym.stream.live): decon -> DSR per

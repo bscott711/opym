@@ -119,8 +119,10 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 z_step_um=DZ,
                 ticket_name=f"Eq_T{t}_C{c}",
                 queue_dir=tmp_path / "q",
+                view_npy=tmp_path / "view" / f"T{t}_C{c}.npy",
                 **kw,
             )
+            (tmp_path / "view").mkdir(exist_ok=True)
             _run(eng, ticket, "run_live_zarr")
 
     dsr_dir = tmp_path / "tiff" / "Decon" / "DSR_decon"
@@ -136,6 +138,10 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 out["1/0"][t, c, 0],
                 tifffile.imread(dsr_dir / "MIPs" / f"{name}_MIP_z.tif"),
             )
+            # The live viewer's copy: the same volume, memory-mapped as is.
+            view = np.load(tmp_path / "view" / f"T{t}_C{c}.npy", mmap_mode="r")
+            assert view.flags.c_contiguous and view.dtype == np.uint16
+            np.testing.assert_array_equal(view, level0)
             level1 = downsample2(level0)
             np.testing.assert_array_equal(out["0/1"][t, c], level1)
             np.testing.assert_array_equal(out["0/2"][t, c], downsample2(level1))

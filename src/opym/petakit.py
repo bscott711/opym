@@ -486,6 +486,7 @@ def submit_live_zarr_job(
     hann_win_bounds: list[float] | None = None,
     damp_factor: float | None = None,
     dsr_dir_name: str = "DSR_decon",
+    view_npy: str | Path | None = None,
 ) -> Path:
     """Queue a 'live_zarr' ticket: one (t, c) volume from its raw OME-Zarr
     array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate in
@@ -497,7 +498,9 @@ def submit_live_zarr_job(
     `mask_store`, channel 0's raw array). The decon and DSR parameters and
     their defaults are exactly `submit_live_frames_job`'s, whose TIFF path
     this reproduces bit for bit. `dsr_dir_name` is accepted (and ignored) so
-    the same `deskew_decon_kwargs` feed both.
+    the same `deskew_decon_kwargs` feed both. `view_npy`: where the server
+    puts the full-resolution volume for the live viewer (an uncompressed
+    .npy on the RAM disk) before it writes the compressed store.
     """
     rl_method = _normalize_rl_method(rl_method)
     params = {
@@ -522,6 +525,8 @@ def submit_live_zarr_job(
         else (2 if rl_method == "omw" else 25),
         "gpu_decon": gpu_decon,
     }
+    if view_npy is not None:
+        params["view_npy"] = str(view_npy)
     if background is not None:
         params["background"] = float(background)
     if edge_erosion is not None:

@@ -28,6 +28,11 @@ function stats = run_live_zarr(p, numCPUs)
 %                   from its t = 0, as the wrappers' erodeByFTP does
 %   levels          processed arrays, full resolution first (<store>/0/0, ...)
 %   mip             processed Z-MIP array (<store>/1/0)
+%   view_npy        optional: where to put the full-resolution volume for the
+%                   live viewer first, as an uncompressed C-order (Z, Y, X)
+%                   uint16 .npy on the RAM disk (numpy memory-maps it: no
+%                   decode). It lands before the compressed store is written,
+%                   so the view never waits on encoding.
 %   psf_path, decon_dir (per-session cache: generated PSF, OMW back projector,
 %                   erosion mask), plus a 'live' ticket's decon and DSR fields.
 
@@ -59,7 +64,7 @@ if getp(p, 'objective_scan', false) || getp(p, 'z_stage_scan', false)
 end
 
 if ~exist(deconDir, 'dir'), mkdir(deconDir); end
-stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'write_s', 0);
+stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'view_s', 0, 'write_s', 0);
 
 % --- once per session: generated PSF, exactly as XR_decon_data_wrapper ---
 % (same code and cache location as run_live_frames.m; RLdecon loads it)
@@ -138,6 +143,13 @@ dsr = uint16(dsr);                        % the wrapper's writetiff(uint16(dsr))
 mip = uint16(max(dsr, [], 3));            % the wrapper's MIP: max over z, uint16
 stats.dsr_s = toc(t0);
 
+% --- the live viewer's copy first: nothing between it and the screen ---
+if isfield(p, 'view_npy') && ~isempty(p.view_npy)
+    t0 = tic;
+    writeNpyZYX(char(p.view_npy), dsr);
+    stats.view_s = toc(t0);
+end
+
 % --- write: (y, x, z) -> (z, y, x), the axis order the TIFF pages had ---
 t0 = tic;
 vol = permute(dsr, [3, 1, 2]);
@@ -150,6 +162,30 @@ for k = 2 : numel(levels)
 end
 opymWriteZarrBlock(char(p.mip), reshape(mip, [1, size(mip)]), leading);
 stats.write_s = toc(t0);
+end
+
+
+function writeNpyZYX(path, dsr)
+% dsr (y, x, z) as deskewRotateFrame3D returns it -> a C-order (Z, Y, X)
+% uint16 .npy (format 1.0). Written under a temporary name and renamed, so
+% a reader never maps a partial buffer.
+v = permute(dsr, [2, 1, 3]);   % (x, y, z) column-major == (z, y, x) C order
+sz = size(dsr, 1 : 3);         % [Y X Z]
+hdr = sprintf('{''descr'': ''<u2'', ''fortran_order'': False, ''shape'': (%d, %d, %d), }', ...
+    sz(3), sz(1), sz(2));
+pad = mod(-(10 + numel(hdr) + 1), 64);   % the whole header a multiple of 64
+hdr = [hdr, repmat(' ', 1, pad), newline];
+tmp = [path, '.tmp'];
+fid = fopen(tmp, 'w');
+if fid < 0
+    error('run_live_zarr:viewBuffer', 'Cannot write %s', tmp);
+end
+fwrite(fid, [uint8(147), uint8('NUMPY'), uint8(1), uint8(0)], 'uint8');
+fwrite(fid, numel(hdr), 'uint16', 0, 'l');
+fwrite(fid, hdr, 'char');
+fwrite(fid, v, 'uint16', 0, 'l');
+fclose(fid);
+movefile(tmp, path);
 end
 
 
