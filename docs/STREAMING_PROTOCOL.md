@@ -192,6 +192,28 @@ of `SESSION_START` and the first `ACK`'s `server_time_s`). The receiver
 records them in `profiling/live_trace.jsonl`; `opym-live-trace` turns them
 into per-hop latencies, including the time on the wire.
 
+#### Slabs (stream a volume while it's being acquired)
+
+Once an `ACK` has listed `"slabs"` in its `features`, a client may send each
+volume as several `FRAME`s, each carrying a run of planes:
+
+```python
+header = {
+    "t": 17, "c": 0, "frame_index": 71,
+    "z0": 24, "nz": 161,              # planes [24, 36) of a 161-plane volume
+    "shape_zyx": [12, 490, 1458],     # THIS slab's shape
+    "dtype": "uint16", "timestamp": ..., "camera_id": 0,
+}
+payload = volume[24:36].tobytes()
+```
+
+The receiver writes each slab into the raw store as it arrives, and stages
+the volume once its last plane has landed. A volume's slabs are ACKed only
+at that point, so a receiver restart mid-volume makes the client resend the
+whole volume. ACKs keep arriving meanwhile (with an unchanged
+`through_frame_index`), so a slow volume never looks like a dead link.
+About 16 MB per slab keeps the per-message overhead negligible.
+
 ### 3. `SESSION_END`
 
 ```python
@@ -214,6 +236,10 @@ Globus-landed acquisition already is (`channel_store_timepoints` in
 ```python
 header = {"through_frame_index": 33, "server_time_s": 1755000000.456}
 ```
+
+`features` lists what this receiver supports beyond the base protocol;
+only `"slabs"` is defined so far. A client must not send slabs to a
+receiver that hasn't advertised them.
 
 `server_time_s` (the server's clock when it sent the ACK) is informational:
 clients use it only to estimate their clock offset for the trace fields.
@@ -319,3 +345,22 @@ send `RESUME`, wait for the `ACK`, then resend everything left in
    --watch` finds the dataset through its normal GPFS walk once
    `SESSION_END` (or the idle timeout) finalizes it, and submits the one
    deskew/decon ticket for the whole thing, unmodified.
+
+## Direct endpoint (10 GbE, no SSH tunnel)
+
+The SSH tunnel tops out around 33 MB/s. That is ~13 s to move one
+161-plane, 2-channel timepoint, and was the largest delay in the live view on
+2026-09-25. `opym-receive` can also listen on the 10 GbE interface itself:
+
+| env var | example | meaning |
+|---|---|---|
+| `OPYM_STREAM_DIRECT_BIND` | `tcp://137.216.250.14:5556` | the direct endpoint |
+| `OPYM_STREAM_ALLOW_IPS` | `10.x.y.z` | comma-separated; every other host is refused (ZMQ ZAP) |
+| `OPYM_STREAM_RAW_ROOTS` | `/mmfs1/scratch/jacks.local/microscopy` | comma-separated; sessions on this endpoint may only write under these |
+
+The receiver will not bind the endpoint unless both allowlists are set. The
+link is plain TCP, not encrypted: CurveZMQ reached only 85 MB/s with pyzmq's
+bundled libzmq, versus ~3.9 GB/s plain. The site firewall admits only the
+acquisition PC on this port. The loopback (SSH tunnel) endpoint is
+unchanged, and it stays the client's fallback. A session follows its client
+if it reconnects through the other endpoint.

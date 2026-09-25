@@ -45,6 +45,25 @@ Live QC (`MSG_QC`): a client that lists "qc" in SESSION_START's `accepts`
 is sent each new verdict the live QC service writes for its session
 (`<leaf>/qc/qc_latest.json`, see `opym.stream.live`), header only. Clients
 that don't ask never see the message type.
+
+Direct endpoint (opt-in, `OPYM_STREAM_DIRECT_BIND`): besides the loopback
+endpoint the acquisition PC reaches through its SSH tunnel (~33 MB/s, the
+biggest single delay in the live view on 2026-09-25), the receiver can listen
+on the 10 GbE interface itself. That socket is plain TCP, not encrypted:
+CurveZMQ measured 85 MB/s with pyzmq's bundled libzmq. It is locked down
+instead. A ZAP IP allowlist (`OPYM_STREAM_ALLOW_IPS`) refuses every other
+host, and sessions arriving on it may only write under
+`OPYM_STREAM_RAW_ROOTS`. The site firewall admits only the acquisition PC
+on top of that. The receiver refuses to bind it with either list empty.
+Each session remembers the socket it is reached on, and follows its client
+if it reconnects through the other one.
+
+Slabs: a client that sees "slabs" in an ACK's `features` sends each volume
+as z-slabs while it is still being acquired (FRAME headers with `z0`,
+`nz`), instead of one message after the last plane. Each slab goes straight
+into the raw store. The volume is staged for processing (decon TIFF, live
+lane, QC) once its last plane lands, and its slabs are ACKed only then, so
+a restart mid-volume makes the client resend the whole volume.
 """
 
 from __future__ import annotations
@@ -119,6 +138,21 @@ _STAGE_ROOT_ENV_VAR = "OPYM_STREAM_STAGE_ROOT"
 _LIVE_LANE_ENV_VAR = "OPYM_LIVE_LANE"
 
 
+# The direct (10 GbE) endpoint; see the module docstring.
+_DIRECT_BIND_ENV_VAR = "OPYM_STREAM_DIRECT_BIND"
+_ALLOW_IPS_ENV_VAR = "OPYM_STREAM_ALLOW_IPS"
+_RAW_ROOTS_ENV_VAR = "OPYM_STREAM_RAW_ROOTS"
+# Setting a ZAP domain is what makes libzmq consult the authenticator (here:
+# the IP allowlist) for NULL-mechanism connections at all.
+_ZAP_DOMAIN = b"opym-direct"
+# Advertised in every ACK; clients only use a feature once they've seen it.
+SERVER_FEATURES = ["slabs"]
+
+
+def _env_list(name: str) -> list[str]:
+    return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
+
+
 def _live_lane_enabled() -> bool:
     return os.environ.get(_LIVE_LANE_ENV_VAR, "").strip() in ("1", "true", "yes")
 
@@ -164,6 +198,18 @@ def _estimate_session_bytes(header: dict[str, Any]) -> int:
     nz, ny, nx = header["shape_zyx"]
     itemsize = np.dtype(header["dtype"]).itemsize
     return nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
+
+
+@dataclass
+class _SlabAssembly:
+    """One (t, c) volume arriving as z-slabs (FRAME headers with `z0`)."""
+
+    volume: np.ndarray
+    z0s: set[int] = field(default_factory=set)
+    planes: int = 0
+    frame_indices: list[int] = field(default_factory=list)
+    first_recv_s: float = 0.0
+    raw_write_s: float = 0.0
 
 
 @dataclass
@@ -214,6 +260,13 @@ class SessionState:
     """Processed timepoint by timepoint by the live lane (opym.stream.live)."""
     accepts_qc: bool = False
     """The client listed "qc" in SESSION_START's `accepts`: forward MSG_QC."""
+    sock: Any = None
+    """The ROUTER socket this session's client is reached on right now
+    (loopback behind the SSH tunnel, or the direct endpoint). ACKs and QC
+    go back through it; it follows the client if it reconnects through the
+    other one."""
+    slabs: dict[tuple[int, int], _SlabAssembly] = field(default_factory=dict)
+    """Volumes still arriving slab by slab, by (t, c)."""
     qc_seq_sent: int = -1
     qc_mtime: float = 0.0
     qc_checked_at: float = 0.0
@@ -261,8 +314,13 @@ class StreamReceiver:
         drain_workers: int = drain.DEFAULT_DRAIN_WORKERS,
         drain_retention_s: float = drain.DEFAULT_RETENTION_S,
         drain_high_water_bytes: int = drain.DEFAULT_HIGH_WATER_BYTES,
+        direct_bind: str | None = None,
+        allow_ips: list[str] | tuple[str, ...] = (),
+        raw_roots: list[Path | str] | tuple[Path | str, ...] = (),
     ) -> None:
         self.bind_addr = bind_addr
+        self.direct_bind = direct_bind
+        self.raw_roots = [Path(r).resolve() for r in raw_roots]
         self.ack_every_n_frames = ack_every_n_frames
         self.ack_every_sec = ack_every_sec
         self.idle_timeout_sec = idle_timeout_sec
@@ -299,11 +357,60 @@ class StreamReceiver:
         self._poller = zmq.Poller()
         self._poller.register(self._socket, zmq.POLLIN)
 
+        self._direct_socket: zmq.Socket | None = None
+        self._direct_ctx: zmq.Context | None = None
+        self._auth = None
+        if direct_bind:
+            self._bind_direct(direct_bind, list(allow_ips))
+
+    def _bind_direct(self, addr: str, allow_ips: list[str]) -> None:
+        """Listen on the direct (10 GbE) endpoint; see the module docstring.
+        Its own context, so its ZAP authenticator can't collide with another
+        receiver's in the same process (tests)."""
+        if not allow_ips or not self.raw_roots:
+            logger.error(
+                "Not binding the direct endpoint %s: it needs both %s and %s "
+                "set. Unrestricted, it would accept any host on the network "
+                "and let it write anywhere this service can.",
+                addr,
+                _ALLOW_IPS_ENV_VAR,
+                _RAW_ROOTS_ENV_VAR,
+            )
+            return
+        from zmq.auth.thread import ThreadAuthenticator
+
+        self._direct_ctx = zmq.Context()
+        self._auth = ThreadAuthenticator(self._direct_ctx)
+        self._auth.start()
+        self._auth.allow(*allow_ips)
+        sock = self._direct_ctx.socket(zmq.ROUTER)
+        sock.setsockopt(zmq.ROUTER_HANDOVER, 1)
+        sock.zap_domain = _ZAP_DOMAIN
+        sock.bind(addr)
+        self._direct_socket = sock
+        self._poller.register(sock, zmq.POLLIN)
+        logger.info(
+            "Direct endpoint %s: allowing %s, writes under %s",
+            addr,
+            ", ".join(allow_ips),
+            ", ".join(map(str, self.raw_roots)),
+        )
+
+    def _raw_root_allowed(self, raw_root: Path) -> bool:
+        resolved = Path(raw_root).resolve()
+        return any(resolved.is_relative_to(root) for root in self.raw_roots)
+
     def close(self) -> None:
         self._lease.update([])
         if self._live is not None:
             self._live.close()
         self._socket.close(linger=0)
+        if self._direct_socket is not None:
+            self._direct_socket.close(linger=0)
+        if self._auth is not None:
+            self._auth.stop()
+        if self._direct_ctx is not None:
+            self._direct_ctx.term()
         # Deliberately not draining the queue first: shutdown must not block
         # on GPFS copies. Any not-yet-drained session's staging copy stays
         # on /dev/shm, untouched, and a restarted receiver process re-drains
@@ -318,7 +425,11 @@ class StreamReceiver:
         self.close()
 
     def run_forever(self) -> None:
-        logger.info("Stream receiver listening on %s", self.bind_addr)
+        logger.info(
+            "Stream receiver listening on %s%s",
+            self.bind_addr,
+            f" and {self.direct_bind} (direct)" if self._direct_socket else "",
+        )
         try:
             while True:
                 self._run_once()
@@ -327,8 +438,9 @@ class StreamReceiver:
 
     def _run_once(self) -> None:
         events = dict(self._poller.poll(timeout=POLL_TIMEOUT_MS))
-        if self._socket in events:
-            self._handle_incoming()
+        for sock in (self._socket, self._direct_socket):
+            if sock is not None and sock in events:
+                self._handle_incoming(sock)
         self._flush_pending_acks()
         self._sweep_idle_sessions()
         # Held while any session is open; refreshed every few seconds so it
@@ -340,8 +452,8 @@ class StreamReceiver:
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
 
-    def _handle_incoming(self) -> None:
-        identity, *rest = self._socket.recv_multipart()
+    def _handle_incoming(self, sock: zmq.Socket) -> None:
+        identity, *rest = sock.recv_multipart()
         try:
             msg_type, session_id, header, payload = unpack_message(rest)
         except ValueError as exc:
@@ -362,24 +474,40 @@ class StreamReceiver:
             return
 
         if msg_type == MSG_SESSION_START:
-            self._handle_session_start(identity, session_id, header)
-        elif msg_type == MSG_FRAME:
+            self._handle_session_start(sock, identity, session_id, header)
+            return
+        session = self.sessions.get(session_id)
+        if session is not None:
+            # Follow the client if it reconnected through the other socket
+            # (direct endpoint down -> SSH tunnel, or back).
+            session.sock, session.identity = sock, identity
+        if msg_type == MSG_FRAME:
             self._handle_frame(session_id, header, payload)
         elif msg_type == MSG_SESSION_END:
             self._handle_session_end(session_id, header)
         elif msg_type == MSG_RESUME:
-            self._handle_resume(identity, session_id)
+            self._handle_resume(sock, identity, session_id)
         else:  # pragma: no cover -- unpack_message already validates this
             logger.warning("Unhandled message type %r", msg_type)
 
     def _handle_session_start(
-        self, identity: bytes, session_id: str, header: dict[str, Any]
+        self,
+        sock: zmq.Socket,
+        identity: bytes,
+        session_id: str,
+        header: dict[str, Any],
     ) -> None:
         # A malformed header here must not take down every other session
         # this process is holding -- log and drop rather than let a
         # KeyError/ValueError propagate out of _run_once.
         try:
             raw_root = Path(header["raw_root"])
+            if sock is self._direct_socket and not self._raw_root_allowed(raw_root):
+                raise ValueError(
+                    f"raw_root {raw_root} is outside {_RAW_ROOTS_ENV_VAR} "
+                    f"({', '.join(map(str, self.raw_roots))}), which is all "
+                    "the direct endpoint may write to"
+                )
             base_name = header["base_name"]
             channels = list(header["channels"])
             channel_names = list(header.get("channel_names") or [])
@@ -428,6 +556,7 @@ class StreamReceiver:
             session = SessionState(
                 session_id=session_id,
                 identity=identity,
+                sock=sock,
                 base_name=base_name,
                 raw_root=raw_root,
                 write_root=write_root,
@@ -587,7 +716,9 @@ class StreamReceiver:
         session.last_activity = time.monotonic()
         t, c, frame_index = header["t"], header["c"], header["frame_index"]
 
-        if frame_index not in session.processed_frame_indices:
+        if "z0" in header:
+            self._handle_slab(session, header, payload, recv_s)
+        elif frame_index not in session.processed_frame_indices:
             if (t, c) not in session.received_pairs:
                 try:
                     self._stage_frame(session, header, payload)
@@ -621,35 +752,140 @@ class StreamReceiver:
         ):
             self._send_ack(session)
 
-    def _stage_frame(
-        self, session: SessionState, header: dict[str, Any], payload: bytes
+    def _handle_slab(
+        self,
+        session: SessionState,
+        header: dict[str, Any],
+        payload: bytes,
+        recv_s: float,
     ) -> None:
-        t, c = header["t"], header["c"]
-        shape_zyx = tuple(header.get("shape_zyx") or session.shape_zyx)
-        dtype = header.get("dtype") or session.dtype
+        """One z-slab `[z0, z0 + n)` of volume (t, c): written into the raw
+        store now, staged for processing once the volume's last plane lands.
+        Its frame_index is ACKed only then (see the module docstring)."""
+        t, c, frame_index, z0 = (
+            header["t"],
+            header["c"],
+            header["frame_index"],
+            header["z0"],
+        )
+        session.frames_since_ack += 1  # keeps ACKs flowing mid-volume
+        if (
+            frame_index <= session.ack_floor
+            or frame_index in session.processed_frame_indices
+        ):
+            return
+        if (t, c) in session.received_pairs:
+            # The whole volume is already staged (a resend after a reconnect).
+            session.processed_frame_indices.add(frame_index)
+            self._advance_ack_floor(session)
+            return
+        dtype = np.dtype(header.get("dtype") or session.dtype)
+        slab = np.frombuffer(payload, dtype=dtype).reshape(header["shape_zyx"])
+        asm = session.slabs.get((t, c))
+        if asm is None:
+            nz = int(header["nz"])
+            asm = _SlabAssembly(
+                volume=np.empty((nz, *slab.shape[1:]), dtype=dtype),
+                first_recv_s=recv_s,
+            )
+            session.slabs[(t, c)] = asm
+        asm.frame_indices.append(frame_index)
+        if z0 in asm.z0s:
+            return  # a resend of a slab already written
+        try:
+            t_start = time.perf_counter()
+            arr = self._raw_array(session, c, asm.volume.shape, dtype.str)
+            rawmirror.write_planes(arr, t, z0, slab)
+            asm.raw_write_s += time.perf_counter() - t_start
+        except Exception:
+            logger.exception(
+                "Failed to write slab z0=%d of (t=%d, c=%d) for session %s -- "
+                "dropping it; the client resends unACKed slabs on resume.",
+                z0,
+                t,
+                c,
+                session.session_id,
+            )
+            asm.frame_indices.remove(frame_index)
+            return
+        asm.volume[z0 : z0 + slab.shape[0]] = slab
+        asm.z0s.add(z0)
+        asm.planes += slab.shape[0]
+        if asm.planes < asm.volume.shape[0]:
+            return
 
-        raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
-        t_start = time.perf_counter()
+        del session.slabs[(t, c)]
+        try:
+            self._stage_volume(session, t, c, asm.volume, raw_write_s=asm.raw_write_s)
+        except Exception:
+            logger.exception(
+                "Failed to stage (t=%d, c=%d) for session %s after its last "
+                "slab -- the client resends it on the next resume.",
+                t,
+                c,
+                session.session_id,
+            )
+            return
+        session.received_pairs.add((t, c))
+        session.processed_frame_indices.update(asm.frame_indices)
+        self._advance_ack_floor(session)
+        _trace_frame(
+            session,
+            header,
+            asm.volume.nbytes,
+            recv_s,
+            first_recv_s=asm.first_recv_s,
+            slabs=len(asm.z0s),
+        )
 
+    def _raw_array(
+        self, session: SessionState, c: int, shape_zyx: tuple[int, ...], dtype: str
+    ):
+        """Channel c's raw store array, created on its first frame with THAT
+        frame's volume shape -- shape_zyx can legitimately differ per channel
+        (e.g. two cameras with different crops), so a single session-wide
+        array shape can't be assumed up front."""
         arr = session.channel_arrays.get(c)
         if arr is None:
-            # Lazily created on this channel's first frame, using THIS
-            # frame's own shape/dtype -- shape_zyx can legitimately differ
-            # per channel (e.g. two cameras with different crops), so a
-            # single session-wide array shape can't be assumed up front.
             arr = rawmirror.create_channel_store(
                 session.channel_store_paths[c],
                 num_timepoints=session.num_timepoints,
-                shape_zyx=shape_zyx,
+                shape_zyx=tuple(shape_zyx),
                 dtype=dtype,
                 z_step_um=session.z_step_um,
                 output_format=session.output_format,
                 session_id=session.session_id,
             )
             session.channel_arrays[c] = arr
-        rawmirror.write_timepoint(arr, t, raw)
-        t_raw = time.perf_counter()
+        return arr
 
+    def _stage_frame(
+        self, session: SessionState, header: dict[str, Any], payload: bytes
+    ) -> None:
+        """A whole (t, c) volume in one FRAME: raw store, then processing."""
+        t, c = header["t"], header["c"]
+        shape_zyx = tuple(header.get("shape_zyx") or session.shape_zyx)
+        dtype = header.get("dtype") or session.dtype
+        raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
+        t_start = time.perf_counter()
+        arr = self._raw_array(session, c, shape_zyx, dtype)
+        rawmirror.write_timepoint(arr, t, raw)
+        self._stage_volume(
+            session, t, c, raw, raw_write_s=time.perf_counter() - t_start
+        )
+
+    def _stage_volume(
+        self,
+        session: SessionState,
+        t: int,
+        c: int,
+        raw: np.ndarray,
+        *,
+        raw_write_s: float,
+    ) -> None:
+        """Volume (t, c) is complete in the raw store: stage it for decon and
+        hand it to the live lane."""
+        t_start = time.perf_counter()
         if session.decon_enabled:
             dst = self._decon_stage_path(session, c, t)
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -658,8 +894,8 @@ class StreamReceiver:
                 self._live.frame_staged(
                     session.session_id, t, session.channel_cidx[c], raw=raw
                 )
-        session.stage_raw_s.append(t_raw - t_start)
-        session.stage_tiff_s.append(time.perf_counter() - t_raw)
+        session.stage_raw_s.append(raw_write_s)
+        session.stage_tiff_s.append(time.perf_counter() - t_start)
         session.staged_bytes += raw.nbytes
 
         logger.debug(
@@ -700,8 +936,9 @@ class StreamReceiver:
         header = {
             "through_frame_index": session.ack_floor,
             "server_time_s": time.time(),
+            "features": SERVER_FEATURES,
         }
-        self._socket.send_multipart(
+        session.sock.send_multipart(
             [session.identity, *pack_message(MSG_ACK, session.session_id, header)]
         )
         session.frames_since_ack = 0
@@ -730,7 +967,7 @@ class StreamReceiver:
                 continue
             if not isinstance(seq, int) or seq <= session.qc_seq_sent:
                 continue
-            self._socket.send_multipart(
+            session.sock.send_multipart(
                 [session.identity, *pack_message(MSG_QC, session.session_id, record)]
             )
             session.qc_seq_sent = seq
@@ -837,7 +1074,9 @@ class StreamReceiver:
         # either way nothing else needs triggering here.
         del self.sessions[session.session_id]
 
-    def _handle_resume(self, identity: bytes, session_id: str) -> None:
+    def _handle_resume(
+        self, sock: zmq.Socket, identity: bytes, session_id: str
+    ) -> None:
         session = self.sessions.get(session_id)
         if session is None:
             # Receiver process restarted, or this session never actually
@@ -845,13 +1084,17 @@ class StreamReceiver:
             # everything still in its local buffer. Acceptable v1
             # degradation: session state isn't persisted to disk, only kept
             # in-process (see docs/STREAMING_PROTOCOL.md).
-            self._socket.send_multipart(
+            sock.send_multipart(
                 [
                     identity,
                     *pack_message(
                         MSG_ACK,
                         session_id,
-                        {"through_frame_index": -1, "server_time_s": time.time()},
+                        {
+                            "through_frame_index": -1,
+                            "server_time_s": time.time(),
+                            "features": SERVER_FEATURES,
+                        },
                     ),
                 ]
             )
@@ -894,10 +1137,15 @@ _CLIENT_TIME_FIELDS = (
 
 
 def _trace_frame(
-    session: SessionState, header: dict[str, Any], nbytes: int, recv_s: float
+    session: SessionState,
+    header: dict[str, Any],
+    nbytes: int,
+    recv_s: float,
+    **extra: Any,
 ) -> None:
-    """One `frame` trace line per newly staged (t, c): when its FRAME was
-    received and when staging finished, plus the client's own timestamps."""
+    """One `frame` trace line per newly staged (t, c): when its FRAME (or
+    its last slab) was received and when staging finished, plus the client's
+    own timestamps (a slab carries its volume's)."""
     trace.record(
         "frame",
         session_id=session.session_id,
@@ -909,6 +1157,7 @@ def _trace_frame(
         recv_s=recv_s,
         staged_s=time.time(),
         **{k: header[k] for k in _CLIENT_TIME_FIELDS if k in header},
+        **extra,
     )
 
 
@@ -961,7 +1210,11 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    receiver = StreamReceiver()
+    receiver = StreamReceiver(
+        direct_bind=os.environ.get(_DIRECT_BIND_ENV_VAR, "").strip() or None,
+        allow_ips=_env_list(_ALLOW_IPS_ENV_VAR),
+        raw_roots=_env_list(_RAW_ROOTS_ENV_VAR),
+    )
     with receiver:
         receiver.run_forever()
 

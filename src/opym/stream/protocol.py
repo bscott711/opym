@@ -123,6 +123,19 @@ _VALID_TYPES = frozenset(
 #                               makes each frame self-describing.
 #   dtype            str
 #
+# OPTIONAL slab fields -- only once an ACK has advertised "slabs" in its
+# `features`. The FRAME then carries planes [z0, z0 + shape_zyx[0]) of
+# volume (t, c) rather than the whole volume, so a volume streams while it
+# is still being acquired:
+#
+#   z0               int    -- first plane of this slab
+#   nz               int    -- the whole volume's plane count
+#   shape_zyx        [int, int, int]  -- THIS slab's shape
+#
+# Each slab has its own frame_index. The receiver ACKs a volume's slabs
+# only once every plane of it has landed, so after a receiver restart the
+# client resends the whole partial volume.
+#
 # OPTIONAL latency-trace fields (opym.stream.trace; all epoch seconds on the
 # CLIENT's clock). The receiver records them as sent; opym-live-trace
 # converts them to server time by adding clock_offset_s:
@@ -148,6 +161,8 @@ _VALID_TYPES = frozenset(
 #                               yet for this session. The client's local
 #                               retry buffer only needs to keep frames with
 #                               frame_index > through_frame_index.
+#   features         [str]  -- OPTIONAL, what this receiver supports beyond
+#                               the base protocol. Only "slabs" is defined.
 #   server_time_s        float -- OPTIONAL, the server's epoch seconds when
 #                               it sent this ACK; lets a client estimate the
 #                               clock offset for the trace fields above.
