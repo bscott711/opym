@@ -123,6 +123,18 @@ _VALID_TYPES = frozenset(
 #                               makes each frame self-describing.
 #   dtype            str
 #
+# OPTIONAL latency-trace fields (opym.stream.trace; all epoch seconds on the
+# CLIENT's clock). The receiver records them as sent; opym-live-trace
+# converts them to server time by adding clock_offset_s:
+#
+#   acq_first_s      float  -- first plane of this volume acquired
+#   acq_last_s       float  -- last plane acquired (volume complete)
+#   queued_s         float  -- volume handed to the sender
+#   sent_s           float  -- this FRAME handed to the socket
+#   clock_offset_s   float  -- server clock minus client clock, measured by
+#                               the client from SESSION_START -> first ACK
+#                               (server_time_s at the round trip's midpoint)
+#
 # --- SESSION_END header fields -------------------------------------------
 #
 #   reason           str    -- "complete" | "idle_timeout" | "client_abort"
@@ -136,6 +148,9 @@ _VALID_TYPES = frozenset(
 #                               yet for this session. The client's local
 #                               retry buffer only needs to keep frames with
 #                               frame_index > through_frame_index.
+#   server_time_s        float -- OPTIONAL, the server's epoch seconds when
+#                               it sent this ACK; lets a client estimate the
+#                               clock offset for the trace fields above.
 #
 # --- RESUME header fields (client -> server, right after reconnecting) ---
 #

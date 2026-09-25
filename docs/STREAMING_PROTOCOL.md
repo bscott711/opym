@@ -184,6 +184,14 @@ along for logging/debugging only — see the multi-camera note above:
 `c` (matched against `SESSION_START`'s `channels`) is what actually
 identifies which camera+excitation this volume belongs to.
 
+Optional latency-trace fields, all epoch seconds on the client's own clock:
+`acq_first_s` / `acq_last_s` (first / last plane of the volume acquired),
+`queued_s` (handed to the sender), `sent_s` (handed to the socket) and
+`clock_offset_s` (server minus client clock, estimated from the round trip
+of `SESSION_START` and the first `ACK`'s `server_time_s`). The receiver
+records them in `profiling/live_trace.jsonl`; `opym-live-trace` turns them
+into per-hop latencies, including the time on the wire.
+
 ### 3. `SESSION_END`
 
 ```python
@@ -204,8 +212,11 @@ Globus-landed acquisition already is (`channel_store_timepoints` in
 ### 4. `ACK` — server -> client, unsolicited, not per-frame
 
 ```python
-header = {"through_frame_index": 33}
+header = {"through_frame_index": 33, "server_time_s": 1755000000.456}
 ```
+
+`server_time_s` (the server's clock when it sent the ACK) is informational:
+clients use it only to estimate their clock offset for the trace fields.
 
 Sent periodically (every ~10 frames or ~2s, whichever first) once frames up
 to `through_frame_index` are durably written into their channel's raw mirror

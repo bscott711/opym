@@ -65,7 +65,7 @@ from opym.decon_config import (
     dsr_dir_name_for,
 )
 from opym.petakit import submit_live_frames_job
-from opym.stream import qcproj
+from opym.stream import qcproj, trace
 from opym.utils import resolve_output_base
 
 logger = logging.getLogger(__name__)
@@ -394,11 +394,26 @@ class LiveLane:
             **deskew_decon_kwargs(self.psf),
         )
         session.tickets[ticket.name] = _Ticket(ticket.name, list(timepoints), attempt)
+        trace.record(
+            "ticket",
+            jobs=self._jobs,
+            session_id=session.session_id,
+            ticket=ticket.name,
+            timepoints=list(timepoints),
+            attempt=attempt,
+        )
 
     def _reap(self, session: LiveSession) -> None:
         for name, ticket in list(session.tickets.items()):
             if (self.jobs / "completed" / name).exists():
                 del session.tickets[name]
+                trace.record(
+                    "ticket_done",
+                    jobs=self._jobs,
+                    session_id=session.session_id,
+                    ticket=name,
+                    timepoints=ticket.timepoints,
+                )
                 if session.superseded:
                     continue
                 for t in ticket.timepoints:
@@ -523,6 +538,10 @@ class LiveLane:
                 session.first_done_at = self._clock()
             self._write_status(session, "running")
             self._write_viewer_progress(session, "running")
+            # The viewer can show t from here: its progress file lists it.
+            trace.record(
+                "view_ready", jobs=self._jobs, session_id=session.session_id, t=t
+            )
 
     def _finalize(self, session: LiveSession) -> None:
         if session.superseded:
