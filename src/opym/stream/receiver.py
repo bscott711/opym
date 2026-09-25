@@ -63,7 +63,7 @@ import zmq
 
 from opym import lanes
 from opym.decon_config import resolve_decon_psf
-from opym.stream import drain, live, rawmirror
+from opym.stream import drain, live, rawmirror, trace
 from opym.stream.live import LiveLane
 from opym.stream.protocol import (
     MSG_ACK,
@@ -583,6 +583,7 @@ class StreamReceiver:
             )
             return
 
+        recv_s = time.time()
         session.last_activity = time.monotonic()
         t, c, frame_index = header["t"], header["c"], header["frame_index"]
 
@@ -601,6 +602,7 @@ class StreamReceiver:
                     )
                     return
                 session.received_pairs.add((t, c))
+                _trace_frame(session, header, len(payload), recv_s)
             else:
                 logger.debug(
                     "Duplicate frame (t=%d, c=%d) for session %s already staged "
@@ -695,7 +697,10 @@ class StreamReceiver:
             session.ack_floor += 1
 
     def _send_ack(self, session: SessionState) -> None:
-        header = {"through_frame_index": session.ack_floor}
+        header = {
+            "through_frame_index": session.ack_floor,
+            "server_time_s": time.time(),
+        }
         self._socket.send_multipart(
             [session.identity, *pack_message(MSG_ACK, session.session_id, header)]
         )
@@ -843,7 +848,11 @@ class StreamReceiver:
             self._socket.send_multipart(
                 [
                     identity,
-                    *pack_message(MSG_ACK, session_id, {"through_frame_index": -1}),
+                    *pack_message(
+                        MSG_ACK,
+                        session_id,
+                        {"through_frame_index": -1, "server_time_s": time.time()},
+                    ),
                 ]
             )
             return
@@ -871,6 +880,36 @@ class StreamReceiver:
         for session in list(self.sessions.values()):
             if now - session.last_activity >= self.idle_timeout_sec:
                 self._finalize_session(session, reason="idle_timeout")
+
+
+# Client-clock times a FRAME header may carry (see protocol.py), traced as
+# sent; the report converts them with the frame's clock_offset_s.
+_CLIENT_TIME_FIELDS = (
+    "acq_first_s",
+    "acq_last_s",
+    "queued_s",
+    "sent_s",
+    "clock_offset_s",
+)
+
+
+def _trace_frame(
+    session: SessionState, header: dict[str, Any], nbytes: int, recv_s: float
+) -> None:
+    """One `frame` trace line per newly staged (t, c): when its FRAME was
+    received and when staging finished, plus the client's own timestamps."""
+    trace.record(
+        "frame",
+        session_id=session.session_id,
+        base_name=session.base_name,
+        t=header["t"],
+        c=header["c"],
+        cidx=session.channel_cidx.get(header["c"]),
+        bytes=nbytes,
+        recv_s=recv_s,
+        staged_s=time.time(),
+        **{k: header[k] for k in _CLIENT_TIME_FIELDS if k in header},
+    )
 
 
 def _stage_stats(values: list[float]) -> dict[str, float | None]:

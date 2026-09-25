@@ -40,6 +40,7 @@ from pathlib import Path
 
 from opym import lanes
 from opym.ome_zarr_writer import complete_timepoints, read_progress
+from opym.stream import trace
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +212,20 @@ class QCOverlay:
 class LiveFollower:
     """Keeps a napari viewer's layers in step with a growing store."""
 
-    def __init__(self, viewer, store: Path, *, follow: bool = True) -> None:
+    def __init__(
+        self,
+        viewer,
+        store: Path,
+        *,
+        follow: bool = True,
+        session_id: str | None = None,
+        jobs: Path | None = None,
+    ) -> None:
         self.viewer = viewer
         self.store = Path(store)
         self.follow = follow
+        self.session_id = session_id
+        self.jobs = jobs
         self.name = self.store.name.removesuffix("_dsr.ome.zarr").removesuffix(
             ".ome.zarr"
         )
@@ -294,6 +305,7 @@ class LiveFollower:
         added successfully (so a construction failure never leaves the
         viewer blank), carrying over whatever contrast_limits was showing.
         """
+        seen_s = time.time()
         progress = read_progress(self.store)
         self._status = status_text(self.name, progress)
         self.qc.poll()
@@ -326,6 +338,17 @@ class LiveFollower:
             self._set_contrast(done[0])
         if self.follow and new:
             self.viewer.dims.set_current_step(0, max(new))
+        # Layers are built and the step set; Qt paints once this returns.
+        trace.record(
+            "shown",
+            name=trace.VIEW_TRACE_NAME,
+            jobs=self.jobs,
+            session_id=self.session_id,
+            store=str(self.store),
+            timepoints=new,
+            seen_s=seen_s,
+            build_s=time.time() - seen_s,
+        )
 
     def _set_contrast(self, t: int) -> None:
         """From the coarsest level of the first real timepoint (the empty
@@ -393,7 +416,13 @@ class SessionWatcher:
         """
         old_layers = list(self.viewer.layers)
         try:
-            follower = LiveFollower(self.viewer, store, follow=self.follow)
+            follower = LiveFollower(
+                self.viewer,
+                store,
+                follow=self.follow,
+                session_id=session_id,
+                jobs=self.jobs,
+            )
         except (OSError, KeyError, ValueError) as exc:
             logger.debug("naparym-live: %s not ready yet (%r); retrying", store, exc)
             self.viewer.text_overlay.text = (

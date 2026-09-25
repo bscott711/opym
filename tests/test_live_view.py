@@ -331,3 +331,25 @@ def test_resolve_store_no_argument_is_a_one_shot_check_not_a_wait(tmp_path):
 def test_resolve_store_bad_explicit_path_fails_immediately():
     with pytest.raises(FileNotFoundError, match="No \\*_dsr.ome.zarr store"):
         live_view.resolve_store("/nonexistent/path/typo")
+
+
+def test_follower_traces_each_newly_shown_timepoint(tmp_path):
+    """opym-live-trace's last hop: when naparym-live built the layers for t."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    from opym.stream import trace
+
+    jobs = tmp_path / "jobs"
+    store = _store(tmp_path)
+    _write_latest(jobs, store, "sess-v")
+    watcher = live_view.SessionWatcher(ViewerModel(), jobs=jobs)
+    watcher.poll()
+    done: list = []
+    _finish(store, 0, done)
+    watcher.poll()
+    watcher.poll()  # nothing new: no second event
+    [shown] = trace.read(trace.VIEW_TRACE_NAME, jobs=jobs)
+    assert shown["ev"] == "shown" and shown["session_id"] == "sess-v"
+    assert shown["timepoints"] == [0]
+    assert shown["build_s"] >= 0 and shown["seen_s"] <= shown["at"]
