@@ -34,9 +34,10 @@ MSG_FRAME = b"FRAME"
 MSG_SESSION_END = b"SESSION_END"
 MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
+MSG_QC = b"QC"
 
 _VALID_TYPES = frozenset(
-    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME}
+    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME, MSG_QC}
 )
 
 # --- SESSION_START header fields ---------------------------------------
@@ -86,6 +87,10 @@ _VALID_TYPES = frozenset(
 #                               each raw store's .zattrs["opym"]; an unknown
 #                               value is logged and ignored. Omitted -> the
 #                               backfill's OPYM_OUTPUT_FORMAT default.
+#   accepts          [str]  -- OPTIONAL server->client message types this
+#                               client understands beyond ACK. Only "qc" is
+#                               defined (MSG_QC below). A client that omits
+#                               it is never sent anything but ACKs.
 #
 # Decon parameters (PSF, wiener_alpha, edge_erosion, rl_method) are NOT
 # part of this handshake -- they're resolved server-side by the batch
@@ -136,6 +141,27 @@ _VALID_TYPES = frozenset(
 #
 #   (none required -- session_id in the envelope is enough; the server
 #   replies with a fresh ACK for that session_id)
+#
+# --- QC header fields (server -> client, only if SESSION_START accepts "qc") --
+#
+# The live QC service's verdict on one timepoint, forwarded as written
+# (header only, at most one per new verdict). Advisory: the client shows it;
+# nothing on the server waits for a reply. Core fields:
+#
+#   seq              int    -- increases with every verdict in the session
+#   session_id       str
+#   t                int    -- timepoint judged
+#   stage            str    -- "raw" (from the raw frames, ~1 s after they
+#                               land) or "dsr" (from the deskewed volume,
+#                               adds the cell's bounding box)
+#   verdict          str    -- "ok" | "warn" | "act" | "no_cell"
+#   flags            [str]  -- e.g. "clipped_depth_high", "drift_exit_soon",
+#                               "defocus", "bleaching"
+#   advice           [dict] -- {"action", "axis", "direction", "amount_um",
+#                               "when": "now" | "next_run", "text"}
+#   metrics          dict   -- per-channel numbers behind the verdict
+#
+# Clients must ignore fields they don't know; new ones may be added.
 
 
 def pack_message(

@@ -226,6 +226,36 @@ the receiver process itself restarted; session state isn't persisted to
 disk in v1). Resend everything in your local buffer with
 `frame_index > through_frame_index`, in order.
 
+### 6. `QC` — server -> client, only if the client asked for it
+
+Opt in by adding `"accepts": ["qc"]` to `SESSION_START`. A client that doesn't
+list it is never sent anything but `ACK`, so older clients are unaffected
+(the reference `unpack_message` rejects message types it doesn't know).
+
+```python
+header = {
+    "seq": 41, "session_id": "...", "t": 20, "stage": "raw",
+    "verdict": "act",                       # ok | warn | act | no_cell
+    "flags": ["clipped_depth_high", "drift_exit_soon"],
+    "advice": [{"action": "focus_offset", "axis": "depth", "direction": "+",
+                "amount_um": 3.0, "when": "now", "text": "..."}],
+    "metrics": {...},
+}
+```
+
+One message per new verdict from the live QC service (CORE's `celldet-live-qc`),
+forwarded unchanged. It is advisory: the server does not wait for a reply.
+There are two verdicts per timepoint. `stage: "raw"` arrives about a second
+after the timepoint's frames land and covers coverage, drift, focus and signal.
+`stage: "dsr"` follows the deskewed volume and adds the cell's bounding box.
+Ignore fields you don't recognize.
+
+Where it comes from: with `OPYM_LIVE_QC=1` the live lane writes projections of
+every raw frame to `<leaf>/qc/rawproj/<base>_C<c>_T<ttt>.npz`
+(`opym.stream.qcproj`). The QC service reads those and writes
+`<leaf>/qc/live_qc.jsonl` (every verdict) and `<leaf>/qc/qc_latest.json` (the
+newest). The receiver forwards the newest one.
+
 ## Worked example (client-side pseudocode)
 
 ```python

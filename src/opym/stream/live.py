@@ -31,6 +31,12 @@ Per session:
   submitting a batch deskew: complete + matching provenance means done,
   running + fresh means wait, and anything else means reprocess in batch.
   Registry writes stay in the backfill.
+- QC sidecars (OPYM_LIVE_QC=1). Each staged raw frame's projections are
+  written to `<leaf>/qc/rawproj/` on a one-thread pool of their own (see
+  opym.stream.qcproj) for the live QC service, which writes its verdicts
+  back into `<leaf>/qc/`. The receiver forwards the latest one to clients
+  that asked for it. QC never holds up decon: when the pool falls behind,
+  frames are skipped.
 
 The lane creates the dataset's GPFS leaf directory itself, before anything
 else writes there. `opym.utils.resolve_output_base` treats a leaf directory
@@ -59,6 +65,7 @@ from opym.decon_config import (
     dsr_dir_name_for,
 )
 from opym.petakit import submit_live_frames_job
+from opym.stream import qcproj
 from opym.utils import resolve_output_base
 
 logger = logging.getLogger(__name__)
@@ -70,6 +77,9 @@ LIVE_LATEST_NAME = "live_latest.json"
 LIVE_STATUS_STALE_S = 300.0
 HEARTBEAT_S = 30.0
 MAX_ATTEMPTS = 2
+QC_LATEST_NAME = "qc_latest.json"
+# Raw volumes waiting for projection (~150 MB each at production size).
+MAX_QC_PENDING = 4
 
 
 def live_dsr_dir(dest_leaf: Path, psf: Path) -> Path:
@@ -86,6 +96,11 @@ def live_viewer_store(dest_leaf: Path) -> Path:
     export writes it (`resolve_output_base(leaf)/viewer/<leaf name>_dsr...`)."""
     dest_leaf = Path(dest_leaf)
     return resolve_output_base(dest_leaf) / "viewer" / f"{dest_leaf.name}_dsr.ome.zarr"
+
+
+def live_qc_dir(dest_leaf: Path) -> Path:
+    """Live QC output for a streamed dataset, next to its `viewer/` store."""
+    return resolve_output_base(Path(dest_leaf)) / "qc"
 
 
 def channel_label(name: str) -> str:
@@ -127,6 +142,7 @@ class LiveSession:
     z_step_um: float
     zarr_path: Path  # napari store on GPFS
     channel_labels: list[str]
+    qc_dir: Path  # <leaf>/qc on GPFS: raw projections in, QC verdicts out
     staged: dict[int, set[int]] = field(default_factory=dict)  # t -> cidx staged
     ready: list[int] = field(default_factory=list)
     tickets: dict[str, _Ticket] = field(default_factory=dict)
@@ -177,6 +193,7 @@ class LiveLane:
         max_outstanding: int = 4,
         max_batch: int = 8,
         copy_workers: int = 2,
+        qc: bool | None = None,
         clock=time.time,
     ) -> None:
         self.psf = Path(psf)
@@ -189,6 +206,11 @@ class LiveLane:
         self._pool = ThreadPoolExecutor(
             max_workers=copy_workers, thread_name_prefix="OpymLiveCopy"
         )
+        self.qc = qcproj.live_qc_enabled() if qc is None else qc
+        self._qc_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="OpymLiveQC"
+        )
+        self._qc_pending = 0
 
     @property
     def jobs(self) -> Path:
@@ -196,6 +218,7 @@ class LiveLane:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
+        self._qc_pool.shutdown(wait=True)
 
     def busy(self) -> bool:
         return bool(self.sessions)
@@ -233,6 +256,7 @@ class LiveLane:
             z_step_um=z_step_um,
             zarr_path=live_viewer_store(Path(dest_leaf)),
             channel_labels=list(channel_labels or [f"C{c}" for c in range(n_channels)]),
+            qc_dir=live_qc_dir(Path(dest_leaf)),
         )
         for other in self.sessions.values():
             if other.dsr_dir == session.dsr_dir and not other.superseded:
@@ -250,7 +274,8 @@ class LiveLane:
         )
         return session
 
-    def frame_staged(self, session_id: str, t: int, cidx: int) -> None:
+    def frame_staged(self, session_id: str, t: int, cidx: int, raw=None) -> None:
+        """`raw` is the frame's (scan, tilted, cover) volume, for QC."""
         session = self.sessions.get(session_id)
         if session is None:
             return
@@ -260,6 +285,42 @@ class LiveLane:
         cs.add(cidx)
         if len(cs) == session.n_channels:
             session.ready.append(t)
+        if self.qc and raw is not None and not session.superseded:
+            self._submit_qc(session, t, cidx, raw)
+
+    # --- QC sidecars ----------------------------------------------------------
+
+    def _submit_qc(self, session: LiveSession, t: int, cidx: int, raw) -> None:
+        with self._lock:
+            if self._qc_pending >= MAX_QC_PENDING:
+                logger.warning(
+                    "Live QC: projection pool behind; skipping T=%d C=%d of %s",
+                    t,
+                    cidx,
+                    session.base_name,
+                )
+                return
+            self._qc_pending += 1
+        dst = (
+            session.qc_dir
+            / qcproj.RAWPROJ_DIR
+            / qcproj.sidecar_name(session.base_name, cidx, t)
+        )
+        fut = self._qc_pool.submit(
+            qcproj.write_sidecar, raw, dst, t=t, c=cidx, z_step_um=session.z_step_um
+        )
+        fut.add_done_callback(self._qc_done)
+
+    def _qc_done(self, fut: Future) -> None:
+        with self._lock:
+            self._qc_pending -= 1
+        exc = fut.exception()
+        if exc is not None:
+            logger.error("Live QC: projection sidecar failed: %r", exc)
+
+    def qc_latest_path(self, session_id: str) -> Path | None:
+        session = self.sessions.get(session_id)
+        return None if session is None else session.qc_dir / QC_LATEST_NAME
 
     def _supersede(self, session: LiveSession, *, by: str) -> None:
         """Same dataset re-acquired under the same name: the newer session
@@ -430,6 +491,11 @@ class LiveLane:
                         "store": str(session.zarr_path),
                         "dsr_dir": str(session.dsr_dir),
                         "started_at": session.started_at,
+                        "qc_dir": str(session.qc_dir) if self.qc else None,
+                        "num_timepoints": session.num_timepoints,
+                        "n_channels": session.n_channels,
+                        "channel_labels": session.channel_labels,
+                        "z_step_um": session.z_step_um,
                     }
                 )
             )
