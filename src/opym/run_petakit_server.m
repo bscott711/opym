@@ -170,8 +170,11 @@ while true
     [jobFiles, claim_dir] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
 
     if isempty(jobFiles)
-        pause(2);
-        idleTimer = idleTimer + 2;
+        % Short poll: a live ticket waiting here is time the live view is
+        % behind (up to 2 s per timepoint with the old 2 s pause). dir() on
+        % the tmpfs queue is cheap.
+        pause(0.1);
+        idleTimer = idleTimer + 0.1;
 
         if idleTimeoutSec > 0 && idleTimer >= idleTimeoutSec
             logMsg('[Server] Idle timeout (%d s) reached. Shutting down to release GPUs.', idleTimeoutSec);
@@ -201,7 +204,8 @@ while true
     prof = struct('ticket', currentFile, 'lane', claimLane, 'server_id', envServerId, ...
         'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
         'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
-        'decon_s', NaN, 'dsr_s', NaN, 'total_s', NaN, 'status', '', 'error', '');
+        'decon_s', NaN, 'dsr_s', NaN, 'read_s', NaN, 'write_s', NaN, ...
+        'total_s', NaN, 'status', '', 'error', '');
     % Defined before the try: the catch block reads it, and a ticket that fails
     % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
     % an undefined-variable error from inside the catch and kill the server.
@@ -536,6 +540,18 @@ while true
                     'masterCompute', true, ...
                     'cpusPerTask', numCPUs ...
                 );
+
+            case 'live_zarr'
+                % One streamed (t, c) volume, raw OME-Zarr in -> processed
+                % OME-Zarr out, in memory (opym.stream.live's one-format
+                % path). See run_live_zarr.m.
+                logMsg('[Server] Live zarr: T=%d C=%d -> %s', p.t, p.c, char(p.levels(1)));
+                liveStats = run_live_zarr(p, numCPUs);
+                prof.n_input_tifs = liveStats.frames;
+                prof.read_s = liveStats.read_s;
+                prof.decon_s = liveStats.decon_s;
+                prof.dsr_s = liveStats.dsr_s;
+                prof.write_s = liveStats.write_s;
 
             case 'live'
                 % Streamed timepoints (opym.stream.live): decon -> DSR per

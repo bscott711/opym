@@ -436,14 +436,18 @@ def submit_remote_deskew_job(
         params["psf_path"] = resolved_psfs[0]
         if len(resolved_psfs) > 1:
             params["psf_paths"] = resolved_psfs
-        params["decon_iter"] = n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
+        params["decon_iter"] = (
+            n_iters if n_iters is not None else (2 if rl_method == "omw" else 25)
+        )
         params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
         if background is not None:
             params["background"] = float(background)
         if edge_erosion is not None:
             params["edge_erosion"] = int(edge_erosion)
-        _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
+        _apply_omw_params(
+            params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor
+        )
 
     payload = {
         "jobType": "deskew",
@@ -453,6 +457,87 @@ def submit_remote_deskew_job(
     }
 
     return _write_ticket(payload, base_name, "DESKEW", queue_dir)
+
+
+def submit_live_zarr_job(
+    raw_store: str | Path,
+    t: int,
+    c: int,
+    *,
+    mask_store: str | Path,
+    levels: list[str | Path],
+    mip: str | Path,
+    psf_path: str | Path,
+    decon_dir: Path,
+    z_step_um: float,
+    ticket_name: str,
+    queue_dir: Path,
+    xy_pixel_size: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+    interp_method: str = DSR_INTERP_METHOD,
+    reverse: bool = True,
+    rl_method: str = "omw",
+    n_iters: int | None = None,
+    gpu_decon: bool = True,
+    background: float | None = None,
+    edge_erosion: int | None = None,
+    wiener_alpha: float | None = None,
+    otf_cum_thresh: float | None = None,
+    hann_win_bounds: list[float] | None = None,
+    damp_factor: float | None = None,
+    dsr_dir_name: str = "DSR_decon",
+) -> Path:
+    """Queue a 'live_zarr' ticket: one (t, c) volume from its raw OME-Zarr
+    array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate in
+    memory, into the processed OME-Zarr's `levels` (full resolution first,
+    each (T, C, Z, Y, X)) and `mip` array (see run_live_zarr.m).
+
+    Every ticket of one acquisition must share `decon_dir` (generated PSF,
+    OMW back projector, the first-timepoint edge-erosion mask built from
+    `mask_store`, channel 0's raw array). The decon and DSR parameters and
+    their defaults are exactly `submit_live_frames_job`'s, whose TIFF path
+    this reproduces bit for bit. `dsr_dir_name` is accepted (and ignored) so
+    the same `deskew_decon_kwargs` feed both.
+    """
+    rl_method = _normalize_rl_method(rl_method)
+    params = {
+        "raw_store": str(raw_store),
+        "t": int(t),
+        "c": int(c),
+        "mask_store": str(mask_store),
+        "levels": [str(p) for p in levels],
+        "mip": str(mip),
+        "psf_path": str(psf_path),
+        "decon_dir": str(decon_dir),
+        "interp_method": interp_method,
+        "xy_pixel_size": xy_pixel_size,
+        "z_step_um": z_step_um,
+        "sheet_angle_deg": sheet_angle_deg,
+        "reverse": reverse,
+        "objective_scan": False,
+        "z_stage_scan": False,
+        "rl_method": rl_method,
+        "decon_iter": n_iters
+        if n_iters is not None
+        else (2 if rl_method == "omw" else 25),
+        "gpu_decon": gpu_decon,
+    }
+    if background is not None:
+        params["background"] = float(background)
+    if edge_erosion is not None:
+        params["edge_erosion"] = int(edge_erosion)
+    _apply_omw_params(
+        params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor
+    )
+    payload = {
+        "jobType": "live_zarr",
+        # The supervisor's hang check watches this directory for new files.
+        "dataDir": str(decon_dir),
+        "baseName": ticket_name,
+        "parameters": params,
+    }
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    return _write_ticket(payload, ticket_name, "LIVE", queue_dir)
 
 
 def submit_live_frames_job(
@@ -514,14 +599,18 @@ def submit_live_frames_job(
         "objective_scan": False,
         "z_stage_scan": False,
         "rl_method": rl_method,
-        "decon_iter": n_iters if n_iters is not None else (2 if rl_method == "omw" else 25),
+        "decon_iter": n_iters
+        if n_iters is not None
+        else (2 if rl_method == "omw" else 25),
         "gpu_decon": gpu_decon,
     }
     if background is not None:
         params["background"] = float(background)
     if edge_erosion is not None:
         params["edge_erosion"] = int(edge_erosion)
-    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
+    _apply_omw_params(
+        params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor
+    )
     payload = {
         "jobType": "live",
         # The supervisor's hang check watches this directory for new files.
@@ -603,13 +692,17 @@ def submit_remote_decon_job(
     params = {
         "psf_paths": resolved_psfs,
         "result_dir_name": result_dir_name,
-        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
+        "iterations": iterations
+        if iterations is not None
+        else (2 if rl_method == "omw" else 25),
         "gpu_job": gpu_job,
         "skewed": skewed,
         "rl_method": rl_method,
         "save_16bit": True,
     }
-    _apply_omw_params(params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor)
+    _apply_omw_params(
+        params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor
+    )
 
     if xy_pixel_size is not None:
         params["xy_pixel_size"] = float(xy_pixel_size)
@@ -719,7 +812,9 @@ def submit_pipeline_job(
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
         "interp_method": interp_method,
-        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
+        "iterations": iterations
+        if iterations is not None
+        else (2 if rl_method == "omw" else 25),
         "rl_method": rl_method,
         "save_zarr": save_zarr,
         "debug": debug,
@@ -799,7 +894,8 @@ def submit_pipeline_batch_job(
             )
 
     resolved_items = [
-        {"shm_path": str(item["shm_path"]), "output_file": str(item["output_file"])} for item in items
+        {"shm_path": str(item["shm_path"]), "output_file": str(item["output_file"])}
+        for item in items
     ]
 
     rl_method = _normalize_rl_method(rl_method)
@@ -809,7 +905,9 @@ def submit_pipeline_batch_job(
         "z_step_um": z_step_um,
         "sheet_angle_deg": sheet_angle_deg,
         "interp_method": interp_method,
-        "iterations": iterations if iterations is not None else (2 if rl_method == "omw" else 25),
+        "iterations": iterations
+        if iterations is not None
+        else (2 if rl_method == "omw" else 25),
         "rl_method": rl_method,
         "save_zarr": save_zarr,
         "debug": debug,
@@ -889,7 +987,10 @@ def _submitter_revision() -> str:
         repo_dir = str(Path(__file__).resolve().parent)
         rev = subprocess.run(
             ["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5, check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
         ).stdout.strip()
         return rev or "unknown"
     except Exception:
