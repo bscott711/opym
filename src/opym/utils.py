@@ -242,7 +242,13 @@ def dsr_shape_zyx(
     out_y = ny
     out_x = (nx - 1) * math.cos(theta) + (nz - 1) * z_aniso / math.sin(abs(theta))
     out_z = (nx - 1) * math.sin(abs(theta)) - 4
-    return (_matlab_round(out_z), _matlab_round(out_y), _matlab_round(out_x))
+    shape = (_matlab_round(out_z), _matlab_round(out_y), _matlab_round(out_x))
+    if min(shape) < 1:
+        raise ValueError(
+            f"A raw {tuple(raw_shape_zyx)} volume deskews to {shape}: too few "
+            "rows along the tilted axis for PetaKit5D's crop"
+        )
+    return shape
 
 
 def write_decon_staged_tiff(volume_zyx: np.ndarray, dst: Path) -> None:
