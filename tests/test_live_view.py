@@ -91,3 +91,67 @@ def test_follower_tracks_new_timepoints(tmp_path):
     follower.poll()
     assert viewer.dims.current_step[0] == 1
     assert viewer.text_overlay.text.endswith("complete")
+
+
+def _qc_line(path, rec):
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def test_box_edges_make_a_closed_box():
+    edges = live_view.box_edges(3, 0, 0, 0, 2, 4, 6)
+    assert len(edges) == 12
+    assert all(e.shape == (2, 4) and (e[:, 0] == 3).all() for e in edges)
+
+
+def test_qc_boxes_and_verdicts_follow_the_log(tmp_path):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    resize_dask_cache(0)
+    store = _store(tmp_path)
+    done: list = []
+    _finish(store, 0, done)
+    qc = live_view.qc_dir_for(store)
+    assert qc == tmp_path / "Cell_005" / "qc"
+    qc.mkdir()
+    log = qc / "live_qc.jsonl"
+    _qc_line(log, {"stage": "session", "session_id": "s1"})
+    _qc_line(log, {"session_id": "other", "t": 0, "stage": "raw", "verdict": "ok"})
+    raw = {
+        "session_id": "s1",
+        "t": 0,
+        "stage": "raw",
+        "verdict": "act",
+        "flags": ["clipped_scan_high"],
+        "advice": [{"text": "Shift the scan window."}],
+    }
+    _qc_line(log, raw)
+    box = {"found": True, "bbox_zyx": [1, 2, 3, 6, 10, 9]}
+    _qc_line(log, {"session_id": "s1", "t": 0, "stage": "dsr", "boxes": {"GFP": box}})
+
+    viewer = ViewerModel()
+    follower = live_view.LiveFollower(viewer, store)
+    layer = follower.qc.layer
+    assert layer is not None and layer.nshapes == 12
+    assert list(layer.scale) == list(follower.layers[0].scale)
+    np.testing.assert_allclose(layer.edge_color[0], [1, 0, 0, 1])  # act -> red
+    assert (
+        "act" in viewer.text_overlay.text
+        and "Shift the scan" in viewer.text_overlay.text
+    )
+
+    # A half-written line is left for the next poll.
+    with open(log, "a") as f:
+        f.write('{"session_id": "s1", "t": 1, "stage": "raw", "verdict": "ok"')
+    follower.poll()
+    assert 1 not in follower.qc.raw
+    with open(log, "a") as f:
+        f.write("}\n")
+    _qc_line(log, {"session_id": "s1", "t": 1, "stage": "dsr", "boxes": {"GFP": box}})
+    _finish(store, 1, done)
+    follower.poll()
+    assert layer.nshapes == 24
+    np.testing.assert_allclose(layer.edge_color[-1], [0, 1, 0, 1])  # ok -> lime
+    assert "t=1: ok" in viewer.text_overlay.text
