@@ -40,6 +40,11 @@ verifies it byte-for-byte, and only then makes it visible there -- see
 the current `opym-receive.service` use), this module behaves exactly as
 before: every write goes straight to `raw_root`, synchronously, no staging,
 no drain, no behavior change at all.
+
+Live QC (`MSG_QC`): a client that lists "qc" in SESSION_START's `accepts`
+is sent each new verdict the live QC service writes for its session
+(`<leaf>/qc/qc_latest.json`, see `opym.stream.live`), header only. Clients
+that don't ask never see the message type.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ from opym.stream.live import LiveLane
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
@@ -78,6 +84,7 @@ ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
 POLL_TIMEOUT_MS = 500
+QC_CHECK_SEC = 0.5
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
 # thousand earlier acquisitions under one name means something is wrong
 # with naming, not a genuine collision; reject the session and say so.
@@ -207,6 +214,11 @@ class SessionState:
     # stays under the acquisition interval.
     live: bool = False
     """Processed timepoint by timepoint by the live lane (opym.stream.live)."""
+    accepts_qc: bool = False
+    """The client listed "qc" in SESSION_START's `accepts`: forward MSG_QC."""
+    qc_seq_sent: int = -1
+    qc_mtime: float = 0.0
+    qc_checked_at: float = 0.0
     stage_raw_s: list[float] = field(default_factory=list)
     stage_tiff_s: list[float] = field(default_factory=list)
     staged_bytes: int = 0
@@ -325,6 +337,7 @@ class StreamReceiver:
         # goes stale (and frees the GPUs) within a minute if we crash.
         if self._live is not None:
             self._live.pump()
+            self._forward_qc()
         # The lease also covers live work still in flight after SESSION_END.
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
@@ -430,6 +443,7 @@ class StreamReceiver:
                 z_step_um=header["z_step_um"],
                 decon_enabled=_decon_enabled(),
                 output_format=_requested_output_format(header, session_id),
+                accepts_qc="qc" in (header.get("accepts") or ()),
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
@@ -636,7 +650,9 @@ class StreamReceiver:
             dst.parent.mkdir(parents=True, exist_ok=True)
             write_decon_staged_tiff(raw, dst)
             if session.live:
-                self._live.frame_staged(session.session_id, t, session.channel_cidx[c])
+                self._live.frame_staged(
+                    session.session_id, t, session.channel_cidx[c], raw=raw
+                )
         session.stage_raw_s.append(t_raw - t_start)
         session.stage_tiff_s.append(time.perf_counter() - t_raw)
         session.staged_bytes += raw.nbytes
@@ -671,6 +687,34 @@ class StreamReceiver:
         )
         session.frames_since_ack = 0
         session.last_ack_time = time.monotonic()
+
+    def _forward_qc(self) -> None:
+        """Send each open session's newest QC verdict to its client, once."""
+        now = time.monotonic()
+        for session in self.sessions.values():
+            if not (session.accepts_qc and session.live) or session.ended:
+                continue
+            if now - session.qc_checked_at < QC_CHECK_SEC:
+                continue
+            session.qc_checked_at = now
+            path = self._live.qc_latest_path(session.session_id)
+            try:
+                mtime = path.stat().st_mtime
+                if mtime == session.qc_mtime:
+                    continue
+                record = json.loads(path.read_text())
+            except (AttributeError, OSError, ValueError):
+                continue
+            session.qc_mtime = mtime
+            seq = record.get("seq", -1)
+            if record.get("session_id") != session.session_id:
+                continue
+            if not isinstance(seq, int) or seq <= session.qc_seq_sent:
+                continue
+            self._socket.send_multipart(
+                [session.identity, *pack_message(MSG_QC, session.session_id, record)]
+            )
+            session.qc_seq_sent = seq
 
     def _handle_session_end(self, session_id: str, header: dict[str, Any]) -> None:
         session = self.sessions.get(session_id)

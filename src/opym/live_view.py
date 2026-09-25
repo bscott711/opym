@@ -14,6 +14,11 @@ Any finished dataset's `viewer/*_dsr.ome.zarr` opens the same way.
 
 napari's dask cache is turned off: it would keep serving the zeros read from
 a timepoint before it was written.
+
+Live QC: when the dataset has `<leaf>/qc/live_qc.jsonl` (CORE's
+`celldet-live-qc`), each timepoint's cell box is drawn as a wireframe coloured
+by its verdict (green ok, orange warn, red act), and the status line adds the
+verdict, flags and first piece of advice for the timepoint on screen.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ from opym import lanes
 from opym.ome_zarr_writer import complete_timepoints, read_progress
 
 POLL_S = 2.0
+QC_LOG_NAME = "live_qc.jsonl"
+QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
 # omero hex colour -> napari colormap name (see ome_zarr_writer.CHANNEL_COLORS).
 _COLORMAPS = {"00FF00": "green", "FF3D3D": "red", "00B3FF": "cyan", "FFC400": "yellow"}
 
@@ -64,6 +71,118 @@ def status_text(name: str, progress: dict | None, now: float | None = None) -> s
         )
         text += f" · newest t={done[-1]}, updated {age:.0f}s ago"
     return text
+
+
+def qc_dir_for(store: Path) -> Path:
+    """`<leaf>/viewer/<name>_dsr.ome.zarr` -> `<leaf>/qc` (opym.stream.live)."""
+    return Path(store).parent.parent / "qc"
+
+
+def box_edges(t: int, z0, y0, x0, z1, y1, x1) -> list:
+    """The 12 edges of a box as (2, 4) (t, z, y, x) paths."""
+    import numpy as np
+
+    corners = [(z, y, x) for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)]
+    edges = []
+    for i, a in enumerate(corners):
+        for b in corners[i + 1 :]:
+            if sum(u != v for u, v in zip(a, b, strict=True)) == 1:
+                edges.append(np.array([[t, *a], [t, *b]], dtype=float))
+    return edges
+
+
+def qc_summary(rec: dict | None) -> str:
+    if not rec:
+        return ""
+    text = f"QC t={rec['t']}: {rec['verdict']}"
+    if rec.get("flags"):
+        text += " · " + ", ".join(rec["flags"])
+    advice = rec.get("advice") or []
+    if advice:
+        text += "\n" + advice[0]["text"]
+    return text
+
+
+class QCOverlay:
+    """Reads the live QC log as it grows and draws each timepoint's box."""
+
+    def __init__(self, viewer, qc_dir: Path, scale, n_z: int) -> None:
+        self.viewer = viewer
+        self.path = Path(qc_dir) / QC_LOG_NAME
+        self.scale = list(scale)
+        self.n_z = n_z
+        self.offset = 0
+        self.session: str | None = None
+        self.raw: dict[int, dict] = {}
+        self.boxed: set[int] = set()
+        self.layer = None
+
+    def _reset(self, session: str | None) -> None:
+        self.session = session
+        self.raw.clear()
+        self.boxed.clear()
+        if self.layer is not None:
+            self.layer.data = []
+
+    def poll(self) -> bool:
+        """Read new complete lines; True if anything changed."""
+        try:
+            with open(self.path) as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return False
+        end = chunk.rfind("\n")
+        if end < 0:
+            return False
+        self.offset += len(chunk[: end + 1].encode())
+        changed = False
+        for line in chunk[:end].splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("stage") == "session":
+                if rec.get("session_id") != self.session:
+                    self._reset(rec.get("session_id"))
+                    changed = True
+                continue
+            if self.session is not None and rec.get("session_id") != self.session:
+                continue
+            if rec.get("stage") == "raw":
+                self.raw[rec["t"]] = rec
+                changed = True
+            elif rec.get("stage") == "dsr" and rec["t"] not in self.boxed:
+                changed |= self._add_box(rec)
+        return changed
+
+    def _add_box(self, rec: dict) -> bool:
+        found = [b["bbox_zyx"] for b in rec.get("boxes", {}).values() if b.get("found")]
+        if not found:
+            return False
+        lo = [min(b[i] for b in found if b[i] is not None) for i in (1, 2)]
+        hi = [max(b[i] for b in found if b[i] is not None) for i in (4, 5)]
+        zs = [b[i] for b in found for i in (0, 3) if b[i] is not None]
+        z0, z1 = (min(zs), max(zs)) if zs else (0, self.n_z - 1)
+        edges = box_edges(rec["t"], z0, lo[0], lo[1], z1, hi[0], hi[1])
+        color = QC_COLORS.get(self.raw.get(rec["t"], rec).get("verdict"), "white")
+        if self.layer is None:
+            self.layer = self.viewer.add_shapes(
+                edges,
+                shape_type="path",
+                edge_color=color,
+                edge_width=2,
+                scale=self.scale,
+                name="QC box",
+                ndim=4,
+            )
+        else:
+            self.layer.add_paths(edges, edge_color=color, edge_width=2)
+        self.boxed.add(rec["t"])
+        return True
+
+    def summary(self, t: int) -> str:
+        return qc_summary(self.raw.get(t))
 
 
 class LiveFollower:
@@ -107,12 +226,23 @@ class LiveFollower:
         self._levels = levels
         self._shown: list[int] = []
         self._contrast_set = False
+        self._status = ""
+        self.qc = QCOverlay(
+            viewer, qc_dir_for(self.store), [scale[0]] + scale[2:], levels[0].shape[2]
+        )
         viewer.text_overlay.visible = True
+        viewer.dims.events.current_step.connect(lambda _e: self._show_text())
         self.poll()
+
+    def _show_text(self) -> None:
+        qc = self.qc.summary(int(self.viewer.dims.current_step[0]))
+        self.viewer.text_overlay.text = self._status + (f"\n{qc}" if qc else "")
 
     def poll(self) -> None:
         progress = read_progress(self.store)
-        self.viewer.text_overlay.text = status_text(self.name, progress)
+        self._status = status_text(self.name, progress)
+        self.qc.poll()
+        self._show_text()
         done = complete_timepoints(progress)
         if done == self._shown:
             return
