@@ -33,11 +33,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 import time
 from pathlib import Path
 
 from opym import lanes
 from opym.ome_zarr_writer import complete_timepoints, read_progress
+
+logger = logging.getLogger(__name__)
+
+# napari's own layer-name uniquification suffix ("GFP 488" -> "GFP 488 [1]"),
+# stripped back off once the layer it collided with is gone -- see
+# SessionWatcher._switch.
+_NAPARI_DEDUP_SUFFIX = re.compile(r" \[\d+\]$")
 
 POLL_S = 2.0
 LIVE_LATEST_NAME = "live_latest.json"
@@ -320,10 +329,41 @@ class SessionWatcher:
             return None, None
 
     def _switch(self, store: Path, session_id: str | None) -> None:
-        for layer in list(self.viewer.layers):
+        """Try to switch to `store`. `live_latest.json` is written the
+        moment a session starts (SESSION_START), well before the first
+        timepoint's zarr group actually exists on disk -- that only happens
+        once its decon+DSR ticket finishes and copies out, which can be
+        several seconds later for a real acquisition (a quick test snap
+        never exposed this: its own first ticket usually finishes before the
+        next poll tick). So a not-yet-existing store here is normal, not an
+        error: build the new follower BEFORE touching any existing layers,
+        and if that fails because it isn't ready yet, leave everything
+        (`self.session_id` included) exactly as it was, so the next poll
+        naturally retries the same target instead of raising into napari's
+        event loop or leaving the viewer with no layers at all.
+        """
+        old_layers = list(self.viewer.layers)
+        try:
+            follower = LiveFollower(self.viewer, store, follow=self.follow)
+        except (OSError, KeyError, ValueError) as exc:
+            logger.debug("naparym-live: %s not ready yet (%r); retrying", store, exc)
+            self.viewer.text_overlay.text = (
+                f"naparym-live: session found, waiting for its first "
+                f"timepoint ({store.name})..."
+            )
+            return
+        for layer in old_layers:
             self.viewer.layers.remove(layer)
+        # The new follower's layers were added while the old ones (often the
+        # same channel names -- "GFP 488" showing up in nearly every
+        # acquisition) were still present, so napari auto-suffixed any
+        # collision ("GFP 488 [1]") to keep names unique at that instant.
+        # Now that the old ones are gone, that suffix no longer means
+        # anything -- restore the clean name.
+        for layer in follower.layers:
+            layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
         self.session_id = session_id
-        self.follower = LiveFollower(self.viewer, store, follow=self.follow)
+        self.follower = follower
         self.viewer.title = f"naparym-live: {store.name}"
 
     def poll(self) -> None:
