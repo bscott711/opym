@@ -113,6 +113,21 @@ class StreamSender:
         self._send_frame_wire(header, payload)
         self.drain_acks()
 
+    def send_slab(
+        self, header: dict[str, Any], volume: np.ndarray, z0: int, planes: int
+    ) -> None:
+        """Send planes `[z0, z0 + planes)` of `volume` as one slab FRAME (see
+        the receiver's module docstring). `header` is the volume's FRAME
+        header; its `frame_index` must be this slab's own."""
+        slab = np.ascontiguousarray(volume[z0 : z0 + planes])
+        slab_header = {
+            **header,
+            "z0": z0,
+            "nz": volume.shape[0],
+            "shape_zyx": list(slab.shape),
+        }
+        self.send_frame(slab_header, slab)
+
     def _send_frame_wire(self, header: dict[str, Any], payload: bytes) -> None:
         self._sock.send_multipart(
             pack_message(MSG_FRAME, self.session_id, header, payload)

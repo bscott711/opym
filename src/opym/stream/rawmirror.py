@@ -190,6 +190,13 @@ def write_timepoint(arr: zarr.Array, t: int, volume_zyx: np.ndarray) -> None:
     arr[t] = volume_zyx
 
 
+def write_planes(arr: zarr.Array, t: int, z0: int, planes_zyx: np.ndarray) -> None:
+    """Writes z-planes `[z0, z0 + n)` of timepoint `t` (a slab of a volume
+    still being acquired). With one chunk per plane, each plane is its own
+    chunk file, so slabs of one volume never touch each other's chunks."""
+    arr[t, z0 : z0 + planes_zyx.shape[0]] = planes_zyx
+
+
 def store_path_for_channel(raw_root: Path, base_name: str, channel_name: str) -> Path:
     """The canonical per-channel store path for `channel_name` (e.g.
     "GFP_488") under `raw_root`, matching
