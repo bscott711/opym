@@ -345,3 +345,27 @@ def complete_timepoints(progress: dict | None) -> list[int]:
     for t, c in progress.get("done", []):
         per_t.setdefault(int(t), set()).add(int(c))
     return sorted(t for t, cs in per_t.items() if len(cs) >= n_c)
+
+
+def is_processed_store(path: Path | str | None) -> bool:
+    """A processed (bioformats2raw layout) store, as the one-format live
+    lane writes -- as opposed to a legacy store or anything else."""
+    if path is None:
+        return False
+    try:
+        attrs = json.loads((Path(path) / ".zattrs").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(attrs, dict) and "bioformats2raw.layout" in attrs
+
+
+def mip_stacks(store: Path) -> dict[int, np.ndarray]:
+    """channel -> (T, y, x) Z-MIPs of a processed store, for every timepoint
+    whose channels are all written (per the progress file), in time order:
+    what the per-frame MIP TIFFs used to provide."""
+    group = image_group(store, MIP_SERIES)
+    arr = group["0"]
+    done = complete_timepoints(read_progress(store))
+    if not done:
+        return {}
+    return {c: np.stack([arr[t, c, 0] for t in done]) for c in range(arr.shape[1])}

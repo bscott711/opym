@@ -180,3 +180,24 @@ def test_ome_zarr_py_opens_the_store_and_its_mip_series(tmp_path):
 
     assert shapes(out) == [(3, 2, 10, 20, 30)]
     assert shapes(out / "1") == [(3, 2, 1, 20, 30)]
+
+
+def test_mip_stacks_cover_complete_timepoints_only(tmp_path):
+    import zarr
+
+    out, arrays = _processed(tmp_path)
+    assert w.is_processed_store(out) and not w.is_processed_store(tmp_path)
+    mip = zarr.open(str(arrays.mip), mode="r+")
+    for t in range(3):
+        for c in range(2):
+            mip[t, c, 0] = 10 * t + c
+    w.write_progress(
+        out,
+        n_t=3,
+        n_c=2,
+        done=[[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]],
+        state="running",
+    )
+    stacks = w.mip_stacks(out)
+    assert set(stacks) == {0, 1} and stacks[1].shape == (2, 20, 30)
+    assert [int(f.max()) for f in stacks[1]] == [1, 11]
