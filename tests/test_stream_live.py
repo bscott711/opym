@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -336,6 +337,16 @@ def test_receiver_hands_single_timepoint_sessions_to_the_live_lane_too(
         recv._run_once()
         tickets = list(lanes.live_queue_dir().glob("LIVE_AlignTest_*.json"))
         assert len(tickets) == 1
+        # The bug this guards: the receiver used to stage a single-timepoint
+        # frame under the batch path's static name (e.g. "sample_GFP_488.tif"),
+        # but a live ticket's frame list always names it "_C{c}_T{ttt}.tif"
+        # (LiveSession.frame, opym.stream.live) -- so MATLAB's own imfinfo on
+        # it failed outright once single-timepoint sessions started going
+        # live. Every frame the ticket lists must actually be there.
+        ticket = json.loads(tickets[0].read_text())
+        for f in ticket["parameters"]["frames"]:
+            assert Path(f).name == "AlignTest_C0_T000.tif"
+            assert Path(f).exists(), f
         sock.close(linger=0)
     finally:
         recv.close()
