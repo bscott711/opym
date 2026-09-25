@@ -67,6 +67,21 @@ BUFFER_KEEP_T = 3
 SHEET_ANGLE_DEG = 60.0
 
 
+def buffer_name(t: int, c: int) -> str:
+    """A (t, c) view buffer's file name (naparym-live reads the same)."""
+    return f"T{t:04d}_C{c}.npy"
+
+
+def parse_buffer_name(name: str) -> tuple[int, int] | None:
+    if not (name.startswith("T") and name.endswith(".npy") and "_C" in name):
+        return None
+    try:
+        t, c = name[1:-4].split("_C")
+        return int(t), int(c)
+    except ValueError:
+        return None
+
+
 def live_format() -> str:
     """ "zarr" for this lane, else "tiff" (the default for now)."""
     return (
@@ -126,7 +141,7 @@ class ZarrLiveSession:
         return self.view_dir / "buffers"
 
     def buffer(self, t: int, c: int) -> Path:
-        return self.buffers_dir / f"T{t:04d}_C{c}.npy"
+        return self.buffers_dir / buffer_name(t, c)
 
     def settled(self) -> bool:
         """Every fully staged timepoint is archived or failed, nothing in flight."""

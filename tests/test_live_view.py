@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -89,7 +90,11 @@ def test_follower_tracks_new_timepoints(tmp_path):
     assert "2/3 timepoints" in viewer.text_overlay.text
     assert [layer.name for layer in follower.layers] == ["GFP 488", "mScarlet 561"]
     # What napari reads for t=1 is the new data, not cached zeros.
-    assert int(np.asarray(follower.layers[1].data[0][1]).max()) == 210
+    assert int(np.asarray(follower.layers[1].data[1]).max()) == 210
+    # Full resolution, single level: napari's 3D view only ever renders a
+    # multiscale layer's coarsest level.
+    assert not follower.layers[1].multiscale
+    assert follower.layers[1].data.shape == (3, 8, 16, 12)
     # A whole new layer, not the same object with new data assigned onto it
     # -- see poll()'s docstring for why this is the fix, not the narrower
     # ones tried first. The old layer is gone from the viewer entirely.
@@ -353,3 +358,69 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     assert shown["ev"] == "shown" and shown["session_id"] == "sess-v"
     assert shown["timepoints"] == [0]
     assert shown["build_s"] >= 0 and shown["seen_s"] <= shown["at"]
+
+
+def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
+    """The one-format lane drops each (t, c) as an uncompressed .npy before
+    writing the store: the view must not wait for the store."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    from opym.stream.live_zarr import buffer_name
+
+    resize_dask_cache(0)
+    store = tmp_path / "view" / "Cell_040_dsr.ome.zarr"
+    w.create_processed_store(
+        store,
+        n_t=3,
+        n_c=2,
+        shape_zyx=(8, 16, 12),
+        channel_labels=["GFP 488", "mScarlet 561"],
+    )
+    buffers = tmp_path / "view" / "buffers"
+    buffers.mkdir()
+    viewer = ViewerModel()
+    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    assert follower._shown == []
+
+    np.save(buffers / buffer_name(0, 0), np.full((8, 16, 12), 50, np.uint16))
+    follower.poll()
+    assert follower._shown == []  # one channel of two: not yet
+    np.save(buffers / buffer_name(0, 1), np.full((8, 16, 12), 60, np.uint16))
+    follower.poll()
+    assert follower._shown == [0]
+    assert int(np.asarray(follower.layers[1].data[0]).max()) == 60  # from the buffer
+
+    # Buffer trimmed after the store has it: read from the store instead.
+    w.write_timepoint(store, 0, 1, np.full((8, 16, 12), 60, np.uint16))
+    w.write_progress(store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running")
+    (buffers / buffer_name(0, 1)).unlink()
+    assert int(np.asarray(follower.layers[1].data[0]).max()) == 60
+
+
+def test_watcher_prefers_the_ram_disk_store(tmp_path):
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    view = tmp_path / "shm" / "s1" / "Cell_041_dsr.ome.zarr"
+    view.mkdir(parents=True)
+    (jobs / "live_latest.json").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "store": str(tmp_path / "gpfs" / "Cell_041_dsr.ome.zarr"),
+                "view_store": str(view),
+                "buffers_dir": str(view.parent / "buffers"),
+                "qc_dir": str(tmp_path / "gpfs_qc"),
+            }
+        )
+    )
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    watcher = live_view.SessionWatcher(ViewerModel(), jobs=jobs)
+    sid, store, extra = watcher._latest()
+    assert (sid, store) == ("s1", view)
+    assert extra["buffers_dir"] == str(view.parent / "buffers")
+    shutil.rmtree(view)  # evicted from the RAM disk: fall back to GPFS
+    assert watcher._latest()[1] == tmp_path / "gpfs" / "Cell_041_dsr.ome.zarr"
