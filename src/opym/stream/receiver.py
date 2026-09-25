@@ -670,8 +670,19 @@ class StreamReceiver:
 
     def _decon_stage_path(self, session: SessionState, c: int, t: int) -> Path:
         """Matches `build_decon_staging_dir`'s own naming exactly, so its
-        skip-if-exists check treats this file as already done."""
-        if session.num_timepoints > 1:
+        skip-if-exists check treats this file as already done -- for a
+        session the live lane never touches. A *live* session's staged
+        frames are read back by their live ticket, which names them
+        `_C{cidx}_T{ttt}.tif` unconditionally (`LiveSession.frame`,
+        `opym.stream.live`) -- there is no single-timepoint special case on
+        that side, and there cannot be one here either, or the live lane's
+        `imfinfo` on the erosion-mask frame fails outright (confirmed on
+        Argus 2026-09-25 once single-timepoint sessions started going
+        live: `num_timepoints > 1` alone used to be equivalent to "am I
+        live", back when the live lane skipped every T<=1 session; once it
+        stopped skipping them, the two diverged).
+        """
+        if session.num_timepoints > 1 or session.live:
             cidx = session.channel_cidx[c]
             return session.decon_stage_dir / f"{session.base_name}_C{cidx}_T{t:03d}.tif"
         store_name = session.channel_store_paths[c].name.removesuffix(".zarr")
