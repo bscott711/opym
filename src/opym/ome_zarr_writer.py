@@ -13,6 +13,18 @@ A store is allocated at full size up front; timepoints not yet written read
 as zeros. `.opym_live.json` next to the arrays records which (t, c) are
 written, so a viewer knows what's real and the export knows the store is
 complete.
+
+Two layouts:
+
+- The processed store (`create_processed_store`), written by the one-format
+  live path: bioformats2raw layout 3. Series "0" is the DSR multiscale
+  (t, c, z, y, x), series "1" its Z-MIP, and `OME/METADATA.ome.xml`
+  (opym.ome_xml) is the OME-XML for both. The GPU server writes the pixels
+  directly (run_live_zarr.m -> opymWriteZarrBlock); Python only creates it.
+- The legacy viewer store (`create_store`): multiscales at the root, no
+  OME-XML, as the TIFF live path and the backfill export wrote it.
+
+Read through `image_group(store, series)`, which handles both.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +45,11 @@ PYRAMID_LEVELS = 3
 # Distinct, colour-blind-safe-ish emission colours; index = channel number.
 CHANNEL_COLORS = ("00FF00", "FF3D3D", "00B3FF", "FFC400")
 PROGRESS_NAME = ".opym_live.json"
+# The processed store (bioformats2raw layout 3); see the module docstring.
+BF2RAW_LAYOUT = 3
+DSR_SERIES = "0"
+MIP_SERIES = "1"
+CHUNKS_ZYX = (64, 256, 256)
 
 
 def downsample2(vol: np.ndarray, threads: int = 4) -> np.ndarray:
@@ -81,36 +99,15 @@ def level_shapes(n_t: int, n_c: int, shape_zyx, levels: int = PYRAMID_LEVELS):
     ]
 
 
-def create_store(
-    out_path: Path,
-    *,
-    n_t: int,
-    n_c: int,
-    shape_zyx: tuple[int, int, int],
-    dtype,
-    channel_labels: list[str] | None = None,
-    voxel_um: float = DSR_VOXEL_UM,
-    levels: int = PYRAMID_LEVELS,
-    time_interval_s: float = 1.0,
-):
-    """Allocate an empty store (all zeros, nothing written) at `out_path`."""
-    import zarr
+def _chunks(shape_tczyx) -> tuple[int, ...]:
+    return (1, 1, *(min(c, n) for c, n in zip(CHUNKS_ZYX, shape_tczyx[2:])))
 
-    out_path = Path(out_path)
-    root = zarr.open_group(str(out_path), mode="w")
-    for lvl, shp in enumerate(level_shapes(n_t, n_c, shape_zyx, levels)):
-        root.create_dataset(
-            str(lvl),
-            shape=shp,
-            dtype=dtype,
-            chunks=(1, 1, min(64, shp[2]), min(256, shp[3]), min(256, shp[4])),
-            dimension_separator="/",
-        )
-    labels = channel_labels or [f"C{c}" for c in range(n_c)]
-    root.attrs["multiscales"] = [
+
+def _multiscales(name: str, levels: int, voxel_um: float, time_interval_s: float):
+    return [
         {
             "version": "0.4",
-            "name": out_path.name.removesuffix(".ome.zarr"),
+            "name": name,
             "axes": [
                 {"name": "t", "type": "time", "unit": "second"},
                 {"name": "c", "type": "channel"},
@@ -132,8 +129,11 @@ def create_store(
             ],
         }
     ]
-    root.attrs["omero"] = {
-        "name": out_path.name,
+
+
+def _omero(name: str, n_c: int, labels: list[str]):
+    return {
+        "name": name,
         "channels": [
             {
                 "label": labels[c] if c < len(labels) else f"C{c}",
@@ -144,16 +144,160 @@ def create_store(
             for c in range(n_c)
         ],
     }
+
+
+def create_store(
+    out_path: Path,
+    *,
+    n_t: int,
+    n_c: int,
+    shape_zyx: tuple[int, int, int],
+    dtype,
+    channel_labels: list[str] | None = None,
+    voxel_um: float = DSR_VOXEL_UM,
+    levels: int = PYRAMID_LEVELS,
+    time_interval_s: float = 1.0,
+):
+    """Allocate an empty legacy-layout store (all zeros, nothing written)."""
+    import zarr
+
+    out_path = Path(out_path)
+    root = zarr.open_group(str(out_path), mode="w")
+    for lvl, shp in enumerate(level_shapes(n_t, n_c, shape_zyx, levels)):
+        root.create_dataset(
+            str(lvl),
+            shape=shp,
+            dtype=dtype,
+            chunks=_chunks(shp),
+            dimension_separator="/",
+        )
+    labels = channel_labels or [f"C{c}" for c in range(n_c)]
+    name = out_path.name.removesuffix(".ome.zarr")
+    root.attrs["multiscales"] = _multiscales(name, levels, voxel_um, time_interval_s)
+    root.attrs["omero"] = _omero(out_path.name, n_c, labels)
     write_progress(out_path, n_t=n_t, n_c=n_c, done=[], state="running")
+    return root
+
+
+@dataclass(frozen=True)
+class ProcessedArrays:
+    """Where the GPU server writes one (t, c): every DSR pyramid level
+    (full resolution first) and the Z-MIP."""
+
+    levels: list[Path]
+    mip: Path
+
+
+def processed_arrays(out_path: Path, levels: int = PYRAMID_LEVELS) -> ProcessedArrays:
+    out_path = Path(out_path)
+    return ProcessedArrays(
+        levels=[out_path / DSR_SERIES / str(lvl) for lvl in range(levels)],
+        mip=out_path / MIP_SERIES / "0",
+    )
+
+
+def create_processed_store(
+    out_path: Path,
+    *,
+    n_t: int,
+    n_c: int,
+    shape_zyx: tuple[int, int, int],
+    channel_labels: list[str] | None = None,
+    voxel_um: float = DSR_VOXEL_UM,
+    levels: int = PYRAMID_LEVELS,
+    time_interval_s: float | None = None,
+    acquisition_date=None,
+) -> ProcessedArrays:
+    """Allocate an empty processed store (bioformats2raw layout 3, see the
+    module docstring) for `n_t` x `n_c` DSR volumes of `shape_zyx`.
+
+    uint16, blosc-lz4, `/` separators, chunk size 1 on t and c -- the layout
+    opymWriteZarrBlock requires -- and fill value 0, so a chunk the writer
+    skipped as all-zero reads back as zeros.
+    """
+    import zarr
+    from numcodecs import Blosc
+
+    from opym.ome_xml import processed_ome_xml
+
+    out_path = Path(out_path)
+    name = out_path.name.removesuffix(".ome.zarr").removesuffix("_dsr")
+    labels = channel_labels or [f"C{c}" for c in range(n_c)]
+    compressor = Blosc(cname="lz4", clevel=5, shuffle=Blosc.SHUFFLE)
+    root = zarr.open_group(str(out_path), mode="w")
+    root.attrs["bioformats2raw.layout"] = BF2RAW_LAYOUT
+
+    def array(group, path, shape):
+        group.create_dataset(
+            path,
+            shape=shape,
+            chunks=_chunks(shape),
+            dtype="uint16",
+            compressor=compressor,
+            dimension_separator="/",
+            fill_value=0,
+        )
+
+    dsr = root.create_group(DSR_SERIES)
+    for lvl, shp in enumerate(level_shapes(n_t, n_c, shape_zyx, levels)):
+        array(dsr, str(lvl), shp)
+    dsr.attrs["multiscales"] = _multiscales(
+        name, levels, voxel_um, time_interval_s or 1.0
+    )
+    dsr.attrs["omero"] = _omero(name, n_c, labels)
+    # The same image on the root, pointing into series "0": NGFF readers that
+    # don't walk bioformats2raw series (ome-zarr-py 0.11, so napari-ome-zarr)
+    # then open the store itself. Bio-Formats reads the layout + OME-XML.
+    root_ms = _multiscales(name, levels, voxel_um, time_interval_s or 1.0)
+    for ds in root_ms[0]["datasets"]:
+        ds["path"] = f"{DSR_SERIES}/{ds['path']}"
+    root.attrs["multiscales"] = root_ms
+    root.attrs["omero"] = _omero(name, n_c, labels)
+
+    mip = root.create_group(MIP_SERIES)
+    array(mip, "0", (n_t, n_c, 1, shape_zyx[1], shape_zyx[2]))
+    mip.attrs["multiscales"] = _multiscales(
+        f"{name} Z-MIP", 1, voxel_um, time_interval_s or 1.0
+    )
+    mip.attrs["omero"] = _omero(f"{name} Z-MIP", n_c, labels)
+
+    ome = root.create_group("OME")
+    ome.attrs["series"] = [DSR_SERIES, MIP_SERIES]
+    (out_path / "OME" / "METADATA.ome.xml").write_text(
+        processed_ome_xml(
+            name=name,
+            n_t=n_t,
+            n_c=n_c,
+            shape_zyx=tuple(shape_zyx),
+            channel_labels=labels,
+            voxel_um=voxel_um,
+            time_interval_s=time_interval_s,
+            colors=CHANNEL_COLORS,
+            acquisition_date=acquisition_date,
+        )
+    )
+    write_progress(out_path, n_t=n_t, n_c=n_c, done=[], state="running")
+    return processed_arrays(out_path, levels)
+
+
+def image_group(store: Path, series: str = DSR_SERIES, mode: str = "r"):
+    """The zarr group holding `series`' multiscales: the numbered series
+    group of a processed (bioformats2raw) store, or the root of a legacy
+    one, which only has the DSR image."""
+    import zarr
+
+    root = zarr.open_group(str(store), mode=mode)
+    if "bioformats2raw.layout" in root.attrs:
+        return root[series]
+    if series != DSR_SERIES:
+        raise KeyError(f"{store} is a legacy store; it has no series {series!r}")
     return root
 
 
 def write_timepoint(out_path: Path, t: int, c: int, vol: np.ndarray) -> None:
     """Write one (t, c) volume into every pyramid level. Safe to call from
     several threads for different (t, c): each writes its own chunks."""
-    import zarr
-
-    root = zarr.open_group(str(out_path), mode="r+")
+    root = image_group(out_path, mode="r+")
     lvl = 0
     while str(lvl) in root:
         arr = root[str(lvl)]
