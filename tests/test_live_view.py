@@ -188,6 +188,60 @@ def test_watcher_opens_with_nothing_and_picks_up_the_first_session(tmp_path):
     assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
 
 
+def test_watcher_survives_a_session_recorded_before_its_store_exists(tmp_path):
+    """Real bug hit live on Argus: live_latest.json is written at
+    SESSION_START, well before the first timepoint's zarr group is actually
+    created on disk (that waits on its decon+DSR ticket). A poll landing in
+    that gap must retry quietly, not raise GroupNotFoundError into napari's
+    event loop, and it must not blank out whatever was already showing."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    jobs = tmp_path / "jobs"
+    not_yet = tmp_path / "StreamMe" / "viewer" / "StreamMe_dsr.ome.zarr"
+    _write_latest(jobs, not_yet, "real-acq")
+
+    viewer = ViewerModel()
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    watcher.poll()  # must not raise
+    assert watcher.follower is None
+    assert watcher.session_id is None  # so the same target is retried
+    assert "waiting for its first timepoint" in viewer.text_overlay.text
+
+    watcher.poll()  # still not there; retrying must not raise either
+    assert watcher.follower is None
+
+    not_yet.parent.mkdir(parents=True)
+    _store(tmp_path).rename(not_yet)  # the ticket finishes; the store appears
+    watcher.poll()
+    assert watcher.follower is not None
+    assert watcher.session_id == "real-acq"
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+
+
+def test_watcher_keeps_the_old_feed_visible_while_a_switch_target_is_not_ready(
+    tmp_path,
+):
+    """A session already showing must not vanish while the watcher waits for
+    the NEXT session's store to become ready."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    jobs = tmp_path / "jobs"
+    first = _store(tmp_path, n_t=1)
+    _write_latest(jobs, first, "s1")
+    viewer = ViewerModel()
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    watcher.poll()
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+
+    not_yet = tmp_path / "StreamMe" / "viewer" / "StreamMe_dsr.ome.zarr"
+    _write_latest(jobs, not_yet, "s2")
+    watcher.poll()  # s2's store isn't there yet
+    assert watcher.session_id == "s1"  # still showing the first session
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+
+
 def test_watcher_switches_feeds_when_a_new_session_starts(tmp_path):
     """A quick alignment snap, then the real acquisition right after -- same
     window, no restart, old layers gone before the new ones load."""
