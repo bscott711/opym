@@ -685,3 +685,138 @@ def test_no_live_lease_unless_the_live_lane_is_enabled(tmp_path, receiver, clien
     sock = client("sess-nolease")
     _start_session(sock, "sess-nolease", receiver, _session_header(tmp_path / "raw"))
     assert not lanes.lease_path().exists()
+
+
+# --- receiver behavior: same-named sessions never share storage ------------
+
+
+def _stream_all(sock, session_id, receiver, num_timepoints, channels=(0, 1)):
+    """Sends every (t, c) frame of a session and ends it; returns the last ACK."""
+    frame_index = 0
+    for t in range(num_timepoints):
+        for c in channels:
+            header, vol = _frame(t=t, c=c, frame_index=frame_index)
+            sock.send_multipart(
+                pack_message(MSG_FRAME, session_id, header, vol.tobytes())
+            )
+            _drive(receiver)
+            _recv_ack(sock)
+            frame_index += 1
+    sock.send_multipart(
+        pack_message(MSG_SESSION_END, session_id, {"reason": "complete"})
+    )
+    _drive(receiver)
+    return _recv_ack(sock)
+
+
+def test_reused_name_gets_a_suffix_instead_of_the_old_store(tmp_path, receiver, client):
+    """The 2026-09-24 Cell_001 loss: a 1-timepoint test, then the real
+    time series under the same name. The second session must land in its
+    own `_001` stores with every frame staged, and leave the first alone."""
+    raw_root = tmp_path / "raw"
+    test_sock = client("sess-test")
+    _start_session(
+        test_sock, "sess-test", receiver, _session_header(raw_root, num_timepoints=1)
+    )
+    _stream_all(test_sock, "sess-test", receiver, num_timepoints=1)
+
+    real_sock = client("sess-real")
+    _start_session(
+        real_sock, "sess-real", receiver, _session_header(raw_root, num_timepoints=3)
+    )
+    assert receiver.sessions["sess-real"].base_name == "sample_001"
+    _, ack = _stream_all(real_sock, "sess-real", receiver, num_timepoints=3)
+    assert ack["through_frame_index"] == 5  # all 3T x 2C acked
+
+    for t in range(3):
+        got = _read_raw_timepoint(raw_root, "sample_001", "C1", t=t)
+        np.testing.assert_array_equal(got, _frame(t=t, c=1, frame_index=0)[1])
+    first = zarr.open(str(_raw_store_path(raw_root, "sample", "C0") / "p0"), mode="r")
+    assert first.shape[0] == 1
+
+
+def test_resent_session_start_keeps_its_resolved_name(tmp_path, receiver, client):
+    raw_root = tmp_path / "raw"
+    sock_a = client("sess-a")
+    _start_session(
+        sock_a, "sess-a", receiver, _session_header(raw_root, num_timepoints=1)
+    )
+    _stream_all(sock_a, "sess-a", receiver, num_timepoints=1)
+
+    sock_b = client("sess-b")
+    header = _session_header(raw_root, num_timepoints=2)
+    _start_session(sock_b, "sess-b", receiver, header)
+    frame_header, vol = _frame(t=0, c=0, frame_index=0)
+    sock_b.send_multipart(
+        pack_message(MSG_FRAME, "sess-b", frame_header, vol.tobytes())
+    )
+    _drive(receiver)
+    _recv_ack(sock_b)
+
+    # Resent while the session is still known ...
+    _start_session(sock_b, "sess-b", receiver, header)
+    assert receiver.sessions["sess-b"].base_name == "sample_001"
+    # ... and after a receiver restart forgot it: its stores are tagged.
+    del receiver.sessions["sess-b"]
+    _start_session(sock_b, "sess-b", receiver, header)
+    assert receiver.sessions["sess-b"].base_name == "sample_001"
+
+
+def test_drained_staging_copy_is_released_for_a_different_destination(
+    tmp_path, receiver, client, monkeypatch
+):
+    """The staging root is flat across experiment folders: a retained copy
+    of an earlier `sample` drained elsewhere must not force a rename when
+    this session's destination has no `sample` at all."""
+    stage_root = tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage_root))
+
+    first_dest = tmp_path / "exp1"
+    sock = client("sess-exp1")
+    _start_session(
+        sock, "sess-exp1", receiver, _session_header(first_dest, num_timepoints=1)
+    )
+    _stream_all(sock, "sess-exp1", receiver, num_timepoints=1)
+    assert _wait_until(lambda: (first_dest / "sample_C0.ome.zarr").exists())
+    assert _wait_until(lambda: "sess-exp1" in receiver._drain_pool._drained)
+    assert (stage_root / "sample_C0.ome.zarr").exists()  # retained after drain
+
+    sock = client("sess-exp2")
+    _start_session(
+        sock,
+        "sess-exp2",
+        receiver,
+        _session_header(tmp_path / "exp2", num_timepoints=1),
+    )
+    assert receiver.sessions["sess-exp2"].base_name == "sample"
+
+    # Back into the first folder, where `sample` really exists: renamed.
+    sock = client("sess-exp1-again")
+    _start_session(
+        sock, "sess-exp1-again", receiver, _session_header(first_dest, num_timepoints=1)
+    )
+    assert receiver.sessions["sess-exp1-again"].base_name == "sample_001"
+
+
+def test_create_channel_store_refuses_another_sessions_shape(tmp_path):
+    from opym.stream import rawmirror
+
+    store = tmp_path / "sample_C0.ome.zarr"
+    rawmirror.create_channel_store(
+        store,
+        num_timepoints=1,
+        shape_zyx=SHAPE_ZYX,
+        dtype="uint16",
+        z_step_um=0.3,
+        session_id="old",
+    )
+    assert rawmirror.read_session_id(store) == "old"
+    with pytest.raises(ValueError, match="another acquisition's store"):
+        rawmirror.create_channel_store(
+            store,
+            num_timepoints=100,
+            shape_zyx=SHAPE_ZYX,
+            dtype="uint16",
+            z_step_um=0.3,
+            session_id="new",
+        )

@@ -55,15 +55,29 @@ _ZATTRS = {
 OUTPUT_FORMATS = ("tiff", "ome-zarr", "both")
 
 
-def read_output_format(store_path: Path) -> str | None:
-    """The `output_format` a stream client recorded on this raw store, or
-    None if none was (e.g. a Globus-landed acquisition)."""
+def _read_opym_attrs(store_path: Path) -> dict:
     try:
         attrs = json.loads((Path(store_path) / ".zattrs").read_text())
     except (OSError, ValueError):
-        return None
-    fmt = attrs.get("opym", {}).get("output_format")
+        return {}
+    opym_attrs = attrs.get("opym") if isinstance(attrs, dict) else None
+    return opym_attrs if isinstance(opym_attrs, dict) else {}
+
+
+def read_output_format(store_path: Path) -> str | None:
+    """The `output_format` a stream client recorded on this raw store, or
+    None if none was (e.g. a Globus-landed acquisition)."""
+    fmt = _read_opym_attrs(store_path).get("output_format")
     return fmt if fmt in OUTPUT_FORMATS else None
+
+
+def read_session_id(store_path: Path) -> str | None:
+    """The stream session that created this raw store (see
+    `create_channel_store`), or None for a store with no such tag -- a
+    Globus-landed acquisition, one written before tagging existed, or no
+    store at all."""
+    sid = _read_opym_attrs(store_path).get("session_id")
+    return sid if isinstance(sid, str) else None
 
 
 def create_channel_store(
@@ -74,6 +88,7 @@ def create_channel_store(
     dtype: str,
     z_step_um: float,
     output_format: str | None = None,
+    session_id: str | None = None,
 ) -> zarr.Array:
     """Creates (or reopens) one channel's raw zarr store at `store_path` and
     returns its `p0` pixel array, shaped `(num_timepoints, *shape_zyx)`.
@@ -81,7 +96,17 @@ def create_channel_store(
     Idempotent: calling this again for the same `store_path` with the same
     shape/dtype (e.g. because the client resent `SESSION_START` after a
     reconnect) reopens the existing array rather than recreating it, same
-    as `zarr.open(..., mode='a')`'s own contract.
+    as `zarr.open(..., mode='a')`'s own contract. A DIFFERENT shape or dtype
+    raises instead: `zarr.open(mode='a')` ignores the requested shape of an
+    existing array, which on 2026-09-24 silently reopened a 1-timepoint test
+    store for a 100-timepoint acquisition of the same name and rejected
+    every one of its frames. The receiver now never reuses another
+    session's name (`StreamReceiver._resolve_base_name`); this check makes
+    any future regression fail with a clear message.
+
+    `session_id` is recorded as `.zattrs["opym"]["session_id"]` so the
+    receiver can tell its own store (a SESSION_START resent after a restart)
+    from an earlier acquisition's (see `read_session_id`).
 
     Chunked one z-plane at a time (`[1, 1, ny, nx]`, `dimension_separator=
     '/'`) to match what the real acquisition writer produces -- not for
@@ -111,13 +136,26 @@ def create_channel_store(
         compressor=None,
         dimension_separator="/",
     )
+    expected_shape = (num_timepoints, nz, ny, nx)
+    if tuple(arr.shape) != expected_shape or arr.dtype != np.dtype(dtype):
+        raise ValueError(
+            f"{store_path} already holds a {tuple(arr.shape)} {arr.dtype} array "
+            f"(tagged session {read_session_id(store_path)!r}); this session "
+            f"needs {expected_shape} {np.dtype(dtype)} -- refusing to write into "
+            "another acquisition's store"
+        )
 
     _write_z_coordinate(store_path / "z", nz, z_step_um)
 
     # Written last -- see docstring.
     attrs = dict(_ZATTRS)
+    opym_attrs = {}
     if output_format is not None:
-        attrs["opym"] = {"output_format": output_format}
+        opym_attrs["output_format"] = output_format
+    if session_id is not None:
+        opym_attrs["session_id"] = session_id
+    if opym_attrs:
+        attrs["opym"] = opym_attrs
     (store_path / ".zattrs").write_text(json.dumps(attrs))
     return arr
 
