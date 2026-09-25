@@ -291,3 +291,14 @@ def test_report_rejects_an_unknown_session(tmp_path):
     _synthetic(tmp_path)
     with pytest.raises(SystemExit):
         trace_report.main(["--jobs", str(tmp_path), "--session", "nope"])
+
+
+def test_frames_sent_before_the_first_ack_use_the_sessions_clock_offset(tmp_path):
+    _synthetic(tmp_path)
+    events = trace.read(jobs=tmp_path)
+    for e in events:  # both t=0 volumes left before the first ACK came back
+        if e["ev"] == "frame" and e["t"] == 0:
+            del e["clock_offset_s"]
+    rows = trace_report.timeline("sess-abc", events, [], {})
+    assert rows[0]["acq_last"] == pytest.approx(1000.0)
+    assert rows[0]["sent"] == pytest.approx(1002.0)

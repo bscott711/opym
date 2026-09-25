@@ -45,8 +45,12 @@ HOPS = (
 )
 
 
-def _client_time(ev: dict, key: str) -> float | None:
-    value, offset = ev.get(key), ev.get("clock_offset_s")
+def _client_time(ev: dict, key: str, session_offset: float | None) -> float | None:
+    """A client-clock time converted to Argus time. Frames the client sent
+    before its first ACK came back carry no offset of their own; they use
+    the session's (one client clock, one offset)."""
+    value = ev.get(key)
+    offset = ev.get("clock_offset_s", session_offset)
     if value is None or offset is None:
         return None
     return float(value) + float(offset)
@@ -121,17 +125,26 @@ def timeline(
                 row(t).setdefault("reaped", e["at"])
         elif ev == "view_ready":
             row(e["t"]).setdefault("view", e["at"])
+    offsets = [
+        float(e["clock_offset_s"])
+        for evs in frames.values()
+        for e in evs
+        if e.get("clock_offset_s") is not None
+    ]
+    session_offset = statistics.median(offsets) if offsets else None
     for t, evs in frames.items():
         r = row(t)
         r["recv"] = _latest(e.get("recv_s") for e in evs)
         r["staged"] = _latest(e.get("staged_s") for e in evs)
-        r["acq_last"] = _latest(_client_time(e, "acq_last_s") for e in evs)
-        r["sent"] = _latest(_client_time(e, "sent_s") for e in evs)
+        r["acq_last"] = _latest(
+            _client_time(e, "acq_last_s", session_offset) for e in evs
+        )
+        r["sent"] = _latest(_client_time(e, "sent_s", session_offset) for e in evs)
         r["wire_mb_per_s"] = [
             int(e["bytes"]) / 1e6 / (e["recv_s"] - sent)
             for e in evs
             if e.get("bytes")
-            and (sent := _client_time(e, "sent_s")) is not None
+            and (sent := _client_time(e, "sent_s", session_offset)) is not None
             and e["recv_s"] > sent
         ]
     for e in view_events:
