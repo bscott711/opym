@@ -9,8 +9,12 @@ seconds. When a timepoint completes, the layers are refreshed and, in follow
 mode, the time slider jumps to it. The status line shows how many timepoints
 are done and how far the view lags the newest one.
 
-With no argument it opens the newest session (`<jobs>/live_latest.json`).
-Any finished dataset's `viewer/*_dsr.ome.zarr` opens the same way.
+With no argument it opens the newest session (`<jobs>/live_latest.json`),
+waiting for one to start if none has yet -- the common case is launching this
+right as (or just before) an acquisition begins. `--no-wait` fails immediately
+instead, and an explicit store path is never waited on (a typo there should
+fail fast, not hang). Any finished dataset's `viewer/*_dsr.ome.zarr` opens the
+same way.
 
 napari's dask cache is turned off: it would keep serving the zeros read from
 a timepoint before it was written.
@@ -38,9 +42,21 @@ QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
 _COLORMAPS = {"00FF00": "green", "FF3D3D": "red", "00B3FF": "cyan", "FFC400": "yellow"}
 
 
-def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
+def resolve_store(
+    arg: str | None,
+    jobs: Path | None = None,
+    *,
+    wait: bool = False,
+    poll_s: float = POLL_S,
+    announce=print,
+) -> Path:
     """A store path, a dataset directory holding `viewer/*_dsr.ome.zarr`, or
-    (no argument) the newest live session's store."""
+    (no argument) the newest live session's store.
+
+    `wait`: keep polling for `<jobs>/live_latest.json` to appear instead of
+    raising immediately -- only meaningful with no `arg`; an explicit path is
+    always checked once, since a typo there should fail fast, not hang.
+    """
     if arg:
         p = Path(arg)
         if p.suffix == ".zarr" or (p / ".zgroup").exists():
@@ -50,12 +66,22 @@ def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
             return found[0]
         raise FileNotFoundError(f"No *_dsr.ome.zarr store at or under {p}")
     latest = (jobs or lanes.jobs_dir()) / "live_latest.json"
-    try:
-        return Path(json.loads(latest.read_text())["store"])
-    except (OSError, ValueError, KeyError) as exc:
-        raise FileNotFoundError(
-            f"No live session recorded yet ({latest}); pass a store path."
-        ) from exc
+    announced = False
+    while True:
+        try:
+            return Path(json.loads(latest.read_text())["store"])
+        except (OSError, ValueError, KeyError) as exc:
+            if not wait:
+                raise FileNotFoundError(
+                    f"No live session recorded yet ({latest}); pass a store path."
+                ) from exc
+            if not announced:
+                announce(
+                    f"naparym-live: waiting for a live acquisition to start "
+                    f"({latest})... Ctrl-C to cancel."
+                )
+                announced = True
+            time.sleep(poll_s)
 
 
 def status_text(name: str, progress: dict | None, now: float | None = None) -> str:
@@ -280,6 +306,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--no-follow", action="store_true", help="don't jump to new timepoints"
     )
+    ap.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="fail immediately if no live session has started yet, instead "
+        "of waiting for one",
+    )
     ap.add_argument("--poll", type=float, default=POLL_S, help="seconds between checks")
     args = ap.parse_args(argv)
 
@@ -288,7 +320,10 @@ def main(argv: list[str] | None = None) -> None:
     from qtpy.QtCore import QTimer
 
     resize_dask_cache(0)
-    store = resolve_store(args.store)
+    try:
+        store = resolve_store(args.store, wait=args.store is None and not args.no_wait)
+    except KeyboardInterrupt:
+        return
     viewer = napari.Viewer(title=f"naparym-live: {store.name}", ndisplay=3)
     follower = LiveFollower(viewer, store, follow=not args.no_follow)
 

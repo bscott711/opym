@@ -155,3 +155,46 @@ def test_qc_boxes_and_verdicts_follow_the_log(tmp_path):
     assert layer.nshapes == 24
     np.testing.assert_allclose(layer.edge_color[-1], [0, 1, 0, 1])  # ok -> lime
     assert "t=1: ok" in viewer.text_overlay.text
+
+
+def test_resolve_store_waits_for_a_live_session_to_appear(tmp_path):
+    """The common case: launched right as/before an acquisition starts."""
+    store = _store(tmp_path)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    messages: list[str] = []
+    calls: list[float] = []
+    real_sleep_calls = {"n": 0}
+
+    def fake_sleep(s):
+        calls.append(s)
+        real_sleep_calls["n"] += 1
+        if real_sleep_calls["n"] == 2:
+            # The session starts partway through waiting.
+            (jobs / "live_latest.json").write_text(json.dumps({"store": str(store)}))
+
+    orig_sleep = live_view.time.sleep
+    live_view.time.sleep = fake_sleep
+    try:
+        got = live_view.resolve_store(
+            None, jobs=jobs, wait=True, poll_s=0.01, announce=messages.append
+        )
+    finally:
+        live_view.time.sleep = orig_sleep
+
+    assert got == store
+    assert len(calls) == 2  # stopped polling once the file appeared
+    assert len(messages) == 1  # announced once, not on every poll
+    assert "waiting for a live acquisition to start" in messages[0]
+
+
+def test_resolve_store_wait_false_still_fails_immediately(tmp_path):
+    with pytest.raises(FileNotFoundError, match="No live session recorded"):
+        live_view.resolve_store(None, jobs=tmp_path / "nothing", wait=False)
+
+
+def test_resolve_store_never_waits_on_an_explicit_bad_path(tmp_path):
+    """A typo'd path should fail fast, not hang -- wait only applies to the
+    no-argument "newest session" lookup."""
+    with pytest.raises(FileNotFoundError, match="No \\*_dsr.ome.zarr store"):
+        live_view.resolve_store(str(tmp_path / "typo"), wait=True)
