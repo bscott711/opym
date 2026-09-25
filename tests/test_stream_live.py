@@ -9,7 +9,9 @@ import json
 import os
 import time
 
+import numpy as np
 import pytest
+import tifffile
 
 from opym import lanes
 from opym.stream import live as live_mod
@@ -59,6 +61,15 @@ def _tickets(jobs):
     return out
 
 
+DSR_SHAPE = (6, 8, 10)
+
+
+def _dsr_volume(stem):
+    """A small deterministic DSR volume per frame name."""
+    seed = sum(map(ord, stem))
+    return np.random.default_rng(seed).integers(0, 4000, DSR_SHAPE, dtype=np.uint16)
+
+
 def _complete(jobs, s, ticket_path, psf_dir="DSR_decon"):
     """What the MATLAB server + run_live_frames.m leave behind."""
     ticket = json.loads(ticket_path.read_text())
@@ -66,8 +77,8 @@ def _complete(jobs, s, ticket_path, psf_dir="DSR_decon"):
     (dsr / "MIPs").mkdir(parents=True, exist_ok=True)
     for f in ticket["parameters"]["frames"]:
         stem = os.path.basename(f)[:-4]
-        (dsr / f"{stem}.tif").write_bytes(b"dsr " + stem.encode())
-        (dsr / "MIPs" / f"{stem}_MIP_z.tif").write_bytes(b"mip")
+        tifffile.imwrite(dsr / f"{stem}.tif", _dsr_volume(stem))
+        tifffile.imwrite(dsr / "MIPs" / f"{stem}_MIP_z.tif", _dsr_volume(stem).max(0))
     os.replace(ticket_path, jobs / "completed" / ticket_path.name)
 
 
@@ -140,7 +151,9 @@ def test_completed_ticket_is_copied_to_gpfs_and_freed_from_ram(tmp_path, psf):
     for t in (0, 1):
         for c in range(2):
             name = f"Cell_002_C{c}_T{t:03d}"
-            assert (s.dsr_dir / f"{name}.tif").read_bytes() == b"dsr " + name.encode()
+            assert np.array_equal(
+                tifffile.imread(s.dsr_dir / f"{name}.tif"), _dsr_volume(name)
+            )
             assert (s.dsr_dir / "MIPs" / f"{name}_MIP_z.tif").exists()
             assert not (s.decon_dir / "DSR_decon" / f"{name}.tif").exists()
     # Staged input is freed, except the erosion-mask source (first C0 frame).
@@ -269,3 +282,131 @@ def test_receiver_hands_time_lapse_sessions_to_the_live_lane(
         sock.close(linger=0)
     finally:
         recv.close()
+
+
+def test_viewer_store_grows_as_timepoints_finish(tmp_path, psf):
+    """napari's store: the backfill export's path and layout, every finished
+    (t, c) written at full resolution, progress recorded as it goes."""
+    import zarr
+
+    from opym.ome_zarr_writer import complete_timepoints, read_progress
+
+    lane, jobs = _lane(tmp_path, psf)
+    s = lane.start_session(
+        "sess",
+        base_name="Cell_002",
+        num_timepoints=3,
+        n_channels=2,
+        frames_dir=(tmp_path / "stage" / "Cell_002" / "decon_stage"),
+        stage_leaf=tmp_path / "stage" / "Cell_002",
+        dest_leaf=tmp_path / "gpfs" / "session_dir" / "Cell_002",
+        z_step_um=0.5,
+        channel_labels=["GFP 488", "mScarlet 561"],
+    )
+    s.frames_dir.mkdir(parents=True)
+    assert s.zarr_path == (
+        tmp_path
+        / "gpfs"
+        / "session_dir"
+        / "Cell_002"
+        / "viewer"
+        / "Cell_002_dsr.ome.zarr"
+    )
+    latest = json.loads((jobs / "live_latest.json").read_text())
+    assert latest["store"] == str(s.zarr_path)
+
+    for c in range(2):
+        _stage(lane, s, 0, c)
+    lane.pump()
+    [(path, _)] = _tickets(jobs)
+    _complete(jobs, s, path)
+    assert _pump_until(lane, lambda: s.done == {0})
+
+    root = zarr.open_group(str(s.zarr_path), mode="r")
+    assert root["0"].shape == (3, 2) + DSR_SHAPE
+    for c in range(2):
+        assert np.array_equal(root["0"][0, c], _dsr_volume(f"Cell_002_C{c}_T000"))
+    assert not root["0"][1].any()  # not yet written: zeros
+    assert [ch["label"] for ch in root.attrs["omero"]["channels"]] == [
+        "GFP 488",
+        "mScarlet 561",
+    ]
+    progress = read_progress(s.zarr_path)
+    assert progress["state"] == "running" and complete_timepoints(progress) == [0]
+
+    lane.end_session("sess")
+    assert _pump_until(lane, lambda: "sess" not in lane.sessions)
+    assert read_progress(s.zarr_path)["state"] == "complete"
+
+
+def _start(lane, tmp_path, sid, base="Cell_004", n_t=4):
+    stage_leaf = tmp_path / "stage" / base
+    frames_dir = stage_leaf / "decon_stage"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    return lane.start_session(
+        sid,
+        base_name=base,
+        num_timepoints=n_t,
+        n_channels=2,
+        frames_dir=frames_dir,
+        stage_leaf=stage_leaf,
+        dest_leaf=tmp_path / "gpfs" / "session_dir" / base,
+        z_step_um=0.5,
+    )
+
+
+def test_empty_rerun_with_the_same_name_does_not_delete_the_first_runs_frames(
+    tmp_path, psf
+):
+    """2026-09-24 Cell_004: a run streamed 2 timepoints and stopped; an empty
+    re-run under the same name started a minute later and, finalizing first,
+    deleted the shared staged frames under the first run's queued tickets."""
+    lane, jobs = _lane(tmp_path, psf)
+    a = _start(lane, tmp_path, "run-a")
+    for t in (0, 1):
+        for c in range(2):
+            _stage(lane, a, t, c)
+    lane.pump()
+    lane.end_session("run-a")
+    assert len(_tickets(jobs)) == 2
+
+    b = _start(lane, tmp_path, "run-b")
+    assert a.superseded and a.work_dir != b.work_dir
+    lane.end_session("run-b")  # received nothing
+    for path, _ in _tickets(jobs):
+        _complete(jobs, a, path)
+    assert _pump_until(lane, lambda: not lane.sessions)
+
+    # The superseded run's output is discarded, not copied over the re-run's.
+    assert not list(b.dsr_dir.glob("Cell_004_C*_T*.tif"))
+    assert read_live_status(b.dsr_dir)["session_id"] == "run-b"
+    # Its frames were inherited by the re-run and cleaned up at its finalize.
+    assert not a.frames_dir.exists()
+
+
+def test_rerun_with_the_same_name_keeps_its_own_frames_and_completes(tmp_path, psf):
+    lane, jobs = _lane(tmp_path, psf)
+    a = _start(lane, tmp_path, "run-a")
+    for c in range(2):
+        _stage(lane, a, 0, c)
+    lane.pump()
+    [(a_ticket, _)] = _tickets(jobs)
+    lane.end_session("run-a")
+
+    b = _start(lane, tmp_path, "run-b", n_t=1)
+    for c in range(2):
+        _stage(lane, b, 0, c)  # same frame names, the re-run's data
+    _complete(jobs, a, a_ticket)
+    lane.pump()  # a's completed ticket is dropped; b dispatches its own
+    assert b.frame(0, 0).exists(), "superseded run must not delete the re-run's frames"
+    [(b_ticket, _)] = _tickets(jobs)
+    _complete(jobs, b, b_ticket)
+    lane.end_session("run-b")
+    assert _pump_until(lane, lambda: not lane.sessions)
+
+    status = read_live_status(b.dsr_dir)
+    assert status["session_id"] == "run-b" and status["state"] == "complete"
+    assert np.array_equal(
+        tifffile.imread(b.dsr_dir / "Cell_004_C0_T000.tif"),
+        _dsr_volume("Cell_004_C0_T000"),
+    )
