@@ -79,12 +79,28 @@ def test_follower_tracks_new_timepoints(tmp_path):
     lo, hi = follower.layers[0].contrast_limits
     assert lo <= 100 <= hi  # from the first real timepoint, not the empty store
 
+    first_level0 = follower.layers[1].data[0]
+    user_limits = (5.0, 900.0)
+    follower.layers[0].contrast_limits = user_limits
+
     _finish(store, 1, done)
     follower.poll()
     assert viewer.dims.current_step[0] == 1  # follow mode jumped to it
     assert "2/3 timepoints" in viewer.text_overlay.text
     # What napari reads for t=1 is the new data, not cached zeros.
     assert int(np.asarray(follower.layers[1].data[0][1]).max()) == 210
+    # Real bug (2026-09-25): napari's own chunk-loading caches a fetched
+    # chunk by the SOURCE ARRAY'S IDENTITY, separate from dask's own cache
+    # (resize_dask_cache(0), already off above) -- reusing the same dask
+    # array and merely calling layer.refresh() left the canvas showing
+    # zeros a growing store had already written past, fixed only by
+    # closing and reopening naparym-live (fresh array objects). A poll
+    # that saw new data must hand each layer a genuinely new array, not
+    # the one from construction.
+    assert follower.layers[1].data[0] is not first_level0
+    # A data swap must not silently wipe out the current contrast, whether
+    # it's the auto-set value above or something the user dialed in by hand.
+    assert follower.layers[0].contrast_limits == list(user_limits)
 
     follower.follow = False
     _finish(store, 2, done, state="complete")

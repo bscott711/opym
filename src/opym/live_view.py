@@ -212,19 +212,14 @@ class LiveFollower:
     """Keeps a napari viewer's layers in step with a growing store."""
 
     def __init__(self, viewer, store: Path, *, follow: bool = True) -> None:
-        import dask.array as da
-        import zarr
-
         self.viewer = viewer
         self.store = Path(store)
         self.follow = follow
         self.name = self.store.name.removesuffix("_dsr.ome.zarr").removesuffix(
             ".ome.zarr"
         )
-        root = zarr.open_group(str(self.store), mode="r")
-        ms = root.attrs["multiscales"][0]
+        root, ms, levels = self._open_levels()
         channels = root.attrs.get("omero", {}).get("channels", [])
-        levels = [da.from_zarr(root[d["path"]]) for d in ms["datasets"]]
         scale = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
         n_c = levels[0].shape[1]
         self.layers = viewer.add_image(
@@ -257,6 +252,25 @@ class LiveFollower:
         viewer.dims.events.current_step.connect(lambda _e: self._show_text())
         self.poll()
 
+    def _open_levels(self):
+        """Fresh dask arrays wrapping the store's current zarr metadata.
+
+        Deliberately new `zarr.Group`/`dask.array.Array` objects every call,
+        never reused across polls: napari's own chunk-loading pipeline
+        caches a fetched chunk by the source array's identity, and neither
+        `layer.refresh()` nor `resize_dask_cache(0)` (a different cache --
+        dask's own, not napari's) busts that once a chunk has been read as
+        zeros before this timepoint's write landed. A brand-new array has
+        nothing cached against it yet, which is also exactly why closing and
+        reopening naparym-live always shows the real data.
+        """
+        import dask.array as da
+        import zarr
+
+        root = zarr.open_group(str(self.store), mode="r")
+        ms = root.attrs["multiscales"][0]
+        return root, ms, [da.from_zarr(root[d["path"]]) for d in ms["datasets"]]
+
     def _show_text(self) -> None:
         qc = self.qc.summary(int(self.viewer.dims.current_step[0]))
         self.viewer.text_overlay.text = self._status + (f"\n{qc}" if qc else "")
@@ -271,10 +285,13 @@ class LiveFollower:
             return
         new = [t for t in done if t not in self._shown]
         self._shown = done
+        _root, _ms, self._levels = self._open_levels()
+        limits = [layer.contrast_limits for layer in self.layers]
+        for c, layer in enumerate(self.layers):
+            layer.data = [lvl[:, c] for lvl in self._levels]
+            layer.contrast_limits = limits[c]  # data= must not reset this
         if not self._contrast_set and done:
             self._set_contrast(done[0])
-        for layer in self.layers:
-            layer.refresh()
         if self.follow and new:
             self.viewer.dims.set_current_step(0, max(new))
 
