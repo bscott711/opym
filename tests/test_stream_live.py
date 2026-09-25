@@ -284,6 +284,63 @@ def test_receiver_hands_time_lapse_sessions_to_the_live_lane(
         recv.close()
 
 
+def test_receiver_hands_single_timepoint_sessions_to_the_live_lane_too(
+    tmp_path, monkeypatch, psf
+):
+    """A quick alignment/test snap (1T) is exactly as useful to see live as a
+    real time-lapse, and the live lane itself has no T>1 assumption -- only
+    the receiver's old guard did."""
+    import zmq
+
+    from opym.stream.protocol import MSG_FRAME, MSG_SESSION_START, pack_message
+    from opym.stream.receiver import StreamReceiver
+
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    monkeypatch.setenv("OPYM_DECON_PSF", str(psf))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(tmp_path / "stage"))
+    recv = StreamReceiver(bind_addr="tcp://127.0.0.1:0", ack_every_n_frames=1)
+    try:
+        endpoint = recv._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+        sock = zmq.Context.instance().socket(zmq.DEALER)
+        sock.setsockopt(zmq.IDENTITY, b"sess-snap")
+        sock.connect(endpoint)
+        header = {
+            "base_name": "AlignTest",
+            "raw_root": str(tmp_path / "raw"),
+            "dtype": "uint16",
+            "shape_zyx": [3, 5, 7],
+            "num_timepoints": 1,
+            "channels": [0],
+            "channel_names": ["GFP_488"],
+            "z_step_um": 0.5,
+        }
+        sock.send_multipart(pack_message(MSG_SESSION_START, "sess-snap", header))
+        recv._run_once()
+        sock.recv_multipart()
+        assert recv.sessions["sess-snap"].live
+        import numpy as np
+
+        vol = np.full((3, 5, 7), 7, dtype=np.uint16)
+        fh = {
+            "t": 0,
+            "c": 0,
+            "frame_index": 0,
+            "timestamp": 0.0,
+            "camera_id": 0,
+            "shape_zyx": [3, 5, 7],
+            "dtype": "uint16",
+        }
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-snap", fh, vol.tobytes()))
+        recv._run_once()
+        sock.recv_multipart()
+        recv._run_once()
+        tickets = list(lanes.live_queue_dir().glob("LIVE_AlignTest_*.json"))
+        assert len(tickets) == 1
+        sock.close(linger=0)
+    finally:
+        recv.close()
+
+
 def test_viewer_store_grows_as_timepoints_finish(tmp_path, psf):
     """napari's store: the backfill export's path and layout, every finished
     (t, c) written at full resolution, progress recorded as it goes."""

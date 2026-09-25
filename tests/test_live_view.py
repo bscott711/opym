@@ -157,44 +157,105 @@ def test_qc_boxes_and_verdicts_follow_the_log(tmp_path):
     assert "t=1: ok" in viewer.text_overlay.text
 
 
-def test_resolve_store_waits_for_a_live_session_to_appear(tmp_path):
-    """The common case: launched right as/before an acquisition starts."""
-    store = _store(tmp_path)
+def _write_latest(jobs, store, session_id):
+    jobs.mkdir(exist_ok=True)
+    (jobs / live_view.LIVE_LATEST_NAME).write_text(
+        json.dumps({"store": str(store), "session_id": session_id})
+    )
+
+
+def test_watcher_opens_with_nothing_and_picks_up_the_first_session(tmp_path):
+    """The window is meant to open before any data exists -- that's the
+    whole point (pay napari's startup cost once, then leave it open)."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
     jobs = tmp_path / "jobs"
     jobs.mkdir()
-    messages: list[str] = []
-    calls: list[float] = []
-    real_sleep_calls = {"n": 0}
+    viewer = ViewerModel()
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    assert "waiting for a live acquisition" in viewer.text_overlay.text
+    assert watcher.follower is None
 
-    def fake_sleep(s):
-        calls.append(s)
-        real_sleep_calls["n"] += 1
-        if real_sleep_calls["n"] == 2:
-            # The session starts partway through waiting.
-            (jobs / "live_latest.json").write_text(json.dumps({"store": str(store)}))
+    watcher.poll()  # still nothing
+    assert watcher.follower is None
 
-    orig_sleep = live_view.time.sleep
-    live_view.time.sleep = fake_sleep
-    try:
-        got = live_view.resolve_store(
-            None, jobs=jobs, wait=True, poll_s=0.01, announce=messages.append
-        )
-    finally:
-        live_view.time.sleep = orig_sleep
-
-    assert got == store
-    assert len(calls) == 2  # stopped polling once the file appeared
-    assert len(messages) == 1  # announced once, not on every poll
-    assert "waiting for a live acquisition to start" in messages[0]
+    store = _store(tmp_path)
+    _write_latest(jobs, store, "s1")
+    watcher.poll()
+    assert watcher.follower is not None
+    assert watcher.session_id == "s1"
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
 
 
-def test_resolve_store_wait_false_still_fails_immediately(tmp_path):
+def test_watcher_switches_feeds_when_a_new_session_starts(tmp_path):
+    """A quick alignment snap, then the real acquisition right after -- same
+    window, no restart, old layers gone before the new ones load."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    jobs = tmp_path / "jobs"
+    first = _store(tmp_path, n_t=1)
+    _write_latest(jobs, first, "snap-1")
+
+    viewer = ViewerModel()
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    watcher.poll()
+    assert len(viewer.layers) == 2
+    first_layer = viewer.layers[0]
+
+    second = tmp_path / "Cell_006" / "viewer" / "Cell_006_dsr.ome.zarr"
+    second.parent.mkdir(parents=True)
+    w.create_store(
+        second,
+        n_t=5,
+        n_c=1,
+        shape_zyx=(8, 16, 12),
+        dtype=np.uint16,
+        channel_labels=["GFP 488"],
+    )
+    _write_latest(jobs, second, "real-acq")
+    watcher.poll()
+
+    assert watcher.session_id == "real-acq"
+    assert [layer.name for layer in viewer.layers] == ["GFP 488"]
+    assert first_layer not in viewer.layers  # the old session's layers are gone
+    assert "Cell_006" in viewer.title
+
+
+def test_watcher_with_an_explicit_store_loads_once_and_ignores_live_latest(tmp_path):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store = _store(tmp_path)
+    jobs = tmp_path / "jobs"
+    other = tmp_path / "Cell_006" / "viewer" / "Cell_006_dsr.ome.zarr"
+    other.parent.mkdir(parents=True)
+    w.create_store(
+        other,
+        n_t=1,
+        n_c=1,
+        shape_zyx=(8, 16, 12),
+        dtype=np.uint16,
+        channel_labels=["GFP 488"],
+    )
+    _write_latest(jobs, other, "s-other")
+
+    viewer = ViewerModel()
+    watcher = live_view.SessionWatcher(viewer, explicit_store=store, jobs=jobs)
+    watcher.poll()
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+    watcher.poll()  # a second poll must not switch to "other" via live_latest.json
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+
+
+def test_resolve_store_no_argument_is_a_one_shot_check_not_a_wait(tmp_path):
+    """The no-argument case's waiting is SessionWatcher's job now; a direct
+    call here still fails immediately if nothing is there yet."""
     with pytest.raises(FileNotFoundError, match="No live session recorded"):
-        live_view.resolve_store(None, jobs=tmp_path / "nothing", wait=False)
+        live_view.resolve_store(None, jobs=tmp_path / "nothing")
 
 
-def test_resolve_store_never_waits_on_an_explicit_bad_path(tmp_path):
-    """A typo'd path should fail fast, not hang -- wait only applies to the
-    no-argument "newest session" lookup."""
+def test_resolve_store_bad_explicit_path_fails_immediately():
     with pytest.raises(FileNotFoundError, match="No \\*_dsr.ome.zarr store"):
-        live_view.resolve_store(str(tmp_path / "typo"), wait=True)
+        live_view.resolve_store("/nonexistent/path/typo")
