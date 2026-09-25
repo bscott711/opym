@@ -9,12 +9,16 @@ seconds. When a timepoint completes, the layers are refreshed and, in follow
 mode, the time slider jumps to it. The status line shows how many timepoints
 are done and how far the view lags the newest one.
 
-With no argument it opens the newest session (`<jobs>/live_latest.json`),
-waiting for one to start if none has yet -- the common case is launching this
-right as (or just before) an acquisition begins. `--no-wait` fails immediately
-instead, and an explicit store path is never waited on (a typo there should
-fail fast, not hang). Any finished dataset's `viewer/*_dsr.ome.zarr` opens the
-same way.
+With no argument the napari window opens immediately (not once data shows
+up -- napari's own startup cost is worth paying exactly once, then leaving it
+open) and follows whichever live session is newest, switching feeds itself
+-- tearing down the old layers and loading the new store -- every time a
+fresh one starts. Run it once, before or during an acquisition, and it keeps
+up: a quick single-timepoint alignment snap, then the real time-lapse right
+after, both show up in the same window with no restart in between. An
+explicit store path is loaded once and stays put -- a typo there fails fast,
+not by waiting. Any finished dataset's `viewer/*_dsr.ome.zarr` opens the same
+way.
 
 napari's dask cache is turned off: it would keep serving the zeros read from
 a timepoint before it was written.
@@ -36,26 +40,20 @@ from opym import lanes
 from opym.ome_zarr_writer import complete_timepoints, read_progress
 
 POLL_S = 2.0
+LIVE_LATEST_NAME = "live_latest.json"
 QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
 # omero hex colour -> napari colormap name (see ome_zarr_writer.CHANNEL_COLORS).
 _COLORMAPS = {"00FF00": "green", "FF3D3D": "red", "00B3FF": "cyan", "FFC400": "yellow"}
 
 
-def resolve_store(
-    arg: str | None,
-    jobs: Path | None = None,
-    *,
-    wait: bool = False,
-    poll_s: float = POLL_S,
-    announce=print,
-) -> Path:
+def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
     """A store path, a dataset directory holding `viewer/*_dsr.ome.zarr`, or
-    (no argument) the newest live session's store.
-
-    `wait`: keep polling for `<jobs>/live_latest.json` to appear instead of
-    raising immediately -- only meaningful with no `arg`; an explicit path is
-    always checked once, since a typo there should fail fast, not hang.
+    (no argument) the newest live session's store, checked once. For the
+    no-argument case, `main()` uses `SessionWatcher` instead, which keeps
+    checking as sessions come and go -- this is for an explicit path, or a
+    one-shot lookup, where "nothing there yet" is a real error, not something
+    to wait out.
     """
     if arg:
         p = Path(arg)
@@ -65,23 +63,13 @@ def resolve_store(
         if found:
             return found[0]
         raise FileNotFoundError(f"No *_dsr.ome.zarr store at or under {p}")
-    latest = (jobs or lanes.jobs_dir()) / "live_latest.json"
-    announced = False
-    while True:
-        try:
-            return Path(json.loads(latest.read_text())["store"])
-        except (OSError, ValueError, KeyError) as exc:
-            if not wait:
-                raise FileNotFoundError(
-                    f"No live session recorded yet ({latest}); pass a store path."
-                ) from exc
-            if not announced:
-                announce(
-                    f"naparym-live: waiting for a live acquisition to start "
-                    f"({latest})... Ctrl-C to cancel."
-                )
-                announced = True
-            time.sleep(poll_s)
+    latest = (jobs or lanes.jobs_dir()) / LIVE_LATEST_NAME
+    try:
+        return Path(json.loads(latest.read_text())["store"])
+    except (OSError, ValueError, KeyError) as exc:
+        raise FileNotFoundError(
+            f"No live session recorded yet ({latest}); pass a store path."
+        ) from exc
 
 
 def status_text(name: str, progress: dict | None, now: float | None = None) -> str:
@@ -294,6 +282,66 @@ class LiveFollower:
         self._contrast_set = True
 
 
+class SessionWatcher:
+    """Keeps one already-open napari viewer following whichever live session
+    is newest, switching feeds -- discarding the old layers and loading the
+    new store -- every time a fresh session starts. Repeated single-timepoint
+    test snaps, then a real time-lapse right after, all show up in turn with
+    no restart of napari itself in between: it opens once and stays ready.
+
+    With `explicit_store` there's nothing to watch for: it loads once, on the
+    first `poll()`, and stays put for the life of the viewer.
+    """
+
+    def __init__(
+        self,
+        viewer,
+        *,
+        explicit_store: Path | None = None,
+        follow: bool = True,
+        jobs: Path | None = None,
+    ) -> None:
+        self.viewer = viewer
+        self.explicit_store = explicit_store
+        self.follow = follow
+        self.jobs = jobs or lanes.jobs_dir()
+        self.session_id: str | None = None
+        self.follower: LiveFollower | None = None
+        viewer.text_overlay.visible = True
+        viewer.text_overlay.text = (
+            "naparym-live: waiting for a live acquisition to start..."
+        )
+
+    def _latest(self) -> tuple[str | None, Path | None]:
+        try:
+            d = json.loads((self.jobs / LIVE_LATEST_NAME).read_text())
+            return d.get("session_id"), Path(d["store"])
+        except (OSError, ValueError, KeyError):
+            return None, None
+
+    def _switch(self, store: Path, session_id: str | None) -> None:
+        for layer in list(self.viewer.layers):
+            self.viewer.layers.remove(layer)
+        self.session_id = session_id
+        self.follower = LiveFollower(self.viewer, store, follow=self.follow)
+        self.viewer.title = f"naparym-live: {store.name}"
+
+    def poll(self) -> None:
+        if self.explicit_store is not None:
+            if self.follower is None:
+                self._switch(self.explicit_store, session_id="explicit")
+            else:
+                self.follower.poll()
+            return
+        session_id, store = self._latest()
+        if store is None:
+            return  # nothing new; keep showing the waiting message
+        if session_id != self.session_id:
+            self._switch(store, session_id)
+        elif self.follower is not None:
+            self.follower.poll()
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
         prog="naparym-live", description=__doc__.splitlines()[0]
@@ -301,16 +349,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "store",
         nargs="?",
-        help="OME-Zarr store or dataset dir (default: the newest live session)",
+        help="OME-Zarr store or dataset dir (default: follow whichever live "
+        "session is newest, switching automatically as new ones start)",
     )
     ap.add_argument(
         "--no-follow", action="store_true", help="don't jump to new timepoints"
-    )
-    ap.add_argument(
-        "--no-wait",
-        action="store_true",
-        help="fail immediately if no live session has started yet, instead "
-        "of waiting for one",
     )
     ap.add_argument("--poll", type=float, default=POLL_S, help="seconds between checks")
     args = ap.parse_args(argv)
@@ -320,21 +363,27 @@ def main(argv: list[str] | None = None) -> None:
     from qtpy.QtCore import QTimer
 
     resize_dask_cache(0)
-    try:
-        store = resolve_store(args.store, wait=args.store is None and not args.no_wait)
-    except KeyboardInterrupt:
-        return
-    viewer = napari.Viewer(title=f"naparym-live: {store.name}", ndisplay=3)
-    follower = LiveFollower(viewer, store, follow=not args.no_follow)
+    # A typo'd explicit path should still fail fast, before anything opens --
+    # but the no-argument "whatever's newest" case never has a bad path to
+    # fail on, so it's the SessionWatcher's job, not this lookup's.
+    explicit_store = resolve_store(args.store) if args.store else None
+    viewer = napari.Viewer(title="naparym-live", ndisplay=3)
+    watcher = SessionWatcher(
+        viewer, explicit_store=explicit_store, follow=not args.no_follow
+    )
 
     @viewer.bind_key("f")
     def _toggle_follow(_viewer):
-        follower.follow = not follower.follow
-        _viewer.status = f"follow {'on' if follower.follow else 'off'}"
+        watcher.follow = not watcher.follow
+        if watcher.follower is not None:
+            watcher.follower.follow = watcher.follow
+        _viewer.status = f"follow {'on' if watcher.follow else 'off'}"
 
     timer = QTimer()
-    timer.timeout.connect(follower.poll)
+    timer.timeout.connect(watcher.poll)
     timer.start(int(args.poll * 1000))
+    watcher.poll()  # pick up an already-running session now, not after the
+    # first --poll-second tick
     napari.run()
 
 

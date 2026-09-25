@@ -163,9 +163,7 @@ def _estimate_session_bytes(header: dict[str, Any]) -> int:
     slightly per the protocol, see `protocol.py`)."""
     nz, ny, nx = header["shape_zyx"]
     itemsize = np.dtype(header["dtype"]).itemsize
-    return (
-        nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
-    )
+    return nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
 
 
 @dataclass
@@ -533,12 +531,17 @@ class StreamReceiver:
         )
 
     def _maybe_start_live(self, session: SessionState) -> None:
-        """Hand a time-lapse session to the live lane when it's enabled
-        (OPYM_LIVE_LANE=1) and decon is on: its per-timepoint input is the
-        decon_stage/ TIFFs this receiver already writes."""
+        """Hand a session to the live lane when it's enabled (OPYM_LIVE_LANE=1)
+        and decon is on: its per-timepoint input is the decon_stage/ TIFFs
+        this receiver already writes.
+
+        Single-timepoint sessions go through it too, not just time-lapses:
+        a quick alignment/test snap benefits from showing up in naparym-live
+        immediately just as much as a real acquisition does, and the live
+        lane's own dispatch/finalize logic has no special-casing for T>1 to
+        begin with -- this guard was the only place that assumed one.
+        """
         if not (_live_lane_enabled() and session.decon_enabled):
-            return
-        if session.num_timepoints <= 1:
             return
         psf = resolve_decon_psf()
         if psf is None:
