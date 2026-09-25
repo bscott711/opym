@@ -79,7 +79,7 @@ def test_follower_tracks_new_timepoints(tmp_path):
     lo, hi = follower.layers[0].contrast_limits
     assert lo <= 100 <= hi  # from the first real timepoint, not the empty store
 
-    first_level0 = follower.layers[1].data[0]
+    first_layer = follower.layers[1]
     user_limits = (5.0, 900.0)
     follower.layers[0].contrast_limits = user_limits
 
@@ -87,18 +87,15 @@ def test_follower_tracks_new_timepoints(tmp_path):
     follower.poll()
     assert viewer.dims.current_step[0] == 1  # follow mode jumped to it
     assert "2/3 timepoints" in viewer.text_overlay.text
+    assert [layer.name for layer in follower.layers] == ["GFP 488", "mScarlet 561"]
     # What napari reads for t=1 is the new data, not cached zeros.
     assert int(np.asarray(follower.layers[1].data[0][1]).max()) == 210
-    # Real bug (2026-09-25): napari's own chunk-loading caches a fetched
-    # chunk by the SOURCE ARRAY'S IDENTITY, separate from dask's own cache
-    # (resize_dask_cache(0), already off above) -- reusing the same dask
-    # array and merely calling layer.refresh() left the canvas showing
-    # zeros a growing store had already written past, fixed only by
-    # closing and reopening naparym-live (fresh array objects). A poll
-    # that saw new data must hand each layer a genuinely new array, not
-    # the one from construction.
-    assert follower.layers[1].data[0] is not first_level0
-    # A data swap must not silently wipe out the current contrast, whether
+    # A whole new layer, not the same object with new data assigned onto it
+    # -- see poll()'s docstring for why this is the fix, not the narrower
+    # ones tried first. The old layer is gone from the viewer entirely.
+    assert follower.layers[1] is not first_layer
+    assert first_layer not in viewer.layers
+    # A rebuild must not silently wipe out the current contrast, whether
     # it's the auto-set value above or something the user dialed in by hand.
     assert follower.layers[0].contrast_limits == list(user_limits)
 
@@ -171,6 +168,11 @@ def test_qc_boxes_and_verdicts_follow_the_log(tmp_path):
     assert layer.nshapes == 24
     np.testing.assert_allclose(layer.edge_color[-1], [0, 1, 0, 1])  # ok -> lime
     assert "t=1: ok" in viewer.text_overlay.text
+    # poll() rebuilds the image layers, appending them after whatever's
+    # already in the viewer -- including the QC box, added once in __init__
+    # -- so without re-asserting z-order the box would end up hidden
+    # underneath the (additive-blended) image data instead of on top of it.
+    assert viewer.layers.index(layer) == len(viewer.layers) - 1
 
 
 def _write_latest(jobs, store, session_id):

@@ -219,51 +219,24 @@ class LiveFollower:
             ".ome.zarr"
         )
         root, ms, levels = self._open_levels()
-        channels = root.attrs.get("omero", {}).get("channels", [])
+        self._channels = root.attrs.get("omero", {}).get("channels", [])
         scale = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
-        n_c = levels[0].shape[1]
-        self.layers = viewer.add_image(
-            levels,
-            channel_axis=1,
-            multiscale=True,
-            name=[
-                channels[c]["label"] if c < len(channels) else f"C{c}"
-                for c in range(n_c)
-            ],
-            colormap=[
-                _COLORMAPS.get(channels[c].get("color", ""), "gray")
-                if c < len(channels)
-                else "gray"
-                for c in range(n_c)
-            ],
-            blending="additive",
-            scale=[scale[0]] + scale[2:],
-            contrast_limits=[0, 300],
-        )
-        self.layers = self.layers if isinstance(self.layers, list) else [self.layers]
+        self._scale = [scale[0]] + scale[2:]
+        self._n_c = levels[0].shape[1]
         self._levels = levels
+        self.layers = self._add_layers(levels, contrast=[[0, 300]] * self._n_c)
         self._shown: list[int] = []
         self._contrast_set = False
         self._status = ""
         self.qc = QCOverlay(
-            viewer, qc_dir_for(self.store), [scale[0]] + scale[2:], levels[0].shape[2]
+            viewer, qc_dir_for(self.store), self._scale, levels[0].shape[2]
         )
         viewer.text_overlay.visible = True
         viewer.dims.events.current_step.connect(lambda _e: self._show_text())
         self.poll()
 
     def _open_levels(self):
-        """Fresh dask arrays wrapping the store's current zarr metadata.
-
-        Deliberately new `zarr.Group`/`dask.array.Array` objects every call,
-        never reused across polls: napari's own chunk-loading pipeline
-        caches a fetched chunk by the source array's identity, and neither
-        `layer.refresh()` nor `resize_dask_cache(0)` (a different cache --
-        dask's own, not napari's) busts that once a chunk has been read as
-        zeros before this timepoint's write landed. A brand-new array has
-        nothing cached against it yet, which is also exactly why closing and
-        reopening naparym-live always shows the real data.
-        """
+        """Fresh dask arrays wrapping the store's current zarr metadata."""
         import dask.array as da
         import zarr
 
@@ -271,11 +244,56 @@ class LiveFollower:
         ms = root.attrs["multiscales"][0]
         return root, ms, [da.from_zarr(root[d["path"]]) for d in ms["datasets"]]
 
+    def _add_layers(self, levels, contrast):
+        layers = self.viewer.add_image(
+            levels,
+            channel_axis=1,
+            multiscale=True,
+            name=[
+                self._channels[c]["label"] if c < len(self._channels) else f"C{c}"
+                for c in range(self._n_c)
+            ],
+            colormap=[
+                _COLORMAPS.get(self._channels[c].get("color", ""), "gray")
+                if c < len(self._channels)
+                else "gray"
+                for c in range(self._n_c)
+            ],
+            blending="additive",
+            scale=self._scale,
+            contrast_limits=contrast,
+        )
+        return layers if isinstance(layers, list) else [layers]
+
     def _show_text(self) -> None:
         qc = self.qc.summary(int(self.viewer.dims.current_step[0]))
         self.viewer.text_overlay.text = self._status + (f"\n{qc}" if qc else "")
 
     def poll(self) -> None:
+        """Rebuild the image layers from scratch on every new timepoint,
+        rather than update the existing ones in place.
+
+        Found live on Argus (2026-09-25): the volume stayed black in the
+        open window while the store kept growing, and only closing and
+        reopening naparym-live ever showed the real data -- a fresh process
+        always works because it builds its layers via `add_image` from
+        scratch. Two narrower fixes (fresh dask arrays reassigned onto the
+        existing layers' `.data`; then adding an explicit `layer.refresh()`
+        alongside that, once tracing napari's event wiring showed the vispy
+        renderer only listens for `events.set_data`, fired only from
+        `refresh()`) each turned out to be necessary but not sufficient --
+        `set_data` was confirmed (by a listener attached in the test) to
+        already fire even without either fix, meaning whatever the real
+        remaining gap is sits deeper in napari's rendering pipeline than
+        either fix reached, in a part not reachable from here to inspect (no
+        working GPU/software-GL context on Argus to render a real frame and
+        compare pixels -- confirmed while investigating this). Since a full
+        restart is the one thing actually confirmed to work, every timepoint
+        now gets that same fresh construction, just without restarting the
+        process: remove the old layers only after the new ones are built and
+        added successfully (so a construction failure never leaves the
+        viewer blank), carrying over whatever contrast_limits was showing.
+        """
         progress = read_progress(self.store)
         self._status = status_text(self.name, progress)
         self.qc.poll()
@@ -285,11 +303,25 @@ class LiveFollower:
             return
         new = [t for t in done if t not in self._shown]
         self._shown = done
+        old_layers = self.layers
+        limits = [layer.contrast_limits for layer in old_layers]
         _root, _ms, self._levels = self._open_levels()
-        limits = [layer.contrast_limits for layer in self.layers]
-        for c, layer in enumerate(self.layers):
-            layer.data = [lvl[:, c] for lvl in self._levels]
-            layer.contrast_limits = limits[c]  # data= must not reset this
+        self.layers = self._add_layers(self._levels, contrast=limits)
+        for layer in old_layers:
+            self.viewer.layers.remove(layer)
+        # The new image layers land at the end of the layer list (added
+        # after the QC box, which was only ever added once, in __init__) --
+        # move the box back on top so it isn't hidden under them.
+        if self.qc.layer is not None and self.qc.layer in self.viewer.layers:
+            self.viewer.layers.move(
+                self.viewer.layers.index(self.qc.layer), len(self.viewer.layers)
+            )
+        # The new layers were added while the old ones (often the same
+        # channel names) were still present, so napari auto-suffixed any
+        # collision ("GFP 488 [1]") to keep names unique at that instant.
+        # Now that the old ones are gone, restore the clean name.
+        for layer in self.layers:
+            layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
         if not self._contrast_set and done:
             self._set_contrast(done[0])
         if self.follow and new:
