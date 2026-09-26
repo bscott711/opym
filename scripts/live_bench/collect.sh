@@ -15,7 +15,7 @@ cd "$WT"
 PYTHONPATH="$WT/src" "$PY" -m opym.stream.trace_report --jobs "$JOBS" --out "$OUT" "$@" \
   | tee "$OUT/report.txt"
 if [ -f "$HOME/$RUN.replay.json" ]; then
-  PYTHONPATH="$WT/src" "$PY" "$LB_DIR/verify.py" "$RUN" | tee "$OUT/verify.json"
+  PYTHONPATH="$WT/src" "$PY" "$LB_DIR/verify.py" "$RUN" "$@" | tee "$OUT/verify.json"
 fi
 [ -f "$LV/sample.jsonl" ] && cp "$LV/sample.jsonl" "$OUT/raw/"
 if compgen -G "$LV/shots/*.png" >/dev/null; then mkdir -p "$OUT/shots" && mv "$LV"/shots/*.png "$OUT/shots/"; fi
