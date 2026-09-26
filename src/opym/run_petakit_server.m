@@ -167,14 +167,16 @@ end
 idleTimer = 0;
 
 while true
-    [jobFiles, claim_dir] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
+    [jobFiles, claim_dir, liveActive] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
 
     if isempty(jobFiles)
         % Short poll: a live ticket waiting here is time the live view is
         % behind (up to 2 s per timepoint with the old 2 s pause). dir() on
-        % the tmpfs queue is cheap.
-        pause(0.1);
-        idleTimer = idleTimer + 0.1;
+        % the tmpfs queue is cheap; poll hardest while an acquisition holds
+        % the live lease.
+        if liveActive, pollS = 0.02; else, pollS = 0.1; end
+        pause(pollS);
+        idleTimer = idleTimer + pollS;
 
         if idleTimeoutSec > 0 && idleTimer >= idleTimeoutSec
             logMsg('[Server] Idle timeout (%d s) reached. Shutting down to release GPUs.', idleTimeoutSec);
@@ -792,12 +794,17 @@ while true
             movefile(activePath, fullfile(done_dir, currentFile));
             logMsg('[Server] <<< Finished: %s', currentFile);
 
-            % --- FREE GPU MEMORY ---
-            try
-                for g = 1:gpuDeviceCount
-                    reset(gpuDevice(g));
+            % --- FREE GPU MEMORY --- except between live tickets: a reset
+            % costs ~0.3 s of this server's time and throws away what the
+            % next one reuses (the decon's cached OTFs, cuFFT plans, the
+            % memory pool). The next backfill job's reset frees them.
+            if ~strcmp(jobType, 'live_zarr')
+                try
+                    for g = 1:gpuDeviceCount
+                        reset(gpuDevice(g));
+                    end
+                catch
                 end
-            catch
             end
         else
             logMsg('[Server] <<< Dispatched %s to background worker.', currentFile);
@@ -828,12 +835,13 @@ while true
     writeProfile(profiling_dir, envServerId, prof);
 end
 
-function [jobFiles, fromDir] = nextJobFiles(liveDir, backfillDir, leasePath)
+function [jobFiles, fromDir, liveActive] = nextJobFiles(liveDir, backfillDir, leasePath)
     % Claimable tickets, oldest name first, from the live queue if it has
     % any, else from the backfill queue unless a live lease is fresh.
     fromDir = liveDir;
     jobFiles = claimableIn(liveDir);
-    if ~isempty(jobFiles) || liveLeaseActive(leasePath)
+    liveActive = ~isempty(jobFiles) || liveLeaseActive(leasePath);
+    if liveActive
         return;
     end
     fromDir = backfillDir;

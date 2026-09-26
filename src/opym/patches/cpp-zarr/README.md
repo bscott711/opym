@@ -44,9 +44,27 @@ never rewrites the `.zarray`.
   from the shared install). It uses the array's own compressor, writes each
   chunk to a temp name then renames it, and skips all-zero chunks.
 
-Both are checked against zarr-python in `tests/test_cpp_zarr_nd.py`
-(`-m gpu`). A 1 GB DSR block takes ~0.7 s to write to /dev/shm. A 161-plane
-raw volume takes ~0.4 s to read from GPFS.
+- `parallelReadZarr(store, 'leadingIndex', [t+1], 'orientForDecon', true)`
+  returns `flip(permute(zyx, [3 2 1]), 1)` directly -- the `(X, Y, Z)` array
+  the live job deconvolves -- by reversing each C-order row, instead of the
+  element-wise transpose to `(Z, Y, X)` that MATLAB then undid (0.16 s ->
+  0.02 s for a 161-plane volume on /dev/shm). C-order arrays only.
+- `t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, [t+1 c+1])`
+  (`mexSrc/opymwriteliveoutputsmex.cpp`) writes everything the live job
+  produces for one deskewed `(Y, X, Z)` volume from a single parallel
+  transpose into C order: the live viewer's `.npy` buffer first (published
+  before anything is encoded), then every pyramid level (2x block means,
+  opym's `downsample2`) and the Z-MIP, compressed with the same blosc call as
+  `opymWriteZarrBlock`. After each call a background thread readies the next
+  buffer file (allocated, every page mapped) so the next transpose never
+  page-faults. Replaced a MATLAB permute + fwrite, a second permute, the
+  C-order chunk gather (a cache miss per voxel) and a GPU round trip:
+  ~2.6 s -> ~0.3 s per volume.
+
+All are checked against zarr-python in `tests/test_cpp_zarr_nd.py`
+(`-m gpu`), and end to end, bit for bit, against the TIFF live path in
+`tests/test_live_zarr_equivalence.py`. A 161-plane raw volume takes ~0.4 s
+to read from GPFS.
 
 ## Rebuilding
 
@@ -77,6 +95,19 @@ The block writer additionally links blosc v1 (upstream's writer calls
   -lblosc -lblosc2 -lz -luuid \
   opymwritezarrblockmex.cpp ../src/zarr.cpp ../src/helperfunctions.cpp \
   ../src/parallelwritezarr.cpp ../src/parallelreadzarr.cpp
+```
+
+The live-output writer (blosc v1, and `-march=x86-64-v3`: AVX2, which every
+Argus node has):
+
+```bash
+/mmfs2/cm/shared/apps_local/matlab/R2024B/bin/mex -outdir ../linux -output opymWriteLiveOutputs.mexa64 \
+  CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-O3 -DNDEBUG" \
+  CXXFLAGS='$CXXFLAGS -fopenmp -O3 -march=x86-64-v3' \
+  LDFLAGS="\$LDFLAGS -fopenmp -O3 -pthread -Wl,-rpath,$CONDA_LIB" \
+  -I"$CONDA_INC" -I"$NJSON_INC" -L"$CONDA_LIB" \
+  -lblosc -lz -luuid \
+  opymwriteliveoutputsmex.cpp ../src/zarr.cpp ../src/helperfunctions.cpp
 ```
 
 To run the `-m gpu` tests from a shell: `module load matlab/R2024b`,
