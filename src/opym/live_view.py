@@ -57,9 +57,11 @@ LIVE_LATEST_NAME = "live_latest.json"
 QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
 # omero hex colour -> napari colormap name (see ome_zarr_writer.CHANNEL_COLORS).
-# The red channel is shown in magenta.
+# FF3D3D is the red that stores written before 2026-09-26 name for channel 1:
+# shown in magenta too.
 _COLORMAPS = {
     "00FF00": "green",
+    "FF00FF": "magenta",
     "FF3D3D": "magenta",
     "00B3FF": "cyan",
     "FFC400": "yellow",

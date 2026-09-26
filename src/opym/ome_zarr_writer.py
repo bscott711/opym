@@ -43,7 +43,8 @@ DSR_VOXEL_UM = 0.136
 # is slow to pan. Three levels cost ~14% extra storage.
 PYRAMID_LEVELS = 3
 # Distinct, colour-blind-safe-ish emission colours; index = channel number.
-CHANNEL_COLORS = ("00FF00", "FF3D3D", "00B3FF", "FFC400")
+# The second is magenta, not red: two-colour composites are green/magenta.
+CHANNEL_COLORS = ("00FF00", "FF00FF", "00B3FF", "FFC400")
 PROGRESS_NAME = ".opym_live.json"
 # The processed store (bioformats2raw layout 3); see the module docstring.
 BF2RAW_LAYOUT = 3
