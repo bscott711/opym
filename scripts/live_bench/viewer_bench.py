@@ -8,7 +8,9 @@ so the same script measures the old viewer and the new one.
 
 Sequence (after the session has loaded and painted):
   rotate_newest  20 rotations of 6 degrees at the newest timepoint
-  scrub_cold     15 steps back, right away
+  (idle 25 s: time for a viewer that fills VRAM in the background)
+  scrub_preloaded 10 steps back, to timepoints never shown yet
+  scrub_cold     15 steps further back
   (wait for the prefetch to settle, if this viewer has one; else 20 s)
   scrub_warm     15 steps forward
   (rest 2 s: full resolution comes back)
@@ -59,8 +61,12 @@ def main() -> None:
     from qtpy.QtCore import QTimer
 
     viewer = napari.Viewer(title=args.title, ndisplay=3)
+    extra = {}
+    vram_gb = float(os.environ.get("LB_VRAM_GB", "48"))
+    if hasattr(live_view, "TextureCache") and vram_gb > 0:
+        extra["vram"] = live_view.TextureCache(vram_gb * 1e9)
     watcher = live_view.SessionWatcher(
-        viewer, jobs=lanes.jobs_dir(), follow=True, title=args.title
+        viewer, jobs=lanes.jobs_dir(), follow=True, title=args.title, **extra
     )
     poll = QTimer()
     poll.timeout.connect(watcher.poll)
@@ -122,6 +128,8 @@ def main() -> None:
                 shot("loaded")
                 state["plan"] = (
                     [rotate("rotate_newest") for _ in range(20)]
+                    + [("rest", 25.0, None)]
+                    + [step("scrub_preloaded", -1) for _ in range(10)]
                     + [step("scrub_cold", -1) for _ in range(15)]
                     + [("warm", None, None)]
                     + [step("scrub_warm", +1) for _ in range(15)]
