@@ -727,28 +727,23 @@ def test_each_channel_shows_its_newest_timepoint_as_soon_as_it_lands(tmp_path):
     assert shown[-2:] == [([1], [0]), ([1], [1])]
 
 
-def test_scrubbing_shows_half_resolution_then_refines_when_it_rests(
-    tmp_path, monkeypatch
-):
+def test_every_timepoint_is_shown_at_full_resolution(tmp_path):
+    """The user moving the slider gets full resolution too: a coarse level
+    while moving flickers (tried, and rejected by the user)."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
 
-    monkeypatch.setattr(live_view, "REFINE_AFTER_S", 0.0)
     store, buffers = _buffered_session(tmp_path, done_t=3)
     viewer = ViewerModel(ndisplay=3)
     follower = live_view.LiveFollower(
         viewer, store, buffers_dir=buffers, prefetch_pool=_InlinePool()
     )
     layer = follower.layers[0]
-    assert viewer.dims.current_step[0] == 2 and layer.data_level == 0
-    viewer.dims.set_current_step(0, 0)  # the user moves the slider
-    assert layer.data_level == 1
-    assert _shown_data(layer).shape == follower.sources[0].shapes[1][1:]
-    follower.poll()  # rested: the full resolution is read in the background
-    follower.poll()  # ... and shown
-    assert layer.data_level == 0
-    assert _shown_data(layer).shape == (8, 16, 12)
-    assert int(_shown_data(layer).max()) == 100
+    for t in (0, 1, 2):
+        viewer.dims.set_current_step(0, t)
+        assert layer.data_level == 0
+        assert _shown_data(layer).shape == (8, 16, 12)
+        assert int(_shown_data(layer).max()) == 100 * (t + 1)
 
 
 def test_the_follower_moving_the_slider_stays_at_full_resolution(tmp_path):
@@ -767,7 +762,7 @@ def test_the_follower_moving_the_slider_stays_at_full_resolution(tmp_path):
     assert [layer.data_level for layer in follower.layers] == [0, 0]
 
 
-def test_prefetch_caches_every_level_so_moving_back_reads_nothing(
+def test_prefetch_caches_full_resolution_so_moving_back_reads_nothing(
     tmp_path, monkeypatch
 ):
     """Everything the lane produced is in the viewer's RAM: moving back to
@@ -793,10 +788,13 @@ def test_prefetch_caches_every_level_so_moving_back_reads_nothing(
     )
     follower.poll()
     cache = follower.cache
-    assert cache.full.bytes > 0 and cache.small.bytes > 0
+    assert cache.full.bytes > 0
+    for t in range(3):
+        assert follower.sources[0].cached(t, 0)  # full resolution, in RAM
     reads = _count_reads(monkeypatch)
-    viewer.dims.set_current_step(0, 0)  # half resolution while moving
+    viewer.dims.set_current_step(0, 0)
     assert reads == []
+    assert int(_shown_data(follower.layers[0]).max()) == 100
 
 
 def test_the_volume_cache_keeps_to_its_budget():

@@ -50,6 +50,11 @@ def main() -> None:
 
     if hasattr(live_view, "no_hugepage_stalls"):
         live_view.no_hugepage_stalls()
+    import os
+
+    for name in ("PREFETCH_IN_FLIGHT", "PREFETCH_RADIUS", "PREFETCH_READ_THREADS"):
+        if os.environ.get("LB_" + name):
+            setattr(live_view, name, int(os.environ["LB_" + name]))
     import napari
     from qtpy.QtCore import QTimer
 

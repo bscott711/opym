@@ -20,10 +20,9 @@ explicit store path is loaded once and stays put -- a typo there fails fast,
 not by waiting. Any finished dataset's `viewer/*_dsr.ome.zarr` opens the same
 way.
 
-Fast to scrub and rotate: each channel is one multiscale layer rendered at
-full resolution at rest and at half resolution while the time slider moves,
-with every timepoint prefetched into this process's RAM (`--cache-gb`) in
-the background, so the UI thread only ever uploads. While following, each
+Fast to scrub and rotate, always at full resolution: the timepoints around
+the time slider are prefetched into this process's RAM (`--cache-gb`) in
+the background, so the UI thread only uploads. While following, each
 channel shows its newest timepoint as soon as it lands (GFP about one stack
 before mScarlet: the channels are acquired one after the other).
 
@@ -84,12 +83,11 @@ MAPPED_BUFFERS = 4
 # screen, and, apart so it never queues behind them, for prefetching.
 READ_THREADS = 32
 PREFETCH_READ_THREADS = 8
-# Prefetch jobs in flight at once, nearest the time slider first.
+# Prefetch jobs in flight at once, nearest the time slider first, and how
+# far either side of it full-resolution timepoints are read ahead.
 PREFETCH_IN_FLIGHT = 3
+PREFETCH_RADIUS = 12
 _PREFETCH_READ_POOL = None
-# Scrubbing: level 1 while the time slider moves; full resolution once it
-# has rested this long.
-REFINE_AFTER_S = 0.35
 
 
 def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
@@ -265,9 +263,8 @@ class VolumeCache:
 
 class ViewCache:
     """The viewer's two caches: full-resolution volumes (level 0, the big
-    ones, `full_gb`) and every coarser level (the scrubbing and thumbnail
-    levels, 1/8 and 1/64 the size, `small_gb`), so a long session's full
-    resolution can't push out the levels that make scrubbing fast."""
+    ones, `full_gb`) and coarser levels (the layer thumbnails', `small_gb`),
+    so a long session's full resolution can't push the thumbnails out."""
 
     def __init__(self, full_gb: float = 100.0, small_gb: float = 40.0) -> None:
         self.full = VolumeCache(full_gb * 1e9)
@@ -410,6 +407,9 @@ class ChannelSource:
         self.served[level] = used
         return arr
 
+    def cached(self, t: int, level: int) -> bool:
+        return self._key(t, level) in self._cache.of(level)
+
     def prefetch(self, t: int, level: int) -> None:
         """Make (t, level) a cache hit; runs on the prefetch pool. A full-
         resolution buffer is copied into the cache, so the timepoint stays
@@ -500,7 +500,10 @@ class _SeriesView:
         key = key if isinstance(key, tuple) else (key,)
         tk, more = key[0], key[1:]
         if isinstance(tk, slice):
-            return np.stack([self._one(t, more) for t in self._ts[tk]])
+            ts = self._ts[tk]
+            if len(ts) == 1:  # napari's thick slice t:t+1: a view, no copy
+                return self._one(ts[0], more)[np.newaxis]
+            return np.stack([self._one(t, more) for t in ts])
         return self._one(self._ts[int(tk)], more)
 
     def __array__(self, dtype=None, copy=None):
@@ -513,17 +516,15 @@ class _SeriesView:
 def live_image_class():
     """`LiveImage`, a napari Image subclass (napari is imported lazily).
 
-    napari renders a multiscale layer in 3D at its coarsest level only: its
-    slice request takes the last level (`len(data) - 1`), and
-    `Layer._update_draw` pins `_data_level` there on every draw. That is
-    why the live layers used to be single-resolution. A `LiveImage` renders
-    the level the follower picks instead -- full resolution at rest, level 1
-    (1/8 the bytes) while the time slider moves -- through its own slicing
-    state (the extension point napari's Labels layer uses), which hands the
-    request the levels up to that one. Its thumbnail comes from napari's
-    thumbnail level (the coarsest with an axis of 64 or more), not from a
-    1 GB full-resolution max. `before_slice(layer, dims)` runs before each
-    dims-driven slice, so the level is set before napari reads anything.
+    Always full resolution, with the layer-list thumbnail from a coarse
+    level of the store's pyramid instead of a max over 1 GB (0.17 s per
+    channel on every timepoint change). napari would render a multiscale
+    layer's coarsest level in 3D -- its slice request takes the last level
+    (`len(data) - 1`) and `Layer._update_draw` pins `_data_level` there --
+    so a `LiveImage` hands the request only level 0 to render, through its
+    own slicing state (the extension point napari's Labels layer uses),
+    while the thumbnail level stays reachable. (Showing a coarse level while
+    the time slider moves was tried and rejected: it flickers.)
     """
     global _LIVE_IMAGE
     if _LIVE_IMAGE is None:
@@ -561,9 +562,7 @@ def live_image_class():
                 return request
 
         class LiveImage(Image):
-            def __init__(self, *args, before_slice=None, **kwargs) -> None:
-                self._before_slice = before_slice
-                self._live_level = 0
+            def __init__(self, *args, **kwargs) -> None:
                 super().__init__(*args, **kwargs)
                 self._data_level = 0
 
@@ -572,20 +571,7 @@ def live_image_class():
 
             def _update_draw(self, *args, **kwargs) -> None:
                 super()._update_draw(*args, **kwargs)
-                self._data_level = self._live_level
-
-            def _slice_dims(self, dims, force: bool = False) -> None:
-                if self._before_slice is not None:
-                    self._before_slice(self, dims)
-                super()._slice_dims(dims, force)
-
-            def set_level(self, level: int) -> bool:
-                """Render `level` from the next slice on; True if it changed."""
-                self._live_level = level
-                if self._data_level == level:
-                    return False
-                self._data_level = level
-                return True
+                self._data_level = 0
 
         _LIVE_IMAGE = LiveImage
     return _LIVE_IMAGE
@@ -753,17 +739,15 @@ class PaintClock:
 class LiveFollower:
     """Keeps a napari viewer's layers in step with a growing store.
 
-    One `LiveImage` layer per channel over the store's whole pyramid (a
-    `ChannelSource` per channel): full resolution at rest, level 1 while
-    the time slider moves, refined to full resolution in the background
-    once it has rested `REFINE_AFTER_S` (the UI thread then only uploads).
-    While following, each channel shows its newest processed timepoint the
-    moment it lands -- the channels are acquired one after the other, so
-    GFP about one stack ahead of mScarlet. Every timepoint the lane
-    produces is prefetched into this viewer's cache (`ViewCache`) in the
-    background: its coarse levels from the store, its full resolution
-    copied from the RAM-disk buffer while that exists, so moving through the
-    session never decodes on the UI thread.
+    One `LiveImage` layer per channel over the store's pyramid (a
+    `ChannelSource` per channel), always at full resolution. While
+    following, each channel shows its newest processed timepoint the moment
+    it lands -- the channels are acquired one after the other, so GFP about
+    one stack ahead of mScarlet. In the background, this viewer's cache
+    (`ViewCache`) is filled: every full-resolution buffer before the lane
+    trims it, the timepoints within `PREFETCH_RADIUS` of the time slider
+    (nearest first), and every timepoint's thumbnail level, so moving
+    through the session leaves only the upload to the UI thread.
 
     `replaces`: a previous feed's layers, taken down once this one's are up.
     `painter`: traces when each shown timepoint is painted (`PaintClock`).
@@ -815,14 +799,9 @@ class LiveFollower:
         self._replaces = list(replaces or [])
         self._shown: list[int] = []  # every channel shown with its own data
         self._shown_c: dict[int, set[int]] = {src.c: set() for src in self.sources}
-        self._submitted: set[tuple[int, int, int]] = set()  # (c, t, level)
-        self._inflight: list = []
+        self._inflight: dict[tuple[int, int, int], object] = {}  # (c, t, level)
         self._contrast_set: set[int] = set()
         self._followed: int | None = None
-        self._driving = False
-        self._slider_t: int | None = None
-        self._scrub_at: float | None = None
-        self._refine: tuple | None = None
         self._status = ""
         self.qc = QCOverlay(
             viewer,
@@ -877,26 +856,34 @@ class LiveFollower:
 
     def _prefetch_new(self) -> None:
         """Keep `PREFETCH_IN_FLIGHT` prefetch jobs going: first every full-
-        resolution buffer not yet copied (the lane trims them), then coarse
-        levels nearest the time slider, so where the user is scrubbing
-        fills first."""
-        self._inflight = [f for f in self._inflight if not f.done()]
+        resolution buffer not yet copied (the lane trims them), then the
+        timepoints nearest the time slider, then thumbnail levels."""
+        self._inflight = {k: f for k, f in self._inflight.items() if not f.done()}
         free = PREFETCH_IN_FLIGHT - len(self._inflight)
         if free <= 0:
             return
         here = int(self.viewer.dims.current_step[0])
+        thumb = self.layers[0]._thumbnail_level if self.layers else 0
         jobs = []
         for src in self.sources:
             jobs += [(0, t, src, 0) for t in src.buffered]
             jobs += [
-                (abs(t - here), t, src, level)
+                (1 + abs(t - here), t, src, 0)
                 for t in src.stored
-                for level in range(1, self._n_levels)
+                if abs(t - here) <= PREFETCH_RADIUS
             ]
-        jobs = [j for j in jobs if (j[2].c, j[1], j[3]) not in self._submitted]
-        for _d, t, src, level in sorted(jobs, key=lambda j: (j[0], j[3], -j[1]))[:free]:
-            self._submitted.add((src.c, t, level))
-            self._inflight.append(self._pool.submit(src.prefetch, t, level))
+            if thumb:
+                jobs += [(1000 + abs(t - here), t, src, thumb) for t in src.stored]
+        chosen = []
+        for _p, t, src, level in sorted(jobs, key=lambda j: (j[0], -j[1])):
+            key = (src.c, t, level)
+            if key in self._inflight or src.cached(t, level):
+                continue
+            chosen.append((key, src, t, level))
+            if len(chosen) == free:
+                break
+        for key, src, t, level in chosen:
+            self._inflight[key] = self._pool.submit(src.prefetch, t, level)
 
     # --- polling ------------------------------------------------------------
 
@@ -945,7 +932,6 @@ class LiveFollower:
         self._show_text()
         self._prefetch_new()
         phases = self._follow() if self.layers else self._build()
-        self._refine_step()
         for t, channels in self._newly_shown().items():
             trace.record(
                 "shown",
@@ -980,28 +966,10 @@ class LiveFollower:
     # --- following ------------------------------------------------------------
 
     def _drive(self, t: int) -> None:
-        """Move the time slider for the follower: full resolution."""
-        self._driving = True
-        try:
-            self.viewer.dims.set_current_step(0, t)
-        finally:
-            self._driving = False
-        self._slider_t = t
-
-    def _before_slice(self, layer, dims) -> None:
-        """Pick the level a dims-driven slice reads, before it reads: full
-        resolution when the follower moves the slider, level 1 when the user
-        does (until it rests), unchanged otherwise (rotating, toggling)."""
-        t = int(dims.current_step[0])
-        if self._driving or self._slider_t is None:
-            layer.set_level(0)
-        elif t != self._slider_t:
-            layer.set_level(1 if self._n_levels > 1 else 0)
-            self._scrub_at = time.monotonic()
-            self._refine = None
+        """Move the time slider to follow the newest timepoint."""
+        self.viewer.dims.set_current_step(0, t)
 
     def _on_step(self, _event=None) -> None:
-        self._slider_t = int(self.viewer.dims.current_step[0])
         self._show_text()
 
     def _follow(self) -> dict[str, float]:
@@ -1024,39 +992,6 @@ class LiveFollower:
                 layer.refresh()
                 phases[f"refresh_c{src.c}"] = time.perf_counter() - t1
         return phases
-
-    def _refine_step(self) -> None:
-        """Once the slider has rested, read the timepoint's full resolution
-        in the background, then show it (only the upload is left)."""
-        if self._scrub_at is None:
-            return
-        t = int(self.viewer.dims.current_step[0])
-        if self._refine is None:
-            if time.monotonic() - self._scrub_at < REFINE_AFTER_S:
-                return
-            futures = [
-                self._pool.submit(src.prefetch, t, 0)
-                for src in self.sources
-                if t in src.has
-            ]
-            self._refine = (t, futures, time.perf_counter())
-            return
-        rt, futures, started = self._refine
-        if rt != t or not all(f.done() for f in futures):
-            return
-        for layer in self.layers:
-            if layer.set_level(0) and layer.visible:
-                layer.refresh()
-        self._refine = None
-        self._scrub_at = None
-        trace.record(
-            "refined",
-            name=trace.VIEW_TRACE_NAME,
-            jobs=self.jobs,
-            session_id=self.session_id,
-            t=t,
-            read_s=time.perf_counter() - started,
-        )
 
     def _set_contrast(self, src: ChannelSource, layer) -> None:
         """From every 4th voxel of the channel's newest timepoint (the empty
@@ -1095,7 +1030,6 @@ class LiveFollower:
             colormap=_COLORMAPS.get(color, "gray"),
             blending="additive",
             contrast_limits=[0, 300],
-            before_slice=self._before_slice,
         )
         layer._slice_dims(self.viewer.dims)
         layer.visible = True
@@ -1152,7 +1086,6 @@ class LiveFollower:
                 stub = self._time_axis_stub()
                 self._drive(target)
                 self._followed = target
-            self._slider_t = int(self.viewer.dims.current_step[0])
             for src in self.sources:
                 layers.append(self._add_layer(src))
         except Exception:
@@ -1317,8 +1250,8 @@ def main(argv: list[str] | None = None) -> None:
         "--cache-gb",
         type=float,
         default=100.0,
-        help="RAM for full-resolution timepoints kept for scrubbing (coarse "
-        "levels get another 40 GB)",
+        help="RAM for full-resolution timepoints kept for scrubbing (the "
+        "layer thumbnails get another 40 GB)",
     )
     args = ap.parse_args(argv)
 
