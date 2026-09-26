@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -806,3 +807,35 @@ def test_the_volume_cache_keeps_to_its_budget():
     assert cache.get(("s", 0, 4, 0)) is not None
     cache.drop(lambda key: key[0] == "s")
     assert cache.bytes == 0
+
+
+def test_served_key_finds_the_array_behind_any_view():
+    vol = np.zeros((4, 5, 6), np.uint16)
+    live_view.register_served(vol, ("s", 1, 7, 0))
+    view = np.transpose(vol[np.newaxis][0], (0, 1, 2))[::1]
+    assert live_view.served_key(view) == ("s", 1, 7, 0)
+    assert live_view.served_key(np.zeros(3)) is None
+    del vol, view  # a new array at a reused address is not mistaken for it
+    fresh = np.zeros((4, 5, 6), np.uint16)
+    assert live_view.served_key(fresh) is None
+
+
+class _Texture:
+    def __init__(self):
+        self.deleted = False
+
+    def delete(self):
+        self.deleted = True
+
+
+def test_the_texture_cache_evicts_unused_textures_to_its_budget():
+    cache = live_view.TextureCache(budget_bytes=2 * 100)
+    a, b, c = _Texture(), _Texture(), _Texture()
+    drawn = {b}
+    cache.put(("s", 0, 0, 0), a, 100, lambda t: t in drawn)
+    cache.put(("s", 0, 1, 0), b, 100, lambda t: t in drawn)
+    cache.put(("s", 0, 2, 0), c, 100, lambda t: t in drawn)
+    assert a.deleted and not b.deleted and not c.deleted  # b is on screen
+    assert cache.get(("s", 0, 1, 0)) is b and cache.bytes == 200
+    cache.drop_store(Path("s"), lambda t: False)
+    assert b.deleted and c.deleted and cache.bytes == 0

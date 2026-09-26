@@ -87,6 +87,12 @@ PREFETCH_READ_THREADS = 8
 # far either side of it full-resolution timepoints are read ahead.
 PREFETCH_IN_FLIGHT = 3
 PREFETCH_RADIUS = 12
+# VRAM fill while the user is idle (no slider or camera change for
+# PRELOAD_IDLE_S): at most PRELOAD_TICK_S of uploads per poll, a slab of
+# PRELOAD_SLAB planes at a time, so the window never visibly stalls.
+PRELOAD_IDLE_S = 0.3
+PRELOAD_TICK_S = 0.08
+PRELOAD_SLAB = 32
 _PREFETCH_READ_POOL = None
 
 
@@ -254,6 +260,11 @@ class VolumeCache:
         with self._lock:
             return key in self._items
 
+    def peek(self, key):
+        """The cached array, without counting it as used."""
+        with self._lock:
+            return self._items.get(key)
+
     def drop(self, match) -> None:
         """Forget every entry whose key `match(key)` accepts."""
         with self._lock:
@@ -404,11 +415,19 @@ class ChannelSource:
         if arr is None:
             used = None
             arr = np.zeros(self.shapes[level][1:], self.dtype)
+        else:
+            register_served(arr, self._key(used, level))
         self.served[level] = used
         return arr
 
     def cached(self, t: int, level: int) -> bool:
         return self._key(t, level) in self._cache.of(level)
+
+    def in_ram(self, t: int):
+        """(t)'s full resolution if it is already in memory -- this viewer's
+        cache or the lane's RAM-disk buffer -- else None: never decodes."""
+        cached = self._cache.full.peek(self._key(t, 0))
+        return cached if cached is not None else self._buffer(t)
 
     def prefetch(self, t: int, level: int) -> None:
         """Make (t, level) a cache hit; runs on the prefetch pool. A full-
@@ -426,6 +445,88 @@ class ChannelSource:
                 return
         if t in self.stored:
             self.load(t, level, background=True)
+
+
+# Which (store, channel, timepoint, level) each array handed to napari
+# holds, by the array's identity (checked with a weak reference: an id can
+# be reused once its array is gone), so the renderer can find the texture
+# already in VRAM for whatever view of it napari passes down.
+_SERVED: dict[int, tuple] = {}
+
+
+def register_served(arr, key: tuple) -> None:
+    import weakref
+
+    try:
+        ref = weakref.ref(arr)
+    except TypeError:
+        return
+    if len(_SERVED) > 4096:
+        for k in [k for k, (r, _key) in _SERVED.items() if r() is None]:
+            del _SERVED[k]
+    _SERVED[id(arr)] = (ref, key)
+
+
+def served_key(arr) -> tuple | None:
+    """The key `arr`, or any array it is a view of, was served under."""
+    import numpy as np
+
+    while isinstance(arr, np.ndarray):
+        entry = _SERVED.get(id(arr))
+        if entry is not None and entry[0]() is arr:
+            return entry[1]
+        arr = arr.base
+    return None
+
+
+class TextureCache:
+    """Volumes kept on the GPU as textures, least recently used out first,
+    up to `budget_bytes` of VRAM: moving back to a timepoint already shown
+    rebinds its texture instead of uploading 1 GB per channel again (0.1-
+    0.3 s each). One cache for the viewer's live layers, on the one GL
+    context they share."""
+
+    def __init__(self, budget_bytes: float) -> None:
+        from collections import OrderedDict
+
+        self.budget = float(budget_bytes)
+        self.bytes = 0
+        self._items: OrderedDict = OrderedDict()  # key -> (texture, nbytes)
+
+    def get(self, key):
+        item = self._items.get(key)
+        if item is None:
+            return None
+        self._items.move_to_end(key)
+        return item[0]
+
+    def __contains__(self, key) -> bool:
+        return key in self._items
+
+    def put(self, key, texture, nbytes: int, in_use) -> None:
+        """Keep `texture`; evict the least recently used ones that no layer
+        is drawing (`in_use(texture)`) until the budget holds."""
+        old = self._items.pop(key, None)
+        if old is not None and old[0] is not texture:
+            self._delete(old)
+        self._items[key] = (texture, nbytes)
+        self.bytes += nbytes - (old[1] if old is not None else 0)
+        for k in list(self._items):
+            if self.bytes <= self.budget:
+                break
+            tex, _n = self._items[k]
+            if k != key and not in_use(tex):
+                self._delete(self._items.pop(k))
+
+    def _delete(self, item) -> None:
+        texture, nbytes = item
+        self.bytes -= nbytes
+        texture.delete()
+
+    def drop_store(self, store: Path, in_use) -> None:
+        for k in [k for k in self._items if k[0] == str(store)]:
+            if not in_use(self._items[k][0]):
+                self._delete(self._items.pop(k))
 
 
 class LevelSeries:
@@ -562,7 +663,9 @@ def live_image_class():
                 return request
 
         class LiveImage(Image):
-            def __init__(self, *args, **kwargs) -> None:
+            def __init__(self, *args, vram: TextureCache | None = None, **kwargs):
+                self.vram = vram
+                self.live_node = None  # set by its renderer, on a real canvas
                 super().__init__(*args, **kwargs)
                 self._data_level = 0
 
@@ -573,8 +676,185 @@ def live_image_class():
                 super()._update_draw(*args, **kwargs)
                 self._data_level = 0
 
+        _register_live_renderer(LiveImage)
         _LIVE_IMAGE = LiveImage
     return _LIVE_IMAGE
+
+
+def _register_live_renderer(live_image) -> None:
+    """Draw `LiveImage` layers with a volume node that keeps a texture per
+    timepoint in VRAM (`TextureCache`). napari picks a layer's renderer by
+    the closest class in its MRO (`napari._vispy.utils.visual`), so this
+    registers one for LiveImage without touching Image's."""
+    import functools
+
+    import numpy as np
+    from napari._vispy.layers.image import ImageLayerNode, VispyImageLayer
+    from napari._vispy.utils.visual import layer_to_visual
+    from napari._vispy.visuals.volume import Volume as VolumeNode
+
+    class LiveVolumeNode(VolumeNode):
+        """A volume node whose texture follows the timepoint: a volume the
+        viewer served (`served_key`) gets a texture of its own, kept in the
+        `TextureCache`; showing it again rebinds that texture -- no upload.
+        Anything else (zeros, a stand-in) uses the node's own texture."""
+
+        def __init__(self, *args, vram=None, texture_format=None, **kwargs):
+            self._vram = vram
+            self._live_format = texture_format
+            super().__init__(*args, texture_format=texture_format, **kwargs)
+            self.unfreeze()  # vispy visuals refuse new attributes once built
+            self._own_texture = self._texture
+            self._filling = None  # [key, texture, next plane] being preloaded
+            self._spare = None  # [texture, next plane]: pre-touched, for a new volume
+            self.freeze()
+
+        def _bind(self, texture) -> None:
+            current = self._texture
+            if texture is current:
+                return
+            if texture.interpolation != current.interpolation:
+                texture.interpolation = current.interpolation
+            texture.set_clim(current.clim)
+            self._texture = texture
+            self.shared_program["u_volumetex"] = texture
+            self.shared_program["clim"] = texture.clim_normalized
+
+        def set_data(self, vol, clim=None, copy=True):
+            if getattr(self, "_own_texture", None) is None:  # vispy's own init
+                return super().set_data(vol, clim=clim, copy=copy)
+            key = served_key(vol) if self._vram is not None else None
+            if key is None:
+                self._bind(self._own_texture)
+                return super().set_data(vol, clim=clim, copy=copy)
+            texture = self._vram.get(key)
+            if texture is not None:
+                self._bind(texture)
+                if texture.set_clim(clim if clim is not None else texture.clim):
+                    texture.scale_and_set_data(vol, copy=False)  # renormalize
+                self._last_data = vol
+                self.shared_program["clim"] = texture.clim_normalized
+                self.shared_program["u_shape"] = (
+                    vol.shape[2],
+                    vol.shape[1],
+                    vol.shape[0],
+                )
+                if self._vol_shape != vol.shape[:3]:
+                    self._vol_shape = vol.shape[:3]
+                    self._need_vertex_update = True
+                self.update()
+                return None
+            # Not on the GPU yet. Into the spare texture (already allocated
+            # and touched while idle: an upload into it costs what an
+            # overwrite does), which then joins the cache. Without a spare,
+            # through the node's own texture -- allocating a 1 GB texture on
+            # the spot costs ~0.3 s more per channel -- and the idle-time
+            # fill (`preload`) caches it later.
+            spare = self._spare
+            if (
+                spare is not None
+                and spare[1] >= vol.shape[0]
+                and (spare[0].shape[:3] == vol.shape)
+            ):
+                self._spare = None
+                self._bind(spare[0])
+                super().set_data(vol, clim=clim, copy=copy)
+                self._vram.put(key, spare[0], vol.nbytes, _in_use)
+                return None
+            self._bind(self._own_texture)
+            return super().set_data(vol, clim=clim, copy=copy)
+
+        def _upload_slabs(self, texture, vol, z: int, seconds: float) -> int:
+            """Upload `vol` into `texture` from plane `z`, a slab at a time,
+            for about `seconds`, now (on this canvas's GL context, not at the
+            next paint); the next plane to upload."""
+            started = time.perf_counter()
+            self.canvas.set_current()
+            context = self.canvas.context
+            while z < vol.shape[0] and time.perf_counter() - started < seconds:
+                texture.set_data(vol[z : z + PRELOAD_SLAB], offset=(z, 0, 0))
+                context.glir.associate(texture.glir)
+                context.flush_commands()
+                z += PRELOAD_SLAB
+            return z
+
+        def _new_texture(self, template):
+            texture = self._create_texture(self._live_format, template[:1, :1, :1])
+            texture.set_clim(self._texture.clim)
+            texture.interpolation = self._texture.interpolation
+            texture.resize(template.shape + (1,))
+            return texture
+
+        def prepare_spare(self, shape, dtype, seconds: float) -> bool:
+            """Have a spare texture of `shape` allocated and touched (zeros
+            uploaded) for the next new volume; True once it is ready."""
+            if self._vram is None or self.canvas is None:
+                return True
+            zeros = np.zeros(shape, dtype)  # the kernel's zero pages: free
+            if self._spare is None or self._spare[0].shape[:3] != tuple(shape):
+                if self._spare is not None:
+                    self._spare[0].delete()
+                self._spare = [self._new_texture(zeros), 0]
+            if self._spare[1] < shape[0]:
+                self._spare[1] = self._upload_slabs(
+                    self._spare[0], zeros, self._spare[1], seconds
+                )
+            return self._spare[1] >= shape[0]
+
+        def preload(self, key, vol, seconds: float) -> bool:
+            """Upload `vol` into a texture of its own for `key`, a slab of
+            PRELOAD_SLAB planes at a time, for about `seconds`; True once it
+            is complete and in the cache."""
+            if self._vram is None or key in self._vram:
+                return True
+            if self.canvas is None:  # not in a scene (2D view)
+                return False
+            fill = self._filling
+            if fill is None or fill[0] != key:
+                if fill is not None:
+                    fill[1].delete()  # a fill abandoned for a nearer one
+                fill = self._filling = [key, self._new_texture(vol), 0]
+            fill[2] = self._upload_slabs(fill[1], vol, fill[2], seconds)
+            if fill[2] < vol.shape[0]:
+                return False
+            self._filling = None
+            self._vram.put(key, fill[1], vol.nbytes, _in_use)
+            return True
+
+    live_nodes: list = []
+
+    def _in_use(texture) -> bool:
+        return any(
+            node._texture is texture or (node._spare and node._spare[0] is texture)
+            for node in live_nodes
+        )
+
+    class LiveImageLayerNode(ImageLayerNode):
+        def __init__(self, custom_node=None, texture_format=None, vram=None):
+            super().__init__(custom_node, texture_format=texture_format)
+            if vram is not None:
+                self._volume_node = LiveVolumeNode(
+                    np.zeros((1, 1, 1), dtype=np.float32),
+                    clim=[0, 1],
+                    texture_format=texture_format,
+                    vram=vram,
+                )
+                live_nodes.append(self._volume_node)
+
+    class LiveVispyImageLayer(VispyImageLayer):
+        def __init__(self, layer, node=None, texture_format="auto", **_kwargs):
+            super().__init__(
+                layer,
+                node=node,
+                texture_format=texture_format,
+                layer_node_class=functools.partial(
+                    LiveImageLayerNode, vram=getattr(layer, "vram", None)
+                ),
+            )
+            volume = self._layer_node._volume_node
+            layer.live_node = volume if isinstance(volume, LiveVolumeNode) else None
+
+    layer_to_visual[live_image] = LiveVispyImageLayer
 
 
 def qc_dir_for(store: Path) -> Path:
@@ -767,11 +1047,13 @@ class LiveFollower:
         painter: PaintClock | None = None,
         cache: ViewCache | None = None,
         prefetch_pool=None,
+        vram: TextureCache | None = None,
     ) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
         self.viewer = viewer
         self.painter = painter
+        self.vram = vram
         self.store = Path(store)
         self.follow = follow
         self.session_id = session_id
@@ -809,14 +1091,19 @@ class LiveFollower:
             self._scale,
             self.sources[0].shapes[0][1],
         )
+        self._active_at = time.monotonic()
         viewer.text_overlay.visible = True
         viewer.dims.events.current_step.connect(self._on_step)
+        viewer.camera.events.connect(self._touch)
         self.poll()
 
     def close(self) -> None:
         """Stop following (a newer session took over) and free its cache."""
         self.viewer.dims.events.current_step.disconnect(self._on_step)
+        self.viewer.camera.events.disconnect(self._touch)
         self.cache.drop_store(self.store)
+        if self.vram is not None:
+            self.vram.drop_store(self.store, lambda _texture: False)
 
     # --- what the lane has produced ----------------------------------------
 
@@ -932,6 +1219,7 @@ class LiveFollower:
         self._show_text()
         self._prefetch_new()
         phases = self._follow() if self.layers else self._build()
+        self._preload_vram()
         for t, channels in self._newly_shown().items():
             trace.record(
                 "shown",
@@ -970,7 +1258,50 @@ class LiveFollower:
         self.viewer.dims.set_current_step(0, t)
 
     def _on_step(self, _event=None) -> None:
+        self._active_at = time.monotonic()
         self._show_text()
+
+    def _touch(self, _event=None) -> None:
+        self._active_at = time.monotonic()
+
+    def _preload_vram(self) -> None:
+        """While the user is idle, fill VRAM with the timepoints nearest the
+        time slider that are already in RAM (one texture at a time, a few
+        slabs per poll), so stepping to them rebinds a texture instead of
+        uploading 1 GB per channel."""
+        nodes = [getattr(layer, "live_node", None) for layer in self.layers]
+        if self.vram is None or not any(nodes):
+            return
+        if time.monotonic() - self._active_at < PRELOAD_IDLE_S:
+            return
+        here = int(self.viewer.dims.current_step[0])
+        per_t = sum(math.prod(src.shapes[0][1:]) for src in self.sources) * 2
+        radius = min(PREFETCH_RADIUS, int(self.vram.budget / per_t / 2))
+        wanted = sorted(
+            (
+                (abs(t - here), t, src, node)
+                for src, node in zip(self.sources, nodes, strict=False)
+                if node is not None and node.visible
+                for t in src.has
+                if abs(t - here) <= radius
+            ),
+            key=lambda w: (w[0], w[1], w[2].c),
+        )
+        deadline = time.perf_counter() + PRELOAD_TICK_S
+        for src, node in zip(self.sources, nodes, strict=False):
+            if node is not None and not node.prepare_spare(
+                src.shapes[0][1:], src.dtype, deadline - time.perf_counter()
+            ):
+                return
+        for _d, t, src, node in wanted:
+            key = src._key(t, 0)
+            if key in self.vram:
+                continue
+            vol = src.in_ram(t)
+            left = deadline - time.perf_counter()
+            if vol is not None and left > 0:
+                node.preload(key, vol, left)
+            return
 
     def _follow(self) -> dict[str, float]:
         """Follow the newest timepoint any channel has, and re-read in place
@@ -1030,6 +1361,7 @@ class LiveFollower:
             colormap=_COLORMAPS.get(color, "gray"),
             blending="additive",
             contrast_limits=[0, 300],
+            vram=self.vram,
         )
         layer._slice_dims(self.viewer.dims)
         layer.visible = True
@@ -1135,12 +1467,14 @@ class SessionWatcher:
         title: str = "naparym-live",
         cache: ViewCache | None = None,
         prefetch_pool=None,
+        vram: TextureCache | None = None,
     ) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
         self.viewer = viewer
         self.painter = painter
         self.title = title
+        self.vram = vram
         self.cache = cache if cache is not None else ViewCache()
         self._pool = prefetch_pool or ThreadPoolExecutor(
             4, thread_name_prefix="naparym-prefetch"
@@ -1198,6 +1532,7 @@ class SessionWatcher:
                 painter=self.painter,
                 cache=self.cache,
                 prefetch_pool=self._pool,
+                vram=self.vram,
                 **(extra or {}),
             )
         except (OSError, KeyError, ValueError) as exc:
@@ -1253,6 +1588,14 @@ def main(argv: list[str] | None = None) -> None:
         help="RAM for full-resolution timepoints kept for scrubbing (the "
         "layer thumbnails get another 40 GB)",
     )
+    ap.add_argument(
+        "--vram-gb",
+        type=float,
+        default=0.0,
+        help="GPU memory for timepoints kept as textures (2 GB per timepoint "
+        "at 2 channels): moving back to one of them needs no upload. "
+        "Experimental, off by default (0)",
+    )
     args = ap.parse_args(argv)
 
     no_hugepage_stalls()
@@ -1273,6 +1616,7 @@ def main(argv: list[str] | None = None) -> None:
         painter=painter,
         title=args.title,
         cache=ViewCache(full_gb=args.cache_gb),
+        vram=TextureCache(args.vram_gb * 1e9) if args.vram_gb > 0 else None,
     )
 
     @viewer.bind_key("f")
