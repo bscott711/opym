@@ -391,6 +391,8 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     follower.poll()
     assert follower._shown == [0]
     assert int(np.asarray(follower.layers[1].data[0]).max()) == 60  # from the buffer
+    lo, hi = follower.layers[1].contrast_limits
+    assert lo <= 60 <= hi < 300  # set from the first real timepoint
 
     # Buffer trimmed after the store has it: read from the store instead.
     w.write_timepoint(store, 0, 1, np.full((8, 16, 12), 60, np.uint16))
@@ -424,3 +426,166 @@ def test_watcher_prefers_the_ram_disk_store(tmp_path):
     assert extra["buffers_dir"] == str(view.parent / "buffers")
     shutil.rmtree(view)  # evicted from the RAM disk: fall back to GPFS
     assert watcher._latest()[1] == tmp_path / "gpfs" / "Cell_041_dsr.ome.zarr"
+
+
+def _buffered_session(tmp_path, n_t=4, done_t=3):
+    """A one-format session with `done_t` timepoints in RAM-disk buffers."""
+    from opym.stream.live_zarr import buffer_name
+
+    store = tmp_path / "view" / "Cell_042_dsr.ome.zarr"
+    w.create_processed_store(
+        store,
+        n_t=n_t,
+        n_c=2,
+        shape_zyx=(8, 16, 12),
+        channel_labels=["GFP 488", "mScarlet 561"],
+    )
+    buffers = tmp_path / "view" / "buffers"
+    buffers.mkdir()
+    for t in range(done_t):
+        for c in range(2):
+            vol = np.full((8, 16, 12), 100 * (t + 1) + 10 * c, np.uint16)
+            np.save(buffers / buffer_name(t, c), vol)
+    return store, buffers
+
+
+def _count_reads(monkeypatch):
+    """(t, c) of every volume napari reads, from a buffer or the store."""
+    from opym.stream.live_zarr import parse_buffer_name
+
+    reads = []
+    real_map, real_read = live_view.map_buffer, live_view.read_volume
+
+    def map_buffer(path):
+        reads.append(parse_buffer_name(path.name))
+        return real_map(path)
+
+    def read(arr, t, c):
+        reads.append((t, c))
+        return real_read(arr, t, c)
+
+    monkeypatch.setattr(live_view, "map_buffer", map_buffer)
+    monkeypatch.setattr(live_view, "read_volume", read)
+    return reads
+
+
+def test_opening_a_session_reads_each_channel_once_at_the_newest_timepoint(
+    tmp_path, monkeypatch
+):
+    """Found on Argus (2026-09-25): opening a finished session read its first
+    timepoint seven times, three from the compressed store, before the
+    window could first paint (25 s of black)."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    resize_dask_cache(0)
+    store, buffers = _buffered_session(tmp_path)
+    reads = _count_reads(monkeypatch)
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    assert viewer.dims.current_step[0] == 2
+    # One read per channel to set the contrast, one for napari's slice.
+    assert sorted(reads) == [(2, 0), (2, 0), (2, 1), (2, 1)]
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+    assert all(layer.visible for layer in follower.layers)
+    lo, hi = follower.layers[1].contrast_limits
+    assert lo <= 310 <= hi  # from the timepoint on screen
+
+    reads.clear()
+    np.save(buffers / "T0003_C0.npy", np.full((8, 16, 12), 7, np.uint16))
+    np.save(buffers / "T0003_C1.npy", np.full((8, 16, 12), 8, np.uint16))
+    follower.poll()
+    assert viewer.dims.current_step[0] == 3
+    assert sorted(reads) == [(3, 0), (3, 1)]  # not t=2 again, not the old layers
+
+
+def test_the_red_channel_is_magenta_and_display_settings_survive_a_rebuild(
+    tmp_path,
+):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store, buffers = _buffered_session(tmp_path, done_t=1)
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    assert [layer.colormap.name for layer in follower.layers] == ["green", "magenta"]
+
+    follower.layers[0].visible = False
+    follower.layers[1].colormap = "gray"
+    follower.layers[1].rendering = "attenuated_mip"
+    np.save(buffers / "T0001_C0.npy", np.full((8, 16, 12), 7, np.uint16))
+    np.save(buffers / "T0001_C1.npy", np.full((8, 16, 12), 8, np.uint16))
+    follower.poll()
+    assert viewer.dims.current_step[0] == 1
+    assert [layer.visible for layer in follower.layers] == [False, True]
+    assert follower.layers[1].colormap.name == "gray"
+    assert follower.layers[1].rendering == "attenuated_mip"
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+
+
+def test_a_session_switch_does_not_reread_the_old_feed(tmp_path, monkeypatch):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    first, first_buffers = _buffered_session(tmp_path / "a", done_t=2)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+
+    def latest(store, buffers, sid):
+        (jobs / live_view.LIVE_LATEST_NAME).write_text(
+            json.dumps(
+                {
+                    "session_id": sid,
+                    "store": str(tmp_path / "gpfs" / store.name),
+                    "view_store": str(store),
+                    "buffers_dir": str(buffers),
+                }
+            )
+        )
+
+    latest(first, first_buffers, "s1")
+    viewer = ViewerModel(ndisplay=3)
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    watcher.poll()
+    assert viewer.dims.current_step[0] == 1
+
+    second, second_buffers = _buffered_session(tmp_path / "b", n_t=6, done_t=4)
+    latest(second, second_buffers, "s2")
+    reads = _count_reads(monkeypatch)
+    watcher.poll()
+    assert watcher.session_id == "s2"
+    assert viewer.dims.current_step[0] == 3
+    assert sorted(reads) == [(3, 0), (3, 0), (3, 1), (3, 1)]
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+    assert all(layer.visible for layer in viewer.layers)
+
+
+def test_read_volume_matches_zarr(tmp_path):
+    import zarr
+
+    arr = zarr.open(
+        str(tmp_path / "a.zarr"),
+        mode="w",
+        shape=(2, 2, 150, 20, 10),
+        chunks=(1, 1, 64, 8, 8),
+        dtype=np.uint16,
+    )
+    arr[:] = np.random.default_rng(0).integers(0, 4000, arr.shape, dtype=np.uint16)
+    np.testing.assert_array_equal(live_view.read_volume(arr, 1, 0), arr[1, 0])
+
+
+def test_a_session_with_nothing_processed_yet_decodes_nothing(tmp_path, monkeypatch):
+    """Its layers show up at once, from zeros: decoding the empty store's
+    fill values took 1.7 s, just as its first timepoint was due."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store, buffers = _buffered_session(tmp_path, done_t=0)
+    decoded = []
+    monkeypatch.setattr(live_view, "read_volume", lambda a, t, c: decoded.append(t))
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
+    assert int(np.asarray(follower.layers[0].data[0]).max()) == 0
+    assert decoded == []
