@@ -26,6 +26,23 @@ def _store(tmp_path, n_t=3):
     return out
 
 
+class _NoPrefetch:
+    """A prefetch pool that does nothing, so a test counts only the reads
+    the UI thread makes."""
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        future = Future()
+        future.set_result(None)
+        return future
+
+
+def _shown_data(layer):
+    """What napari holds for display: the layer's current slice."""
+    return np.asarray(layer._slice.image.raw)
+
+
 def _finish(store, t, done, n_t=3, state="running"):
     for c in range(2):
         vol = np.full((8, 16, 12), 100 * (t + 1) + 10 * c, dtype=np.uint16)
@@ -90,11 +107,11 @@ def test_follower_tracks_new_timepoints(tmp_path):
     assert "2/3 timepoints" in viewer.text_overlay.text
     assert [layer.name for layer in follower.layers] == ["GFP 488", "mScarlet 561"]
     # What napari reads for t=1 is the new data, not cached zeros.
-    assert int(np.asarray(follower.layers[1].data[1]).max()) == 210
-    # Full resolution, single level: napari's 3D view only ever renders a
-    # multiscale layer's coarsest level.
-    assert not follower.layers[1].multiscale
-    assert follower.layers[1].data.shape == (3, 8, 16, 12)
+    assert int(_shown_data(follower.layers[1]).max()) == 210
+    # Full resolution at rest: napari alone would render a multiscale layer
+    # at its coarsest level in 3D.
+    assert follower.layers[1].data_level == 0
+    assert tuple(follower.layers[1].level_shapes[0]) == (3, 8, 16, 12)
     # The same layers, re-sliced at t=1 (no rebuild per timepoint: see
     # poll()'s docstring), and what napari holds for display is t=1's data.
     assert follower.layers[1] is first_layer and first_layer in viewer.layers
@@ -380,7 +397,8 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     assert shown["build_s"] >= 0 and shown["seen_s"] <= shown["at"]
     # The layers were built when the session was found; t=0 is read into
     # them in place (slider moved to it, or re-read if already there).
-    assert set(shown["phases"]) in ({"contrast", "slice"}, {"contrast", "refresh"})
+    assert shown["channels"] == [0, 1]
+    assert set(shown["phases"]) in ({"slice"}, {"refresh_c0", "refresh_c1"})
 
 
 def test_paint_clock_traces_the_first_frame_after_a_timepoint_is_shown(tmp_path):
@@ -446,7 +464,9 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     buffers = tmp_path / "view" / "buffers"
     buffers.mkdir()
     viewer = ViewerModel()
-    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, prefetch_pool=_NoPrefetch()
+    )
     assert follower._shown == []
 
     np.save(buffers / buffer_name(0, 0), np.full((8, 16, 12), 50, np.uint16))
@@ -455,7 +475,7 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     np.save(buffers / buffer_name(0, 1), np.full((8, 16, 12), 60, np.uint16))
     follower.poll()
     assert follower._shown == [0]
-    assert int(np.asarray(follower.layers[1].data[0]).max()) == 60  # from the buffer
+    assert int(_shown_data(follower.layers[1]).max()) == 60  # from the buffer
     lo, hi = follower.layers[1].contrast_limits
     assert lo <= 60 <= hi < 300  # set from the first real timepoint
 
@@ -463,7 +483,8 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     w.write_timepoint(store, 0, 1, np.full((8, 16, 12), 60, np.uint16))
     w.write_progress(store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running")
     (buffers / buffer_name(0, 1)).unlink()
-    assert int(np.asarray(follower.layers[1].data[0]).max()) == 60
+    follower.poll()
+    assert int(follower.sources[1].load(0, 0).max()) == 60
 
 
 def test_watcher_prefers_the_ram_disk_store(tmp_path):
@@ -525,9 +546,9 @@ def _count_reads(monkeypatch):
         reads.append(parse_buffer_name(path.name))
         return real_map(path)
 
-    def read(arr, t, c):
+    def read(arr, t, c, **kwargs):
         reads.append((t, c))
-        return real_read(arr, t, c)
+        return real_read(arr, t, c, **kwargs)
 
     monkeypatch.setattr(live_view, "map_buffer", map_buffer)
     monkeypatch.setattr(live_view, "read_volume", read)
@@ -548,10 +569,13 @@ def test_opening_a_session_reads_each_channel_once_at_the_newest_timepoint(
     store, buffers = _buffered_session(tmp_path)
     reads = _count_reads(monkeypatch)
     viewer = ViewerModel(ndisplay=3)
-    follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, prefetch_pool=_NoPrefetch()
+    )
     assert viewer.dims.current_step[0] == 2
-    # One read per channel to set the contrast, one for napari's slice.
-    assert sorted(reads) == [(2, 0), (2, 0), (2, 1), (2, 1)]
+    # One mapping per channel serves its slice, its thumbnail level and its
+    # contrast.
+    assert sorted(reads) == [(2, 0), (2, 1)]
     assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
     assert all(layer.visible for layer in follower.layers)
     lo, hi = follower.layers[1].contrast_limits
@@ -611,7 +635,7 @@ def test_a_session_switch_does_not_reread_the_old_feed(tmp_path, monkeypatch):
 
     latest(first, first_buffers, "s1")
     viewer = ViewerModel(ndisplay=3)
-    watcher = live_view.SessionWatcher(viewer, jobs=jobs)
+    watcher = live_view.SessionWatcher(viewer, jobs=jobs, prefetch_pool=_NoPrefetch())
     watcher.poll()
     assert viewer.dims.current_step[0] == 1
 
@@ -621,7 +645,7 @@ def test_a_session_switch_does_not_reread_the_old_feed(tmp_path, monkeypatch):
     watcher.poll()
     assert watcher.session_id == "s2"
     assert viewer.dims.current_step[0] == 3
-    assert sorted(reads) == [(3, 0), (3, 0), (3, 1), (3, 1)]
+    assert sorted(reads) == [(3, 0), (3, 1)]
     assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
     assert all(layer.visible for layer in viewer.layers)
 
@@ -648,9 +672,139 @@ def test_a_session_with_nothing_processed_yet_decodes_nothing(tmp_path, monkeypa
 
     store, buffers = _buffered_session(tmp_path, done_t=0)
     decoded = []
-    monkeypatch.setattr(live_view, "read_volume", lambda a, t, c: decoded.append(t))
+    monkeypatch.setattr(
+        live_view, "read_volume", lambda a, t, c, **kw: decoded.append(t)
+    )
     viewer = ViewerModel(ndisplay=3)
     follower = live_view.LiveFollower(viewer, store, buffers_dir=buffers)
     assert [layer.name for layer in viewer.layers] == ["GFP 488", "mScarlet 561"]
     assert int(np.asarray(follower.layers[0].data[0]).max()) == 0
     assert decoded == []
+
+
+class _InlinePool:
+    """A prefetch pool that runs each job at once, on the calling thread."""
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        future = Future()
+        future.set_result(fn(*args, **kwargs))
+        return future
+
+
+def test_each_channel_shows_its_newest_timepoint_as_soon_as_it_lands(tmp_path):
+    """The 488 stack is acquired before the 561 stack: GFP's timepoint is
+    shown the moment it's processed, mScarlet keeps its newest until its own
+    lands, and each channel's arrival is traced."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    from opym.stream import trace
+
+    store, buffers = _buffered_session(tmp_path, done_t=1)
+    jobs = tmp_path / "jobs"
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, jobs=jobs, prefetch_pool=_NoPrefetch()
+    )
+    gfp, msc = follower.layers
+    np.save(buffers / "T0001_C0.npy", np.full((8, 16, 12), 7, np.uint16))
+    follower.poll()
+    assert viewer.dims.current_step[0] == 1
+    assert int(_shown_data(gfp).max()) == 7  # GFP at t=1
+    assert int(_shown_data(msc).max()) == 110  # mScarlet still at t=0
+    assert "mScarlet 561 t=0" in viewer.text_overlay.text
+    np.save(buffers / "T0001_C1.npy", np.full((8, 16, 12), 8, np.uint16))
+    follower.poll()
+    assert int(_shown_data(msc).max()) == 8
+    assert follower._shown == [0, 1]
+    shown = [
+        (e["timepoints"], e["channels"])
+        for e in trace.read(trace.VIEW_TRACE_NAME, jobs=jobs)
+        if e["ev"] == "shown"
+    ]
+    assert shown[-2:] == [([1], [0]), ([1], [1])]
+
+
+def test_scrubbing_shows_half_resolution_then_refines_when_it_rests(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    monkeypatch.setattr(live_view, "REFINE_AFTER_S", 0.0)
+    store, buffers = _buffered_session(tmp_path, done_t=3)
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, prefetch_pool=_InlinePool()
+    )
+    layer = follower.layers[0]
+    assert viewer.dims.current_step[0] == 2 and layer.data_level == 0
+    viewer.dims.set_current_step(0, 0)  # the user moves the slider
+    assert layer.data_level == 1
+    assert _shown_data(layer).shape == follower.sources[0].shapes[1][1:]
+    follower.poll()  # rested: the full resolution is read in the background
+    follower.poll()  # ... and shown
+    assert layer.data_level == 0
+    assert _shown_data(layer).shape == (8, 16, 12)
+    assert int(_shown_data(layer).max()) == 100
+
+
+def test_the_follower_moving_the_slider_stays_at_full_resolution(tmp_path):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store, buffers = _buffered_session(tmp_path, done_t=1)
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, prefetch_pool=_NoPrefetch()
+    )
+    for c in range(2):
+        np.save(buffers / f"T0001_C{c}.npy", np.full((8, 16, 12), 5, np.uint16))
+    follower.poll()
+    assert viewer.dims.current_step[0] == 1
+    assert [layer.data_level for layer in follower.layers] == [0, 0]
+
+
+def test_prefetch_caches_every_level_so_moving_back_reads_nothing(
+    tmp_path, monkeypatch
+):
+    """Everything the lane produced is in the viewer's RAM: moving back to
+    an earlier timepoint reads neither a buffer nor the store."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    monkeypatch.setattr(live_view, "PREFETCH_IN_FLIGHT", 100)
+    store, buffers = _buffered_session(tmp_path, done_t=3)
+    for t in range(3):
+        for c in range(2):
+            w.write_timepoint(store, t, c, np.full((8, 16, 12), 10 * t + c, np.uint16))
+    w.write_progress(
+        store,
+        n_t=4,
+        n_c=2,
+        done=[[t, c] for t in range(3) for c in range(2)],
+        state="running",
+    )
+    viewer = ViewerModel(ndisplay=3)
+    follower = live_view.LiveFollower(
+        viewer, store, buffers_dir=buffers, prefetch_pool=_InlinePool()
+    )
+    follower.poll()
+    cache = follower.cache
+    assert cache.full.bytes > 0 and cache.small.bytes > 0
+    reads = _count_reads(monkeypatch)
+    viewer.dims.set_current_step(0, 0)  # half resolution while moving
+    assert reads == []
+
+
+def test_the_volume_cache_keeps_to_its_budget():
+    cache = live_view.VolumeCache(budget_bytes=3 * 800)
+    for t in range(5):
+        cache.put(("s", 0, t, 0), np.zeros(400, np.uint16))  # 800 bytes each
+    assert cache.bytes == 2400
+    assert cache.get(("s", 0, 0, 0)) is None  # the oldest went first
+    assert cache.get(("s", 0, 4, 0)) is not None
+    cache.drop(lambda key: key[0] == "s")
+    assert cache.bytes == 0
