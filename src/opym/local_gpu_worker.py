@@ -59,7 +59,26 @@ FAILURE_BACKOFF_BASE_SEC = 15
 FAILURE_BACKOFF_CAP_SEC = 300
 
 # (PETAKIT_SERVER_ID, CUDA_VISIBLE_DEVICES): one server per physical GPU.
-SERVERS: tuple[tuple[str, str], ...] = (("1", "0"), ("2", "1"))
+DEFAULT_SERVERS: tuple[tuple[str, str], ...] = (("1", "0"), ("2", "1"))
+SERVERS_ENV_VAR = "OPYM_SERVE_SERVERS"
+
+
+def servers_from_env(value: str | None) -> tuple[tuple[str, str], ...]:
+    """`OPYM_SERVE_SERVERS` ("id:gpu,id:gpu", e.g. "lv1:0,lv2:1") as
+    (server id, CUDA device) pairs; unset means DEFAULT_SERVERS. A test stack
+    beside production (its own PETAKIT_JOBS_DIR) names its servers apart."""
+    if not value or not value.strip():
+        return DEFAULT_SERVERS
+    out = []
+    for item in value.split(","):
+        sid, _, dev = item.strip().partition(":")
+        if not sid or not dev:
+            raise ValueError(f"{SERVERS_ENV_VAR}: expected id:gpu, got {item!r}")
+        out.append((sid, dev))
+    return tuple(out)
+
+
+SERVERS = servers_from_env(os.environ.get(SERVERS_ENV_VAR))
 
 # A ticket that has taken down its server this many times goes to failed/
 # instead of back in the queue, so one poisonous dataset can't keep a GPU
@@ -157,21 +176,32 @@ def newest_mtime(root: Path) -> float | None:
     return newest
 
 
-def _server_pids(server_id: str) -> list[int]:
+def _server_pids(server_id: str, jobs: Path | None = None) -> list[int]:
     """Pids of this user's processes launched for PETAKIT_SERVER_ID=`server_id`
-    (the server's bash wrapper, MATLAB itself, and its parpool workers, which
-    all inherit the variable). Processes we can't read are skipped."""
+    on the jobs dir `jobs` (default BASE_DIR): the server's bash wrapper,
+    MATLAB itself, and its parpool workers, which all inherit both variables.
+    A process with no PETAKIT_JOBS_DIR serves the default one, so a test
+    supervisor never takes production's servers for its own, nor the other
+    way round. Processes we can't read are skipped."""
     marker = f"PETAKIT_SERVER_ID={server_id}".encode()
+    want = Path(jobs or BASE_DIR)
     pids = []
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
             continue
         try:
             with open(f"/proc/{entry.name}/environ", "rb") as f:
-                if marker in f.read().split(b"\0"):
-                    pids.append(int(entry.name))
+                env = f.read().split(b"\0")
         except OSError:
             continue
+        if marker not in env:
+            continue
+        theirs = next(
+            (e.split(b"=", 1)[1] for e in env if e.startswith(b"PETAKIT_JOBS_DIR=")),
+            b"",
+        )
+        if Path(theirs.decode(errors="replace") or lanes.DEFAULT_JOBS_DIR) == want:
+            pids.append(int(entry.name))
     return pids
 
 
@@ -501,7 +531,7 @@ class ServerSupervisor:
         """Terminate the server's whole process tree: the bash wrapper,
         Matlab, and its parpool workers (all carry its PETAKIT_SERVER_ID)."""
         for sig, wait_s in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, 5.0)):
-            pids = _server_pids(slot.server_id)
+            pids = _server_pids(slot.server_id, self.base_dir)
             if slot.proc is not None and slot.proc.poll() is None:
                 pids.append(slot.proc.pid)
             if not pids:
@@ -512,7 +542,9 @@ class ServerSupervisor:
                 except ProcessLookupError:
                     pass
             deadline = time.time() + wait_s
-            while time.time() < deadline and _server_pids(slot.server_id):
+            while time.time() < deadline and _server_pids(
+                slot.server_id, self.base_dir
+            ):
                 time.sleep(0.5)
 
     # --- process launch, consolidation, status --------------------------------
