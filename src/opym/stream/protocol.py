@@ -136,6 +136,14 @@ _VALID_TYPES = frozenset(
 # only once every plane of it has landed, so after a receiver restart the
 # client resends the whole partial volume.
 #
+# OPTIONAL compression -- only once an ACK has advertised "blosc":
+#
+#   codec            str    -- "blosc": the payload is one blosc (v1) frame
+#                               holding the raw bytes (lz4 + bitshuffle
+#                               compresses camera frames ~2.5x); absent or
+#                               "raw": the raw bytes themselves. shape_zyx
+#                               and dtype always describe the DECODED data.
+#
 # OPTIONAL latency-trace fields (opym.stream.trace; all epoch seconds on the
 # CLIENT's clock). The receiver records them as sent; opym-live-trace
 # converts them to server time by adding clock_offset_s:
@@ -162,7 +170,7 @@ _VALID_TYPES = frozenset(
 #                               retry buffer only needs to keep frames with
 #                               frame_index > through_frame_index.
 #   features         [str]  -- OPTIONAL, what this receiver supports beyond
-#                               the base protocol. Only "slabs" is defined.
+#                               the base protocol: "slabs", "blosc".
 #   server_time_s        float -- OPTIONAL, the server's epoch seconds when
 #                               it sent this ACK; lets a client estimate the
 #                               clock offset for the trace fields above.

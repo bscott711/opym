@@ -35,6 +35,7 @@ from typing import Any
 import numpy as np
 import zarr
 import zmq
+from numcodecs import blosc as _blosc
 
 from opym.discovery import find_channel_zarr_stores, parse_zarr_group_prefix
 from opym.metadata import parse_zarr_z_step_from_store
@@ -54,6 +55,12 @@ DEFAULT_SNDHWM = 50  # a few seconds' worth of volumes; see docs/STREAMING_PROTO
 DEFAULT_POLL_TIMEOUT_MS = 200
 
 
+def compress_payload(array: np.ndarray) -> bytes:
+    """A FRAME payload with `codec: "blosc"` (see protocol.py): lz4 +
+    bitshuffle, ~2.5x on camera frames at ~1.8 GB/s per thread."""
+    return _blosc.compress(np.ascontiguousarray(array), b"lz4", 5, _blosc.BITSHUFFLE)
+
+
 class StreamSender:
     """Owns one DEALER connection for one session.
 
@@ -68,8 +75,13 @@ class StreamSender:
         connect_addr: str,
         session_id: str | None = None,
         sndhwm: int = DEFAULT_SNDHWM,
+        compress: bool = False,
     ) -> None:
+        """`compress`: send payloads blosc-compressed once the receiver
+        advertises "blosc" (raw until then, and always to an older one)."""
         self.session_id = session_id or str(uuid.uuid4())
+        self.compress = compress
+        self.features: set[str] = set()
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.DEALER)
         # MUST be set before connect() -- see protocol.py's module docstring
@@ -107,7 +119,11 @@ class StreamSender:
         C-contiguous exactly as given -- callers are responsible for any
         reshaping/dtype match with what SESSION_START declared.
         """
-        payload = np.ascontiguousarray(volume).tobytes()
+        if self.compress and "blosc" in self.features:
+            payload = compress_payload(volume)
+            header = {**header, "codec": "blosc"}
+        else:
+            payload = np.ascontiguousarray(volume).tobytes()
         frame_index = header["frame_index"]
         self._retry_buffer[frame_index] = (header, payload)
         self._send_frame_wire(header, payload)
@@ -201,6 +217,7 @@ class StreamSender:
             )
             return
         self.through_frame_index = header["through_frame_index"]
+        self.features.update(header.get("features") or ())
         self._evict_acked()
 
     def _evict_acked(self) -> None:
