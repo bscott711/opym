@@ -4,12 +4,13 @@ function stats = run_live_zarr(p, numCPUs)
 %
 % The one-format live path (jobType 'live_zarr', opym.stream.live):
 %
-%   raw store (T, Z, Y, X)   --parallelReadZarr 'leadingIndex' [t+1]-->  (Z, Y, X)
-%   --orient: exactly opym.utils.orient_zyx_for_decon_tiff + TIFF paging--> (ny, nx, nz)
+%   raw store (T, Z, Y, X)   --parallelReadZarr 'leadingIndex' [t+1],
+%       'orientForDecon': exactly opym.utils.orient_zyx_for_decon_tiff + TIFF
+%       paging, done by the reader-->  (ny, nx, nz)
 %   --RLdecon, in memory ('rawdata' in, nothing written)-->  uint16 (ny, nx, nz)
 %   --deskewRotateFrame3D, the call patches/XR_deskewRotateFrame.m makes-->  DSR (y, x, z)
-%   --> processed store: 3 pyramid levels of (T, C, Z, Y, X) + the Z-MIP,
-%       each through opymWriteZarrBlock at [t+1, c+1].
+%   --opymWriteLiveOutputs--> the view buffer, then the processed store:
+%       3 pyramid levels of (T, C, Z, Y, X) + the Z-MIP at [t+1, c+1].
 %
 % Same functions with the same arguments as the TIFF live path
 % (run_live_frames.m -> XR_RLdeconFrame3D -> RLdecon, then
@@ -33,8 +34,16 @@ function stats = run_live_zarr(p, numCPUs)
 %                   uint16 .npy on the RAM disk (numpy memory-maps it: no
 %                   decode). It lands before the compressed store is written,
 %                   so the view never waits on encoding.
-%   psf_path, decon_dir (per-session cache: generated PSF, OMW back projector,
-%                   erosion mask), plus a 'live' ticket's decon and DSR fields.
+%   psf_path, decon_dir (the session's work dir), plus a 'live' ticket's
+%                   decon and DSR fields
+%   psf_cache_dir   optional: where the generated PSF and OMW back projector
+%                   live (<dir>/psfgen), shared by every acquisition with the
+%                   same PSF, settings and shape (default decon_dir)
+%   warmup          optional: true for the warm-up a server runs when a
+%                   session starts (see opym.stream.live_zarr.WARMUP_NAME) --
+%                   a decon + DSR of a constant volume of raw_shape_zyx,
+%                   discarded, and the first view buffer readied in view_dir.
+%                   Nothing is read or written besides the PSF cache.
 
 t = double(p.t);
 c = double(p.c);
@@ -65,10 +74,11 @@ end
 
 if ~exist(deconDir, 'dir'), mkdir(deconDir); end
 stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'view_s', 0, 'write_s', 0);
+cacheRoot = char(getp(p, 'psf_cache_dir', deconDir));
 
-% --- once per session: generated PSF, exactly as XR_decon_data_wrapper ---
-% (same code and cache location as run_live_frames.m; RLdecon loads it)
-psfgenDir = fullfile(deconDir, 'psfgen');
+% --- once per PSF cache: generated PSF, exactly as XR_decon_data_wrapper ---
+% (same code as run_live_frames.m; RLdecon loads it from <its output dir>/psfgen)
+psfgenDir = fullfile(cacheRoot, 'psfgen');
 if ~exist(psfgenDir, 'dir'), mkdir(psfgenDir); end
 [~, psfFsn] = fileparts(psf);
 psfgenFn = sprintf('%s/%s_%s.tif', psfgenDir, psfFsn, method);
@@ -90,130 +100,106 @@ if ~exist(psfgenFn, 'file')
     publishOnce(tmpFn, psfgenFn, false);
 end
 
-% --- once per session: the first-time-point erosion mask (erodeByFTP) ---
-maskFn = '';
-if erode > 0
-    maskDir = fullfile(deconDir, 'Masks');
-    if ~exist(maskDir, 'dir'), mkdir(maskDir); end
-    maskFn = sprintf('%s/first_timepoint_C0_eroded.zarr', maskDir);
-    if ~exist(maskFn, 'dir')
-        first = orientForDecon(parallelReadZarr(char(p.mask_store), 'leadingIndex', 1));
-        im_bw_erode = decon_mask_edge_erosion(first > 0, erode);
-        tmpMask = sprintf('%s/first_timepoint_C0_eroded_%s.zarr', maskDir, get_uuid());
-        writezarr(uint8(im_bw_erode), tmpMask, 'blockSize', [256, 256, 256]);
-        publishOnce(tmpMask, maskFn, true);
-    end
-end
-
-% --- read ---
-t0 = tic;
-raw = orientForDecon(parallelReadZarr(char(p.raw_store), 'leadingIndex', t + 1));
-stats.read_s = toc(t0);
-
-% --- decon: RLdecon exactly as XR_RLdeconFrame3D calls it (its defaults for
-% what run_live_frames.m doesn't pass: Reverse true, fixIter false, mipAxis
-% [0 0 1]), with the volume in memory and nothing written. The output name
-% only places RLdecon's PSF cache (deconDir/psfgen); save3Dstack all false
-% returns the uint16 result instead of writing it. ---
-t0 = tic;
-fsname = sprintf('live_T%04d_C%d', t, c);
-deconvolved = RLdecon('', fullfile(deconDir, [fsname '.tif']), psf, xy, dz, dzPSF, 'rawdata', raw, ...
-    'save16bit', true, 'SkewAngle', ang, 'Deskew', false, 'Rotate', false, 'DSRCombined', true, ...
+% RLdecon exactly as XR_RLdeconFrame3D calls it (its defaults for what
+% run_live_frames.m doesn't pass: Reverse true, fixIter false, mipAxis
+% [0 0 1]), with the volume in memory and nothing written: save3Dstack all
+% false returns the result, and the output name only places the PSF cache.
+% The erosion mask is applied by this job rather than by RLdecon: given a
+% mask file it runs the core with EdgeErosion 0, then reads the file and
+% multiplies by it on every call -- EdgeErosion 0 with no file is that same
+% core call, and zeroing the mask's voxels is that same product.
+rlArgs = {'save16bit', true, 'SkewAngle', ang, 'Deskew', false, 'Rotate', false, 'DSRCombined', true, ...
     'Reverse', true, 'Background', bg, 'DeconIter', iter, 'RLMethod', method, 'skewed', true, ...
     'wienerAlpha', alpha, 'OTFCumThresh', otfCT, 'hannWinBounds', hann, 'saveZarr', false, ...
     'blockSize', [256, 256, 256], 'fixIter', false, 'dampFactor', damp, 'scaleFactor', 1, ...
-    'deconOffset', 0, 'EdgeErosion', erode, 'ErodeMaskfile', maskFn, 'errThresh', [], ...
+    'deconOffset', 0, 'EdgeErosion', 0, 'ErodeMaskfile', '', 'errThresh', [], ...
     'saveStep', 5, 'useGPU', gpu, 'psfGen', true, 'debug', false, ...
-    'save3Dstack', [false, false, false], 'mipAxis', [0, 0, 1]);
+    'save3Dstack', [false, false, false], 'mipAxis', [0, 0, 1]};
+% The DSRCombined call patches/XR_deskewRotateFrame.m makes for this
+% configuration (no stage scan, so skewAngle_1 = skewAngle).
+dsrArgs = {'reverse', reverse, 'crop', true, 'objectiveScan', false, ...
+    'resampleFactor', [], 'interpMethod', interp, 'xStepThresh', 2.0, 'save16bit', true};
+
+% --- warm-up: the same decon and DSR on a constant volume of the session's
+% shape, discarded. Compiles the code paths, builds the back projector into
+% the cache, plans the FFTs and leaves the OTF on the GPU
+% (decon_lucy_omw_function keys it on size and back projector, so the first
+% real ticket reuses it), then readies the first view buffer. ---
+if getp(p, 'warmup', false)
+    t0 = tic;
+    rs = double(p.raw_shape_zyx(:)');
+    dummy = repmat(uint16(bg + 1), rs([3, 2, 1]));   % (X, Y, Z), as the read returns
+    d = uint16(RLdecon('', fullfile(cacheRoot, 'warmup.tif'), psf, xy, dz, dzPSF, ...
+        'rawdata', dummy, rlArgs{:}));
+    clear dummy;
+    d = deskewRotateFrame3D(d, ang, dz, xy, dsrArgs{:});
+    if isfield(p, 'view_dir') && ~isempty(p.view_dir)
+        opymWriteLiveOutputs('prepare', char(p.view_dir), double(size(d, 1 : 3)));
+    end
+    stats.decon_s = toc(t0);
+    return;
+end
+
+% --- once per session and server: the first-time-point erosion mask
+% (erodeByFTP), kept in memory as the voxels it zeroes ---
+zeroIdx = [];
+if erode > 0
+    zeroIdx = ftpMaskZeros(char(p.mask_store), erode, deconDir);
+end
+
+% --- read, straight into the orientation the decon takes ---
+t0 = tic;
+raw = parallelReadZarr(char(p.raw_store), 'leadingIndex', t + 1, 'orientForDecon', true);
+stats.read_s = toc(t0);
+
+% --- decon ---
+t0 = tic;
+fsname = sprintf('live_T%04d_C%d', t, c);
+deconvolved = RLdecon('', fullfile(cacheRoot, [fsname '.tif']), psf, xy, dz, dzPSF, ...
+    'rawdata', raw, rlArgs{:});
 clear raw;
 % What the TIFF path writes and XR_deskewRotateFrame reads back (RLdecon's
 % save branch does this cast; the early return above skips it).
 deconvolved = uint16(deconvolved);
+deconvolved(zeroIdx) = 0;
 stats.decon_s = toc(t0);
 
-% --- deskew/rotate: the DSRCombined call patches/XR_deskewRotateFrame.m
-% makes for this configuration (no stage scan, so skewAngle_1 = skewAngle). ---
+% --- deskew/rotate ---
 t0 = tic;
-dsr = deskewRotateFrame3D(deconvolved, ang, dz, xy, ...
-    'reverse', reverse, 'crop', true, 'objectiveScan', false, ...
-    'resampleFactor', [], 'interpMethod', interp, ...
-    'xStepThresh', 2.0, 'save16bit', true);
+dsr = deskewRotateFrame3D(deconvolved, ang, dz, xy, dsrArgs{:});
 clear deconvolved;
 dsr = uint16(dsr);                        % the wrapper's writetiff(uint16(dsr))
-mip = uint16(max(dsr, [], 3));            % the wrapper's MIP: max over z, uint16
 stats.dsr_s = toc(t0);
 
-% --- the live viewer's copy first: nothing between it and the screen ---
+% --- every output from one transpose (opymWriteLiveOutputs): the live
+% viewer's buffer first, published before anything is encoded, then every
+% pyramid level and the Z-MIP (the wrapper's MIP: max over z) into the
+% processed store at [t+1, c+1] ---
+viewNpy = '';
 if isfield(p, 'view_npy') && ~isempty(p.view_npy)
-    t0 = tic;
-    writeNpyZYX(char(p.view_npy), dsr);
-    stats.view_s = toc(t0);
+    viewNpy = char(p.view_npy);
 end
-
-% --- write: (y, x, z) -> (z, y, x), the axis order the TIFF pages had ---
-t0 = tic;
-vol = permute(dsr, [3, 1, 2]);
-clear dsr;
-leading = [t + 1, c + 1];
-opymWriteZarrBlock(levels{1}, vol, leading);
-for k = 2 : numel(levels)
-    vol = downsample2(vol);
-    opymWriteZarrBlock(levels{k}, vol, leading);
-end
-opymWriteZarrBlock(char(p.mip), reshape(mip, [1, size(mip)]), leading);
-stats.write_s = toc(t0);
+tt = opymWriteLiveOutputs(dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]);
+stats.view_s = tt(1);
+stats.write_s = tt(2);
 end
 
 
-function writeNpyZYX(path, dsr)
-% dsr (y, x, z) as deskewRotateFrame3D returns it -> a C-order (Z, Y, X)
-% uint16 .npy (format 1.0). Written under a temporary name and renamed, so
-% a reader never maps a partial buffer.
-v = permute(dsr, [2, 1, 3]);   % (x, y, z) column-major == (z, y, x) C order
-sz = size(dsr, 1 : 3);         % [Y X Z]
-hdr = sprintf('{''descr'': ''<u2'', ''fortran_order'': False, ''shape'': (%d, %d, %d), }', ...
-    sz(3), sz(1), sz(2));
-pad = mod(-(10 + numel(hdr) + 1), 64);   % the whole header a multiple of 64
-hdr = [hdr, repmat(' ', 1, pad), newline];
-tmp = [path, '.tmp'];
-fid = fopen(tmp, 'w');
-if fid < 0
-    error('run_live_zarr:viewBuffer', 'Cannot write %s', tmp);
+function zeroIdx = ftpMaskZeros(maskStore, erode, sessionDir)
+% Linear indices (into the decon's (X, Y, Z) array) of the voxels the
+% first-time-point erosion mask zeroes: decon_mask_edge_erosion of channel
+% 0's first time point, as the wrappers' erodeByFTP builds it. Computed on
+% this server's first ticket of a session and kept for the rest of it
+% (keyed on the session's own work dir too: a later session can reuse a
+% raw store's path).
+persistent key idx
+k = sprintf('%s|%d|%s', maskStore, erode, sessionDir);
+if ~isequal(key, k)
+    first = parallelReadZarr(maskStore, 'leadingIndex', 1, 'orientForDecon', true);
+    idx = uint32(find(~decon_mask_edge_erosion(first > 0, erode)));
+    key = k;
 end
-fwrite(fid, [uint8(147), uint8('NUMPY'), uint8(1), uint8(0)], 'uint8');
-fwrite(fid, numel(hdr), 'uint16', 0, 'l');
-fwrite(fid, hdr, 'char');
-fwrite(fid, v, 'uint16', 0, 'l');
-fclose(fid);
-movefile(tmp, path);
-end
-
-
-function a = orientForDecon(zyx)
-% (Z, Y, X) as read from the raw store -> the (ny, nx, nz) array MATLAB's
-% readtiff returns for a staged TIFF written by
-% opym.utils.orient_zyx_for_decon_tiff: np.rot90(v, 1, axes=(1, 2)), whose
-% pages readtiff stacks along dim 3. Element for element:
-% a(i, j, z) = v(z, j, X + 1 - i). An exact index permutation.
-a = flip(permute(zyx, [3, 2, 1]), 1);
-end
-
-
-function out = downsample2(v)
-% 2x block mean on each axis, dropping an odd trailing plane/row/column,
-% floored back to uint16 -- bit-identical to opym.ome_zarr_writer.downsample2
-% (8-voxel sum in uint32, floor-divided by 8). On the GPU when there is one.
-sz = size(v, 1 : 3);
-sz = sz - mod(sz, 2);
-if gpuDeviceCount > 0
-    v = gpuArray(v);
-end
-v = uint32(v(1 : sz(1), 1 : sz(2), 1 : sz(3)));
-s = v(1:2:end, 1:2:end, 1:2:end) + v(2:2:end, 1:2:end, 1:2:end) ...
-  + v(1:2:end, 2:2:end, 1:2:end) + v(2:2:end, 2:2:end, 1:2:end) ...
-  + v(1:2:end, 1:2:end, 2:2:end) + v(2:2:end, 1:2:end, 2:2:end) ...
-  + v(1:2:end, 2:2:end, 2:2:end) + v(2:2:end, 2:2:end, 2:2:end);
-out = gather(uint16(bitshift(s, -3)));
+zeroIdx = idx;
 end
 
 

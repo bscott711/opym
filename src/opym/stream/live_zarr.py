@@ -31,6 +31,7 @@ this one is proven in production. Per session:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from opym.ome_zarr_writer import (
     create_processed_store,
     write_progress,
 )
-from opym.petakit import submit_live_zarr_job
+from opym.petakit import live_zarr_parameters, submit_live_zarr_job
 from opym.stream import trace
 from opym.stream.live import (
     LIVE_LATEST_NAME,
@@ -65,6 +66,39 @@ DEFAULT_VIEW_ROOT = Path("/dev/shm/opym_live_view")
 # (about 1 GB per channel each at 161 planes).
 BUFFER_KEEP_T = 3
 SHEET_ANGLE_DEG = 60.0
+# Written at every session start (see `ZarrLiveLane.start_session`): each GPU
+# server, when idle, runs one warm-up on it -- the session's PSF cache, a
+# decon + DSR of its shape to compile the code paths and plan the FFTs, and
+# its next view buffer readied -- so the first timepoint costs what the
+# others do.
+WARMUP_NAME = "live_warmup.json"
+PSF_CACHE_DIR = "psf_cache"
+
+
+def psf_cache_dir(
+    jobs: Path, psf: Path, z_step_um: float, raw_shape_zyx, decon_kwargs: dict
+) -> Path | None:
+    """Where one PSF's generated PSF and OMW back projector live for every
+    acquisition that shares them: keyed on the PSF file itself, every decon
+    setting and the raw shape (RLdecon crops a PSF bigger than the data
+    before building the back projector, and the file names record neither).
+    None if the PSF can't be read."""
+    try:
+        st = Path(psf).stat()
+    except OSError:
+        return None
+    key = json.dumps(
+        {
+            "psf": str(Path(psf).resolve()),
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "z_step_um": float(z_step_um),
+            "raw_shape_zyx": [int(n) for n in raw_shape_zyx],
+            "decon": decon_kwargs,
+        },
+        sort_keys=True,
+    )
+    return Path(jobs) / PSF_CACHE_DIR / hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
 def buffer_name(t: int, c: int) -> str:
@@ -117,6 +151,7 @@ class ZarrLiveSession:
     dsr_dir: Path  # where .live_status.json goes (the backfill's hand-off)
     qc_dir: Path
     view_arrays: ProcessedArrays = None  # type: ignore[assignment]
+    psf_cache: Path | None = None
     staged: dict[int, set[int]] = field(default_factory=dict)  # t -> cidx staged
     ready: list[tuple[int, int]] = field(default_factory=list)
     tickets: dict[str, _ZTicket] = field(default_factory=dict)
@@ -218,9 +253,13 @@ class ZarrLiveLane(LiveLane):
         session.view_arrays = create_processed_store(session.view_store, **store_kw)
         create_processed_store(session.archive_store, **store_kw)
         session.dsr_dir.mkdir(parents=True, exist_ok=True)
+        session.psf_cache = psf_cache_dir(
+            self.jobs, self.psf, z_step_um, raw_shape_zyx, deskew_decon_kwargs(self.psf)
+        )
         self.sessions[session_id] = session
         self._write_status(session, "running")
         self._write_latest(session)
+        self._write_warmup(session, raw_shape_zyx, shape)
         logger.info(
             "Live lane (zarr): session %s (%s) -> %s, archived to %s",
             session_id,
@@ -257,21 +296,52 @@ class ZarrLiveLane(LiveLane):
             self._submit(session, t, c, attempt=1)
             free -= 1
 
+    def _ticket_kwargs(self, session: ZarrLiveSession) -> dict:
+        return {
+            "mask_store": session.raw_arrays[0],
+            "levels": session.view_arrays.levels,
+            "mip": session.view_arrays.mip,
+            "psf_path": self.psf,
+            "decon_dir": session.decon_dir,
+            "z_step_um": session.z_step_um,
+            "psf_cache_dir": session.psf_cache,
+            **deskew_decon_kwargs(self.psf),
+        }
+
+    def _write_warmup(
+        self, session: ZarrLiveSession, raw_shape_zyx, dsr_shape_zyx
+    ) -> None:
+        """The warm-up spec for this session (see WARMUP_NAME): a (0, 0)
+        ticket's parameters plus the shapes and the view buffer directory.
+        Best effort -- without it the first timepoint is just slower."""
+        params = live_zarr_parameters(
+            session.raw_arrays[0], 0, 0, **self._ticket_kwargs(session)
+        )
+        params.update(
+            warmup=True,
+            raw_shape_zyx=[int(n) for n in raw_shape_zyx],
+            dsr_shape_zyx=[int(n) for n in dsr_shape_zyx],
+            view_dir=str(session.buffers_dir),
+        )
+        path = self.jobs / WARMUP_NAME
+        tmp = path.with_name(f".{WARMUP_NAME}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps({"session_id": session.session_id, "parameters": params})
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("Live lane (zarr): no warm-up spec written: %s", exc)
+
     def _submit(self, session: ZarrLiveSession, t: int, c: int, attempt: int) -> None:
         ticket = submit_live_zarr_job(
             session.raw_arrays[c],
             t,
             c,
-            mask_store=session.raw_arrays[0],
-            levels=session.view_arrays.levels,
-            mip=session.view_arrays.mip,
-            psf_path=self.psf,
-            decon_dir=session.decon_dir,
-            z_step_um=session.z_step_um,
             ticket_name=f"{session.base_name}_T{t:04d}_C{c}",
             queue_dir=lanes.live_queue_dir(self.jobs),
             view_npy=session.buffer(t, c),
-            **deskew_decon_kwargs(self.psf),
+            **self._ticket_kwargs(session),
         )
         session.tickets[ticket.name] = _ZTicket(ticket.name, t, c, attempt)
         trace.record(

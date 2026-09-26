@@ -432,29 +432,43 @@ class ServerSupervisor:
     # --- preemption -----------------------------------------------------------
 
     def _maybe_preempt(self, now: float) -> None:
-        """If a live ticket has waited `preempt_after_s` and no idle or
-        starting server is free to take it, kill one server that is working on
-        a backfill ticket. At most one per `preempt_after_s`, so work
-        escalates to the second GPU only while live tickets keep piling up."""
-        waited = oldest_claimable_age(self.live_queue_dir, now)
-        if waited is None or waited < self.preempt_after_s:
-            return
+        """Kill one server that is working on a backfill ticket, so live work
+        gets a GPU, when either
+
+        - there is live work (a live session's lease, or a live ticket) and
+          no server can take it -- every one is on backfill. Right away: a
+          relaunch plus the session warm-up take ~20 s, about what the first
+          volume takes to arrive, while backfill tickets run for minutes; or
+        - a live ticket has waited `preempt_after_s` and more are waiting than
+          the idle or starting servers can absorb (escalation to a second GPU).
+
+        At most one per `preempt_after_s`."""
         if now - self._last_preempt < self.preempt_after_s:
             return
-        # A running server with no claim is idle or still starting (Matlab
-        # takes about a minute) and will take a live ticket next; only
-        # preempt for live tickets beyond what those can absorb.
-        free = sum(
-            1
-            for slot in self.slots
-            if slot.proc is not None
-            and not slot.preempting
-            and self._read_claim(slot) is None
-        )
-        waiting = sum(
-            1 for p in self.live_queue_dir.glob("*.json") if not p.name.startswith(".")
-        )
-        if waiting <= free:
+        waited = oldest_claimable_age(self.live_queue_dir, now)
+        live_wanted = waited is not None or self._lease_active()
+        if live_wanted and not self._live_capacity():
+            reason = "Live work with every GPU on backfill"
+        elif waited is not None and waited >= self.preempt_after_s:
+            # A running server with no claim is idle or still starting and
+            # will take a live ticket next; only preempt for live tickets
+            # beyond what those can absorb.
+            free = sum(
+                1
+                for slot in self.slots
+                if slot.proc is not None
+                and not slot.preempting
+                and self._read_claim(slot) is None
+            )
+            waiting = sum(
+                1
+                for p in self.live_queue_dir.glob("*.json")
+                if not p.name.startswith(".")
+            )
+            if waiting <= free:
+                return
+            reason = f"Live ticket waiting {waited:.0f}s"
+        else:
             return
         for slot in self.slots:
             if slot.proc is None or slot.preempting:
@@ -463,14 +477,25 @@ class ServerSupervisor:
             if claim is None or claim.lane != lanes.BACKFILL_QUEUE_NAME:
                 continue
             print(
-                f"⏩ Live ticket waiting {waited:.0f}s: preempting server "
-                f"{slot.server_id} (backfill {claim.ticket}).",
+                f"⏩ {reason}: preempting server {slot.server_id} "
+                f"(backfill {claim.ticket}).",
                 flush=True,
             )
             slot.preempting = True
             self._last_preempt = now
             self._kill(slot)
             return
+
+    def _live_capacity(self) -> bool:
+        """A server that can take live work: running, and idle, starting, or
+        on live work already."""
+        for slot in self.slots:
+            if slot.proc is None or slot.preempting:
+                continue
+            claim = self._read_claim(slot)
+            if claim is None or claim.lane != lanes.BACKFILL_QUEUE_NAME:
+                return True
+        return False
 
     def _kill(self, slot: ServerSlot) -> None:
         """Terminate the server's whole process tree: the bash wrapper,
@@ -604,8 +629,8 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
         f"kill={'on' if kill_hung else 'off'}"
     )
     print(
-        f" ⏩ Live Preemption: {'on' if preempt else 'off'}, after a live ticket "
-        f"waits {preempt_after_s:.0f}s"
+        f" ⏩ Live Preemption: {'on' if preempt else 'off'}: at once when live "
+        f"work has no GPU, a second one after {preempt_after_s:.0f}s"
     )
     print(f" 🔧 Backend Script:  {OPYM_DIR}/run_petakit_server.m")
     print("=" * 60, flush=True)

@@ -64,6 +64,12 @@ as z-slabs while it is still being acquired (FRAME headers with `z0`,
 into the raw store. The volume is staged for processing (decon TIFF, live
 lane, QC) once its last plane lands, and its slabs are ACKed only then, so
 a restart mid-volume makes the client resend the whole volume.
+
+Compression: a client that sees "blosc" in `features` may send any FRAME's
+payload as one blosc frame (header `codec: "blosc"`); it's decoded here
+before anything else looks at it. Camera frames compress ~2.5x with lz4 +
+bitshuffle, which is ~2.5x the throughput of a link that is the bottleneck
+(the SSH tunnel: ~33 MB/s).
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ from typing import Any
 
 import numpy as np
 import zmq
+from numcodecs import blosc as _blosc
 
 from opym import lanes
 from opym.decon_config import resolve_decon_psf
@@ -103,7 +110,7 @@ DEFAULT_BIND_ADDR = "tcp://127.0.0.1:5555"
 ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
-POLL_TIMEOUT_MS = 500
+POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
 # thousand earlier acquisitions under one name means something is wrong
@@ -147,7 +154,7 @@ _RAW_ROOTS_ENV_VAR = "OPYM_STREAM_RAW_ROOTS"
 # the IP allowlist) for NULL-mechanism connections at all.
 _ZAP_DOMAIN = b"opym-direct"
 # Advertised in every ACK; clients only use a feature once they've seen it.
-SERVER_FEATURES = ["slabs"]
+SERVER_FEATURES = ["slabs", "blosc"]
 
 
 def _env_list(name: str) -> list[str]:
@@ -211,6 +218,7 @@ class _SlabAssembly:
     frame_indices: list[int] = field(default_factory=list)
     first_recv_s: float = 0.0
     raw_write_s: float = 0.0
+    wire_bytes: int = 0
 
 
 @dataclass
@@ -738,9 +746,29 @@ class StreamReceiver:
         recv_s = time.time()
         session.last_activity = time.monotonic()
         t, c, frame_index = header["t"], header["c"], header["frame_index"]
+        wire_bytes = len(payload)
+        if header.get("codec") == "blosc":
+            try:
+                payload = _blosc.decompress(payload)
+            except Exception:
+                logger.exception(
+                    "Undecodable blosc FRAME (t=%d, c=%d) for session %s -- "
+                    "dropped; the client resends unACKed frames on resume.",
+                    t,
+                    c,
+                    session_id,
+                )
+                return
+        elif header.get("codec") not in (None, "raw"):
+            logger.warning(
+                "FRAME with unknown codec %r for session %s -- dropped",
+                header.get("codec"),
+                session_id,
+            )
+            return
 
         if "z0" in header:
-            self._handle_slab(session, header, payload, recv_s)
+            self._handle_slab(session, header, payload, recv_s, wire_bytes)
         elif frame_index not in session.processed_frame_indices:
             if (t, c) not in session.received_pairs:
                 try:
@@ -756,7 +784,9 @@ class StreamReceiver:
                     )
                     return
                 session.received_pairs.add((t, c))
-                _trace_frame(session, header, len(payload), recv_s)
+                _trace_frame(
+                    session, header, len(payload), recv_s, wire_bytes=wire_bytes
+                )
             else:
                 logger.debug(
                     "Duplicate frame (t=%d, c=%d) for session %s already staged "
@@ -781,6 +811,7 @@ class StreamReceiver:
         header: dict[str, Any],
         payload: bytes,
         recv_s: float,
+        wire_bytes: int | None = None,
     ) -> None:
         """One z-slab `[z0, z0 + n)` of volume (t, c): written into the raw
         store now, staged for processing once the volume's last plane lands.
@@ -815,6 +846,7 @@ class StreamReceiver:
         asm.frame_indices.append(frame_index)
         if z0 in asm.z0s:
             return  # a resend of a slab already written
+        asm.wire_bytes += len(payload) if wire_bytes is None else wire_bytes
         try:
             t_start = time.perf_counter()
             arr = self._raw_array(session, c, asm.volume.shape, dtype.str)
@@ -859,6 +891,7 @@ class StreamReceiver:
             recv_s,
             first_recv_s=asm.first_recv_s,
             slabs=len(asm.z0s),
+            wire_bytes=asm.wire_bytes,
         )
 
     def _raw_array(

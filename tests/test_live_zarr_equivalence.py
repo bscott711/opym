@@ -10,6 +10,7 @@ Cell_001_001 raw stores and PSF on GPFS; skipped otherwise."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,11 @@ from numcodecs import Blosc
 
 from opym.decon_config import deskew_decon_kwargs
 from opym.ome_zarr_writer import downsample2, level_shapes
-from opym.petakit import submit_live_frames_job, submit_live_zarr_job
+from opym.petakit import (
+    live_zarr_parameters,
+    submit_live_frames_job,
+    submit_live_zarr_job,
+)
 from opym.utils import dsr_shape_zyx, write_decon_staged_tiff
 
 pytestmark = pytest.mark.gpu
@@ -105,6 +110,38 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
     )
 
     _run(eng, tiff_ticket, "run_live_frames")
+
+    # As in production: the session's warm-up first (PSF into the shared
+    # cache, a throwaway decon + DSR of this shape, the first view buffer
+    # readied), then the real tickets through that same cache.
+    (tmp_path / "view").mkdir()
+    cache = tmp_path / "psf_cache" / "k"
+    raw_shape = zarr.open(str(STORES[0]), mode="r").shape[1:]
+    warm = live_zarr_parameters(
+        STORES[0],
+        0,
+        0,
+        mask_store=STORES[0],
+        levels=levels,
+        mip=store / "1" / "0",
+        psf_path=PSF,
+        decon_dir=tmp_path / "zarr" / "Decon",
+        z_step_um=DZ,
+        psf_cache_dir=cache,
+        **kw,
+    )
+    warm.update(
+        warmup=True,
+        raw_shape_zyx=list(raw_shape),
+        dsr_shape_zyx=list(shape),
+        view_dir=str(tmp_path / "view"),
+    )
+    spec = tmp_path / "warmup.json"
+    spec.write_text(json.dumps({"parameters": warm}))
+    _run(eng, spec, "run_live_zarr")
+    assert list((cache / "psfgen").glob("*back_projector*.tif"))
+    assert not zarr.open_group(str(store), mode="r")["0/0"][:].any()  # nothing written
+
     for t in range(T):
         for c in range(C):
             ticket = submit_live_zarr_job(
@@ -120,9 +157,9 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 ticket_name=f"Eq_T{t}_C{c}",
                 queue_dir=tmp_path / "q",
                 view_npy=tmp_path / "view" / f"T{t}_C{c}.npy",
+                psf_cache_dir=cache,
                 **kw,
             )
-            (tmp_path / "view").mkdir(exist_ok=True)
             _run(eng, ticket, "run_live_zarr")
 
     dsr_dir = tmp_path / "tiff" / "Decon" / "DSR_decon"

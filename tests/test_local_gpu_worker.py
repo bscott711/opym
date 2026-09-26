@@ -361,10 +361,42 @@ def _busy_with_backfill_and_live_waiting(tmp_path, waited_s, **kwargs):
     return sup, launched, clock, procs, killed
 
 
-def test_no_preemption_before_a_live_ticket_has_waited_long_enough(tmp_path):
-    sup, _, _, _, killed = _busy_with_backfill_and_live_waiting(tmp_path, waited_s=10)
+def test_no_preemption_while_a_server_can_take_the_live_ticket(tmp_path):
+    sup, launched, clock = _make_supervisor(tmp_path, preempt_after_s=30)
+    _ticket(sup.queue_dir, "bf_a.json")
+    sup.tick()
+    _claim(sup, "1", "bf_a.json")  # server 2 is idle
+    live = _ticket(sup.live_queue_dir, "LIVE_t000.json")
+    os.utime(live, (clock.t - 10, clock.t - 10))
+    killed = []
+    sup._kill = lambda slot: killed.append(slot.server_id)
     sup.tick()
     assert killed == []
+
+
+def test_live_work_with_every_gpu_on_backfill_preempts_one_at_once(tmp_path):
+    """No 30 s grace when nothing can take live work: a session opening (its
+    lease, before any ticket) or a fresh live ticket preempts one server."""
+    lease = {"active": False}
+    sup, launched, clock, procs, killed = _busy_with_backfill_and_live_waiting(
+        tmp_path, waited_s=0, lease_active=lambda: lease["active"]
+    )
+    (sup.live_queue_dir / "LIVE_t000.json").unlink()
+    sup.tick()
+    assert killed == []  # no session, no live ticket
+    lease["active"] = True
+    sup.tick()
+    assert killed == ["1"]
+    sup.tick()  # relaunched with no claim: it takes the live work
+    clock.t += 60
+    sup.tick()
+    assert killed == ["1"]
+
+
+def test_a_fresh_live_ticket_preempts_when_every_gpu_is_on_backfill(tmp_path):
+    sup, _, _, _, killed = _busy_with_backfill_and_live_waiting(tmp_path, waited_s=1)
+    sup.tick()
+    assert killed == ["1"]
 
 
 def test_waiting_live_ticket_preempts_one_backfill_server(tmp_path):

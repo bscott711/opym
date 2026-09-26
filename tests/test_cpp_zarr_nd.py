@@ -104,3 +104,96 @@ def test_write_rejects_a_wrong_size_or_index(eng, tmp_path):
         eng.opymWriteZarrBlock(
             str(store), matlab.uint16(block), matlab.double([2, 1]), nargout=0
         )
+
+
+@pytest.mark.parametrize("compressor", [None, LZ4], ids=["uncompressed", "blosc"])
+def test_read_oriented_for_decon(eng, tmp_path, compressor):
+    """'orientForDecon' returns flip(permute(zyx, [3 2 1]), 1) directly:
+    a(i, j, z) = v(z, j, X + 1 - i), each C-order row reversed."""
+    import matlab
+
+    raw = np.random.default_rng(1).integers(0, 60000, (2, 5, 7, 9), dtype=np.uint16)
+    store = tmp_path / "p0"
+    arr = zarr.open(
+        str(store),
+        mode="w",
+        shape=raw.shape,
+        chunks=(1, 1, 7, 9),
+        dtype="uint16",
+        compressor=compressor,
+        dimension_separator="/",
+    )
+    arr[:] = raw
+    got = np.asarray(
+        eng.parallelReadZarr(
+            str(store), "leadingIndex", matlab.double([2]), "orientForDecon", True
+        )
+    )
+    assert got.shape == (9, 7, 5)
+    np.testing.assert_array_equal(got, np.flip(raw[1].transpose(2, 1, 0), axis=0))
+
+
+def _processed(tmp_path, shape):
+    from opym.ome_zarr_writer import create_processed_store
+
+    return create_processed_store(
+        tmp_path / "S_dsr.ome.zarr", n_t=2, n_c=2, shape_zyx=shape
+    )
+
+
+def test_live_outputs_match_every_reference(eng, tmp_path):
+    """opymWriteLiveOutputs from a (Y, X, Z) DSR volume: the C-order
+    (Z, Y, X) view buffer, level 0, each 2x level (opym's downsample2) and
+    the Z-MIP -- at ragged, odd sizes, twice into one directory (the second
+    call writes into the buffer readied after the first)."""
+    import matlab
+
+    from opym.ome_zarr_writer import downsample2
+
+    shape = (70, 301, 259)  # (Z, Y, X): odd trailing edges on every axis
+    arrs = _processed(tmp_path, shape)
+    rng = np.random.default_rng(2)
+    (tmp_path / "view").mkdir()
+    for t, c in ((0, 1), (1, 0)):
+        vol = rng.integers(0, 4000, shape, dtype=np.uint16)
+        vol[:64, :256, :256] = 0  # an all-zero chunk: skipped, reads as 0
+        npy = tmp_path / "view" / f"T{t}_C{c}.npy"
+        secs = eng.opymWriteLiveOutputs(
+            matlab.uint16(np.ascontiguousarray(vol.transpose(1, 2, 0))),
+            str(npy),
+            [str(p) for p in arrs.levels],
+            str(arrs.mip),
+            matlab.double([t + 1, c + 1]),
+        )
+        assert np.asarray(secs).size == 2
+        view = np.load(npy, mmap_mode="r")
+        assert view.flags.c_contiguous
+        np.testing.assert_array_equal(view, vol)
+        out = zarr.open_group(str(arrs.mip.parents[1]), mode="r")
+        ref = vol
+        for lvl in range(len(arrs.levels)):
+            np.testing.assert_array_equal(out[f"0/{lvl}"][t, c], ref)
+            ref = downsample2(ref)
+        np.testing.assert_array_equal(out["1/0"][t, c, 0], vol.max(axis=0))
+    # No partial buffers left behind; only the hidden next buffer, readied.
+    left = [f.name for f in (tmp_path / "view").iterdir() if f.name.endswith(".tmp")]
+    assert len(left) == 1 and left[0].startswith(".opym_prep_")
+
+
+def test_live_outputs_without_a_view_buffer(eng, tmp_path):
+    import matlab
+
+    shape = (8, 12, 10)
+    arrs = _processed(tmp_path, shape)
+    vol = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    eng.opymWriteLiveOutputs(
+        matlab.uint16(np.ascontiguousarray(vol.transpose(1, 2, 0))),
+        "",
+        [str(p) for p in arrs.levels],
+        str(arrs.mip),
+        matlab.double([2, 2]),
+        nargout=1,
+    )
+    out = zarr.open_group(str(arrs.mip.parents[1]), mode="r")
+    np.testing.assert_array_equal(out["0/0"][1, 1], vol)
+    np.testing.assert_array_equal(out["1/0"][1, 1, 0], vol.max(axis=0))

@@ -303,3 +303,89 @@ def test_whole_volume_frames_still_work_next_to_slabs(tmp_path, receiver):
     np.testing.assert_array_equal(store[0], v0)
     np.testing.assert_array_equal(store[1], v1)
     sock.close()
+
+
+def test_blosc_frames_and_slabs_decode_to_the_same_store(tmp_path, receiver):
+    """A client that saw "blosc" may compress any FRAME's payload: a whole
+    volume and a volume's slabs land exactly as their raw bytes would."""
+    from opym.stream.client import compress_payload
+
+    assert "blosc" in SERVER_FEATURES
+    sock = _dealer(_endpoint(receiver._socket), "sess-blosc")
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, "sess-blosc", _header(tmp_path / "raw"))
+    )
+    assert "blosc" in _pump_for_ack(receiver, sock)["features"]
+    v0, v1 = _volume(0), _volume(1)
+    frame = {
+        "t": 0,
+        "c": 0,
+        "frame_index": 0,
+        "timestamp": 0.0,
+        "camera_id": 0,
+        "shape_zyx": list(SHAPE_ZYX),
+        "dtype": "uint16",
+        "codec": "blosc",
+    }
+    sock.send_multipart(
+        pack_message(MSG_FRAME, "sess-blosc", frame, compress_payload(v0))
+    )
+    assert _pump_for_ack(receiver, sock)["through_frame_index"] == 0
+    for fi, (z0, n) in enumerate([(0, 3), (3, 2)], start=1):
+        header, _ = _slab(1, z0, n, fi, v1)
+        payload = compress_payload(v1[z0 : z0 + n])
+        sock.send_multipart(
+            pack_message(MSG_FRAME, "sess-blosc", {**header, "codec": "blosc"}, payload)
+        )
+        ack = _pump_for_ack(receiver, sock)
+    assert ack["through_frame_index"] == 2
+    store = zarr.open(
+        str(tmp_path / "raw" / "Cell_020_GFP_488.ome.zarr" / "p0"), mode="r"
+    )
+    np.testing.assert_array_equal(store[0], v0)
+    np.testing.assert_array_equal(store[1], v1)
+    evs = {e["t"]: e for e in trace.read() if e["ev"] == "frame"}
+    assert evs[0]["bytes"] == evs[1]["bytes"] == v0.nbytes
+    assert 0 < evs[1]["wire_bytes"] and evs[0]["wire_bytes"] == len(
+        compress_payload(v0)
+    )
+    sock.close()
+
+
+def test_an_undecodable_or_unknown_codec_frame_is_dropped(tmp_path, receiver):
+    sock = _dealer(_endpoint(receiver._socket), "sess-bad")
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, "sess-bad", _header(tmp_path / "raw"))
+    )
+    _pump_for_ack(receiver, sock)
+    frame = {
+        "t": 0,
+        "c": 0,
+        "frame_index": 0,
+        "timestamp": 0.0,
+        "camera_id": 0,
+        "shape_zyx": list(SHAPE_ZYX),
+        "dtype": "uint16",
+    }
+    for codec, payload in (("blosc", b"not blosc"), ("zstd9", _volume().tobytes())):
+        sock.send_multipart(
+            pack_message(MSG_FRAME, "sess-bad", {**frame, "codec": codec}, payload)
+        )
+        for _ in range(20):
+            receiver._run_once()
+    assert not receiver.sessions["sess-bad"].received_pairs
+    sock.close()
+
+
+def test_the_sender_compresses_only_once_the_receiver_offers_it(tmp_path, receiver):
+    from opym.stream.client import StreamSender
+
+    sent = []
+    with StreamSender(_endpoint(receiver._socket), compress=True) as s:
+        s._send_frame_wire = lambda header, payload: sent.append((header, payload))
+        s.send_frame({"frame_index": 0, "t": 0, "c": 0}, _volume())
+        assert "codec" not in sent[-1][0]  # nothing advertised yet
+        s.features.add("blosc")
+        s.send_frame({"frame_index": 1, "t": 1, "c": 0}, _volume(1))
+        assert sent[-1][0]["codec"] == "blosc"
+        assert len(sent[-1][1]) < _volume().nbytes

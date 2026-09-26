@@ -459,7 +459,7 @@ def submit_remote_deskew_job(
     return _write_ticket(payload, base_name, "DESKEW", queue_dir)
 
 
-def submit_live_zarr_job(
+def live_zarr_parameters(
     raw_store: str | Path,
     t: int,
     c: int,
@@ -470,8 +470,6 @@ def submit_live_zarr_job(
     psf_path: str | Path,
     decon_dir: Path,
     z_step_um: float,
-    ticket_name: str,
-    queue_dir: Path,
     xy_pixel_size: float = 0.136,
     sheet_angle_deg: float = 60.0,
     interp_method: str = DSR_INTERP_METHOD,
@@ -487,20 +485,24 @@ def submit_live_zarr_job(
     damp_factor: float | None = None,
     dsr_dir_name: str = "DSR_decon",
     view_npy: str | Path | None = None,
-) -> Path:
-    """Queue a 'live_zarr' ticket: one (t, c) volume from its raw OME-Zarr
-    array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate in
-    memory, into the processed OME-Zarr's `levels` (full resolution first,
+    psf_cache_dir: str | Path | None = None,
+) -> dict:
+    """The parameters of a 'live_zarr' ticket: one (t, c) volume from its raw
+    OME-Zarr array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate
+    in memory, into the processed OME-Zarr's `levels` (full resolution first,
     each (T, C, Z, Y, X)) and `mip` array (see run_live_zarr.m).
 
-    Every ticket of one acquisition must share `decon_dir` (generated PSF,
-    OMW back projector, the first-timepoint edge-erosion mask built from
-    `mask_store`, channel 0's raw array). The decon and DSR parameters and
-    their defaults are exactly `submit_live_frames_job`'s, whose TIFF path
-    this reproduces bit for bit. `dsr_dir_name` is accepted (and ignored) so
-    the same `deskew_decon_kwargs` feed both. `view_npy`: where the server
-    puts the full-resolution volume for the live viewer (an uncompressed
-    .npy on the RAM disk) before it writes the compressed store.
+    Every ticket of one acquisition must share `decon_dir` (its work dir)
+    and `mask_store` (channel 0's raw array: the first-timepoint edge-erosion
+    mask comes from it). The generated PSF and OMW back projector go under
+    `psf_cache_dir` (default `decon_dir`): one directory per PSF, decon
+    settings and data shape can serve every acquisition that shares them.
+    The decon and DSR parameters and their defaults are exactly
+    `submit_live_frames_job`'s, whose TIFF path this reproduces bit for bit.
+    `dsr_dir_name` is accepted (and ignored) so the same `deskew_decon_kwargs`
+    feed both. `view_npy`: where the server puts the full-resolution volume
+    for the live viewer (an uncompressed .npy on the RAM disk) before it
+    writes the compressed store.
     """
     rl_method = _normalize_rl_method(rl_method)
     params = {
@@ -527,6 +529,8 @@ def submit_live_zarr_job(
     }
     if view_npy is not None:
         params["view_npy"] = str(view_npy)
+    if psf_cache_dir is not None:
+        params["psf_cache_dir"] = str(psf_cache_dir)
     if background is not None:
         params["background"] = float(background)
     if edge_erosion is not None:
@@ -534,6 +538,21 @@ def submit_live_zarr_job(
     _apply_omw_params(
         params, wiener_alpha, otf_cum_thresh, hann_win_bounds, damp_factor
     )
+    return params
+
+
+def submit_live_zarr_job(
+    raw_store: str | Path,
+    t: int,
+    c: int,
+    *,
+    decon_dir: Path,
+    ticket_name: str,
+    queue_dir: Path,
+    **kwargs,
+) -> Path:
+    """Queue a 'live_zarr' ticket; the arguments are `live_zarr_parameters`'."""
+    params = live_zarr_parameters(raw_store, t, c, decon_dir=decon_dir, **kwargs)
     payload = {
         "jobType": "live_zarr",
         # The supervisor's hang check watches this directory for new files.

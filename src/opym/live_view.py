@@ -52,7 +52,7 @@ _NAPARI_DEDUP_SUFFIX = re.compile(r" \[\d+\]$")
 
 # Reading a progress file and listing a RAM-disk directory is cheap; a slow
 # poll was up to 2 s of the live view's lag.
-POLL_S = 0.25
+POLL_S = 0.1
 LIVE_LATEST_NAME = "live_latest.json"
 QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}

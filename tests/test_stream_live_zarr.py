@@ -153,6 +153,61 @@ def test_nothing_is_dispatched_before_channel_0_timepoint_0(tmp_path, psf):
     assert p["view_npy"] == str(s.buffer(p["t"], p["c"]))
 
 
+def test_session_start_writes_the_warm_up_spec(tmp_path, psf):
+    """Every GPU server warms up on this before (0, 0) arrives: a (0, 0)
+    ticket's parameters, flagged, with the shapes and the buffers dir."""
+    lane, jobs = _lane(tmp_path, psf)
+    s = _session(lane, tmp_path)
+    spec = json.loads((jobs / live_zarr.WARMUP_NAME).read_text())
+    assert spec["session_id"] == "sess"
+    p = spec["parameters"]
+    assert p["warmup"] is True
+    assert p["raw_shape_zyx"] == list(RAW_ZYX)
+    assert p["dsr_shape_zyx"] == list(dsr_shape_zyx(RAW_ZYX, 0.5))
+    assert p["view_dir"] == str(s.buffers_dir)
+    assert p["psf_cache_dir"] == str(s.psf_cache)
+    assert (p["t"], p["c"], p["raw_store"]) == (0, 0, str(s.raw_arrays[0]))
+    # ...and its decon settings are exactly the real tickets'.
+    s.staged[0] = {0}
+    s.ready.append((0, 0))
+    lane.pump()
+    ((_, tk),) = _tickets(jobs)
+    real = tk["parameters"]
+    for k in set(real) - {"view_npy"}:
+        assert p[k] == real[k], k
+    _session(lane, tmp_path, sid="next")
+    assert (
+        json.loads((jobs / live_zarr.WARMUP_NAME).read_text())["session_id"] == "next"
+    )
+
+
+def test_the_psf_cache_is_shared_only_by_what_matches(tmp_path, psf):
+    kw = {"wiener_alpha": 0.2, "hann_win_bounds": [0.4, 1.0]}
+    jobs = tmp_path / "jobs"
+    one = live_zarr.psf_cache_dir(jobs, psf, 0.5, RAW_ZYX, kw)
+    assert one.parent == jobs / live_zarr.PSF_CACHE_DIR
+    assert live_zarr.psf_cache_dir(jobs, psf, 0.5, list(RAW_ZYX), dict(kw)) == one
+    assert live_zarr.psf_cache_dir(jobs, psf, 0.3, RAW_ZYX, kw) != one
+    assert live_zarr.psf_cache_dir(jobs, psf, 0.5, (7, 16, 12), kw) != one
+    assert (
+        live_zarr.psf_cache_dir(jobs, psf, 0.5, RAW_ZYX, {**kw, "wiener_alpha": 0.1})
+        != one
+    )
+    psf.write_bytes(b"a different psf")
+    assert live_zarr.psf_cache_dir(jobs, psf, 0.5, RAW_ZYX, kw) != one
+    assert (
+        live_zarr.psf_cache_dir(jobs, tmp_path / "gone.tif", 0.5, RAW_ZYX, kw) is None
+    )
+
+
+def test_two_sessions_of_one_shape_share_the_psf_cache(tmp_path, psf):
+    lane, _ = _lane(tmp_path, psf)
+    a = _session(lane, tmp_path, sid="a")
+    b = _session(lane, tmp_path, sid="b")
+    assert a.psf_cache == b.psf_cache is not None
+    assert a.decon_dir != b.decon_dir
+
+
 def test_one_ticket_per_channel_and_the_in_flight_cap(tmp_path, psf):
     lane, jobs = _lane(tmp_path, psf)
     _session(lane, tmp_path, n_t=4)

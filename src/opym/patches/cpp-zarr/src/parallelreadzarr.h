@@ -8,7 +8,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &readShape,
                          const uint64_t bits,
                          const bool useCtx=false,
-                         const bool sparse=false);
+                         const bool sparse=false,
+                         const bool orientForDecon=false);
 
 void* parallelReadZarrWriteWrapper(zarr Zarr, const bool &crop,
                               std::vector<uint64_t> startCoords, 

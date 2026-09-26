@@ -15,7 +15,8 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
                          const std::vector<uint64_t> &readShape,
                          const uint64_t bits,
                          const bool useCtx,
-                         const bool sparse)
+                         const bool sparse,
+                         const bool orientForDecon)
 {
     void* zarrArrC = nullptr;
     const uint64_t bytes = (bits/8);
@@ -308,6 +309,25 @@ uint8_t parallelReadZarr(zarr &Zarr, void* zarrArr,
         Zarr.set_errString(errString);
         free(zarrArrC);
         return 1;
+    }
+    else if (Zarr.get_order() == "C" && orientForDecon){
+        // opym patch: straight into the (X, Y, Z) array opym's live job
+        // deconvolves -- flip(permute(zyx, [3 2 1]), 1), i.e. each C-order
+        // row reversed in place -- instead of the element-wise transpose to
+        // (Z, Y, X) below that MATLAB then undid with a permute and a flip.
+        const uint64_t Z = readShape[0], Y = readShape[1], X = readShape[2];
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int64_t z = 0; z < (int64_t)Z; z++){
+            for(int64_t y = 0; y < (int64_t)Y; y++){
+                const uint64_t row = ((uint64_t)z*Y + (uint64_t)y)*X;
+                const uint8_t* src = (const uint8_t*)zarrArrC + row*bytes;
+                uint8_t* dst = (uint8_t*)zarrArr + row*bytes;
+                for(uint64_t x = 0; x < X; x++){
+                    memcpy(dst + (X-1-x)*bytes, src + x*bytes, bytes);
+                }
+            }
+        }
+        free(zarrArrC);
     }
     else if (Zarr.get_order() == "C"){
         // This transpose can potentially be optimized more        

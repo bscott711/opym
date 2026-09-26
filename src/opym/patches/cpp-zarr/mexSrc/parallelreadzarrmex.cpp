@@ -18,6 +18,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // opym patch: 1-based indices along the leading axes of an N-D array;
     // see zarr::set_leadingIndex.
     std::vector<uint64_t> leadingIndex;
+    // opym patch: return flip(permute(zyx, [3 2 1]), 1) directly (the
+    // (X, Y, Z) array run_live_zarr.m deconvolves), C-order arrays only.
+    bool orientForDecon = false;
     std::string folderName(mxArrayToString(prhs[0]));
 
     for(int i = 1; i < nrhs; i+=2){
@@ -52,9 +55,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 leadingIndex.push_back((uint64_t)v - 1);
             }
         }
+        else if(currInput == "orientForDecon"){
+            orientForDecon = mxIsLogicalScalarTrue(prhs[i+1]) ||
+                             (mxIsNumeric(prhs[i+1]) && mxGetScalar(prhs[i+1]) != 0);
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: bbox, sparse, leadingIndex\n",currInput.c_str());
+            Currently Supported Names: bbox, sparse, leadingIndex, orientForDecon\n",currInput.c_str());
         }
     }
     
@@ -95,6 +102,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
                                              endCoords[1]-startCoords[1],
                                              endCoords[2]-startCoords[2]};
     uint64_t dim[3] = {readShape[0],readShape[1],readShape[2]};
+    if(orientForDecon){
+        if(Zarr.get_order() != "C") mexErrMsgIdAndTxt("zarr:inputError","orientForDecon needs a C-order array");
+        dim[0] = readShape[2];
+        dim[2] = readShape[0];
+    }
     // TESTING
     /*
     if(Zarr.get_order() == "C"){
@@ -124,7 +136,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
             zarrArr = (uint8_t*)mxGetPr(plhs[0]);
         }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse,orientForDecon);
     }
     else if(Zarr.get_dtype().find("u2") != std::string::npos){
         uint64_t bits = 16;
@@ -138,7 +150,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
             zarrArr = (uint16_t*)mxGetPr(plhs[0]);
         }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse,orientForDecon);
     }
     else if(Zarr.get_dtype().find("f4") != std::string::npos){
         uint64_t bits = 32;
@@ -152,7 +164,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
             zarrArr = (float*)mxGetPr(plhs[0]);
         }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse,orientForDecon);
     }
     else if(Zarr.get_dtype().find("f8") != std::string::npos){
         uint64_t bits = 64;
@@ -166,7 +178,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
             zarrArr = (double*)mxGetPr(plhs[0]);
         }
-        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse);
+        err = parallelReadZarr(Zarr, (void*)zarrArr,startCoords,endCoords,readShape,bits,useCtx,sparse,orientForDecon);
     }
     else{
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
