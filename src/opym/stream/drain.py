@@ -234,6 +234,37 @@ class DrainPool:
         for sid, entry in hits:
             self._evict(sid, entry)
 
+    def retain(self, session_id: str, stage_paths: list[Path]) -> None:
+        """Keeps a session's staging copies for the usual retention, then
+        evicts them, without copying them anywhere. For a session the client
+        paused (see `StreamReceiver._finalize_session`): its partial copy
+        must not reach GPFS, but live work still in flight may read it."""
+        paths = [Path(p) for p in stage_paths if Path(p).exists()]
+        if not paths:
+            return
+        size = sum(_tree_stats(p)[1] for p in paths)
+        with self._lock:
+            self._drained[session_id] = _DrainedEntry(
+                stage_dirs=paths, drained_at=time.monotonic(), size_bytes=size
+            )
+        self._write_manifest(session_id, paths, size)
+
+    def reclaim(self, stage_paths: list[Path]) -> None:
+        """Takes staging copies back out of retention WITHOUT evicting them:
+        a session resumed after it was drained (the client reconnected after
+        the receiver's idle timeout) keeps writing into its old staging copy,
+        which must not be evicted under it. Its next drain re-registers it."""
+        wanted = {Path(p) for p in stage_paths}
+        with self._lock:
+            hits = [
+                sid for sid, e in self._drained.items() if wanted & set(e.stage_dirs)
+            ]
+            for sid in hits:
+                del self._drained[sid]
+        if self._manifest_dir is not None:
+            for sid in hits:
+                (self._manifest_dir / f"{sid}.json").unlink(missing_ok=True)
+
     def _sweep_retention(self) -> None:
         now = time.monotonic()
         to_evict: list[tuple[str, _DrainedEntry]] = []

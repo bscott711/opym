@@ -70,6 +70,24 @@ payload as one blosc frame (header `codec: "blosc"`); it's decoded here
 before anything else looks at it. Camera frames compress ~2.5x with lz4 +
 bitshuffle, which is ~2.5x the throughput of a link that is the bottleneck
 (the SSH tunnel: ~33 MB/s).
+
+Links: a client that sees "links" may stream one session over several
+connections at once (identities `<session_id>#<k>`, see protocol.py): one
+SSH tunnel is capped at ~2 MB per round trip, so N tunnels move ~N times
+as much. Nothing here depends on which link a message came in on.
+
+Recovery ("resume"): a FRAME or RESUME for a session this process doesn't
+know (it restarted, or idle-timed the session out) is answered with
+`unknown_session`, and the client re-sends SESSION_START with
+`resume_through`. The session then continues in its old stores -- on the
+staging root if its copy is still there, else straight into raw_root -- and
+goes to the batch pipeline rather than the live lane.
+
+Paused runs: SESSION_END reason "paused" means the client gave up
+streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
+holds). The partial copy is kept on staging for the usual retention but
+never copied to raw_root, so the run's full local save can be sent there by
+Globus instead.
 """
 
 from __future__ import annotations
@@ -154,11 +172,23 @@ _RAW_ROOTS_ENV_VAR = "OPYM_STREAM_RAW_ROOTS"
 # the IP allowlist) for NULL-mechanism connections at all.
 _ZAP_DOMAIN = b"opym-direct"
 # Advertised in every ACK; clients only use a feature once they've seen it.
-SERVER_FEATURES = ["slabs", "blosc"]
+SERVER_FEATURES = ["slabs", "blosc", "links", "resume"]
+# Unknown-session replies to FRAMEs are rate-limited per session: a client
+# resending hundreds of MB of slabs would otherwise get one per slab.
+_UNKNOWN_NOTICE_EVERY_S = 2.0
 
 
 def _env_list(name: str) -> list[str]:
     return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
+
+
+def _identity_belongs(identity: bytes, session_id: str) -> bool:
+    """A link identity is the session_id (link 0) or `<session_id>#<k>`."""
+    sid = session_id.encode("utf-8")
+    if identity == sid:
+        return True
+    prefix, sep, k = identity.rpartition(b"#")
+    return bool(sep) and prefix == sid and k.isdigit()
 
 
 def _live_lane_enabled() -> bool:
@@ -280,6 +310,9 @@ class SessionState:
     other one."""
     slabs: dict[tuple[int, int], _SlabAssembly] = field(default_factory=dict)
     """Volumes still arriving slab by slab, by (t, c)."""
+    resumed: bool = False
+    """Re-opened by a SESSION_START with `resume_through` (see the module
+    docstring's "Recovery"); never live."""
     qc_seq_sent: int = -1
     qc_mtime: float = 0.0
     qc_checked_at: float = 0.0
@@ -338,6 +371,7 @@ class StreamReceiver:
         self.ack_every_sec = ack_every_sec
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
+        self._unknown_noticed: dict[str, float] = {}
         # Always constructed (cheap: idle threads blocked on a queue read)
         # so staging can be toggled per-session via the env var without
         # needing the receiver process restarted -- mirrors `_decon_enabled`
@@ -473,11 +507,11 @@ class StreamReceiver:
             logger.warning("Dropping malformed message from %r: %s", identity, exc)
             return
 
-        # The DEALER client is required to set zmq.IDENTITY == session_id
-        # (see protocol.py) -- trust the transport-level identity for
-        # routing/session lookup and treat a mismatched header session_id
-        # as a misbehaving client rather than silently using either one.
-        if identity != session_id.encode("utf-8"):
+        # The DEALER client is required to set zmq.IDENTITY == session_id,
+        # or "<session_id>#<k>" for its extra links (see protocol.py) --
+        # treat a mismatched header session_id as a misbehaving client
+        # rather than silently using either one.
+        if not _identity_belongs(identity, session_id):
             logger.warning(
                 "Dropping message: socket identity %r does not match header "
                 "session_id %r",
@@ -491,9 +525,13 @@ class StreamReceiver:
             return
         session = self.sessions.get(session_id)
         if session is not None:
-            # Follow the client if it reconnected through the other socket
-            # (direct endpoint down -> SSH tunnel, or back).
+            # Answer on the link (and socket) heard from last: it just
+            # proved it works, and a link or route that died stops being
+            # used as soon as any other one delivers something.
             session.sock, session.identity = sock, identity
+        elif msg_type == MSG_FRAME:
+            self._notice_unknown(sock, identity, session_id)
+            return
         if msg_type == MSG_FRAME:
             self._handle_frame(session_id, header, payload)
         elif msg_type == MSG_SESSION_END:
@@ -510,6 +548,16 @@ class StreamReceiver:
         session_id: str,
         header: dict[str, Any],
     ) -> None:
+        existing = self.sessions.get(session_id)
+        if existing is not None and not existing.ended:
+            # A resend (the client re-synced after a link hiccup): the
+            # session is intact here, so just re-ACK where it stands.
+            existing.sock, existing.identity = sock, identity
+            logger.info(
+                "Session %s: SESSION_START for an open session -- re-ACKing", session_id
+            )
+            self._send_ack(existing)
+            return
         # A malformed header here must not take down every other session
         # this process is holding -- log and drop rather than let a
         # KeyError/ValueError propagate out of _run_once.
@@ -557,6 +605,12 @@ class StreamReceiver:
             base_name = self._resolve_base_name(
                 session_id, base_name, channel_names, raw_root, write_root
             )
+            resume_through = header.get("resume_through")
+            if resume_through is not None:
+                resume_through = int(resume_through)
+                write_root = self._resume_write_root(
+                    session_id, base_name, channel_names, raw_root, write_root
+                )
             channel_store_paths = {
                 c: rawmirror.store_path_for_channel(write_root, base_name, name)
                 for c, name in zip(channels, channel_names)
@@ -585,13 +639,26 @@ class StreamReceiver:
                 output_format=_requested_output_format(header, session_id),
                 accepts_qc="qc" in (header.get("accepts") or ()),
                 t_interval_s=float(header.get("t_interval_s") or 0.0),
+                ack_floor=-1 if resume_through is None else resume_through,
+                resumed=resume_through is not None,
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
             return
 
         self.sessions[session_id] = session
-        self._maybe_start_live(session)
+        self._unknown_noticed.pop(session_id, None)
+        if session.resumed:
+            logger.warning(
+                "Session %s resumed after frame %d (this receiver restarted or "
+                "idle-timed it out): continuing in %s; the batch pipeline, not "
+                "the live lane, processes it",
+                session_id,
+                session.ack_floor,
+                session.leaf_dir,
+            )
+        else:
+            self._maybe_start_live(session)
         logger.info(
             "Session %s started: base_name=%s grid=%dT x %dC -> %s "
             "(decon_enabled=%s, staging=%s)",
@@ -631,8 +698,9 @@ class StreamReceiver:
         drained sessions are released first (`DrainPool.release`), since the
         staging root is flat across every `raw_root` and a retained copy from
         another experiment folder would otherwise force a needless rename.
-        Stores tagged with this `session_id` are this session's own -- a
-        SESSION_START resent after a receiver restart -- and keep their name.
+        Stores tagged with this `session_id` -- staged or already drained --
+        are this session's own (a SESSION_START resent after a receiver
+        restart or idle timeout), and keep their name.
         """
         existing = self.sessions.get(session_id)
         if existing is not None:
@@ -644,12 +712,15 @@ class StreamReceiver:
                 rawmirror.store_path_for_channel(write_root, name, ch)
                 for ch in channel_names
             ]
-            if any(rawmirror.read_session_id(p) == session_id for p in stage_stores):
-                return name
             dest_stores = [
                 rawmirror.store_path_for_channel(raw_root, name, ch)
                 for ch in channel_names
             ]
+            if any(
+                rawmirror.read_session_id(p) == session_id
+                for p in (*stage_stores, *dest_stores)
+            ):
+                return name
             taken = any(p.exists() for p in dest_stores) or (raw_root / name).exists()
             if staging and not taken:
                 stage_leaf = write_root / name
@@ -672,6 +743,64 @@ class StreamReceiver:
             f"base_name {requested!r} and all of its _001.._{_MAX_NAME_SUFFIX:03d} "
             f"variants are already used under {raw_root}"
         )
+
+    def _resume_write_root(
+        self,
+        session_id: str,
+        base_name: str,
+        channel_names: list[str],
+        raw_root: Path,
+        write_root: Path,
+    ) -> Path:
+        """Where a resumed session keeps writing: into its staging copy if
+        that still exists (taking it back out of drain retention so it
+        isn't evicted mid-write; its own drain later replaces the GPFS copy
+        with it, a superset), else straight into its drained GPFS stores. A
+        fresh staging copy would hold only the frames after the resume, and
+        draining it would replace the complete GPFS copy with it."""
+        if write_root == raw_root:
+            return write_root
+        stage_stores = [
+            rawmirror.store_path_for_channel(write_root, base_name, ch)
+            for ch in channel_names
+        ]
+        self._drain_pool.reclaim(
+            [*stage_stores, write_root / base_name / "decon_stage"]
+        )
+        if any(rawmirror.read_session_id(p) == session_id for p in stage_stores):
+            return write_root
+        dest_stores = [
+            rawmirror.store_path_for_channel(raw_root, base_name, ch)
+            for ch in channel_names
+        ]
+        if any(rawmirror.read_session_id(p) == session_id for p in dest_stores):
+            return raw_root
+        return write_root
+
+    def _notice_unknown(
+        self, sock: zmq.Socket, identity: bytes, session_id: str
+    ) -> None:
+        """Tell a client its session is unknown here (at most every
+        `_UNKNOWN_NOTICE_EVERY_S`), so it can resume it."""
+        now = time.monotonic()
+        if now - self._unknown_noticed.get(session_id, -1e9) < _UNKNOWN_NOTICE_EVERY_S:
+            return
+        self._unknown_noticed[session_id] = now
+        logger.warning(
+            "FRAME for unknown session %s -- asking the client to resume it",
+            session_id,
+        )
+        self._send_unknown(sock, identity, session_id)
+
+    @staticmethod
+    def _send_unknown(sock: zmq.Socket, identity: bytes, session_id: str) -> None:
+        header = {
+            "through_frame_index": -1,
+            "unknown_session": True,
+            "server_time_s": time.time(),
+            "features": SERVER_FEATURES,
+        }
+        sock.send_multipart([identity, *pack_message(MSG_ACK, session_id, header)])
 
     def _maybe_start_live(self, session: SessionState) -> None:
         """Hand a session to the live lane when it's enabled (OPYM_LIVE_LANE=1)
@@ -1063,7 +1192,9 @@ class StreamReceiver:
         # reach the client) is gone.
         self._send_ack(session)
 
-        if session.write_root != session.raw_root:
+        if reason == "paused":
+            self._retain_paused(session)
+        elif session.write_root != session.raw_root:
             # Staging was active for this session -- hand its completed
             # artifacts to the background drain pool. A session is NOT one
             # contiguous directory: each channel's store is a top-level
@@ -1131,30 +1262,42 @@ class StreamReceiver:
         # either way nothing else needs triggering here.
         del self.sessions[session.session_id]
 
+    def _retain_paused(self, session: SessionState) -> None:
+        """The client gave up streaming this run mid-way (SESSION_END reason
+        "paused"): its full local save goes to Argus by Globus, into the
+        same raw_root, so the partial streamed copy must not land there."""
+        if session.write_root == session.raw_root:
+            logger.error(
+                "Session %s was PAUSED by the client after %d (t,c) pair(s); "
+                "staging is off, so its partial raw copy is already in %s -- "
+                "remove it before sending the run by Globus",
+                session.session_id,
+                len(session.received_pairs),
+                session.dest_leaf_dir,
+            )
+            return
+        stage_paths = [*session.channel_store_paths.values(), session.decon_stage_dir]
+        self._drain_pool.retain(session.session_id, stage_paths)
+        logger.error(
+            "Session %s was PAUSED by the client (link down longer than its "
+            "buffer) after %d of %d (t,c) pair(s): the partial copy stays on "
+            "staging and is NOT copied to %s -- send this run by Globus",
+            session.session_id,
+            len(session.received_pairs),
+            session.num_timepoints * len(session.channels),
+            session.raw_root,
+        )
+
     def _handle_resume(
         self, sock: zmq.Socket, identity: bytes, session_id: str
     ) -> None:
         session = self.sessions.get(session_id)
         if session is None:
-            # Receiver process restarted, or this session never actually
-            # reached SESSION_START here -- reply -1 so the client resends
-            # everything still in its local buffer. Acceptable v1
-            # degradation: session state isn't persisted to disk, only kept
-            # in-process (see docs/STREAMING_PROTOCOL.md).
-            sock.send_multipart(
-                [
-                    identity,
-                    *pack_message(
-                        MSG_ACK,
-                        session_id,
-                        {
-                            "through_frame_index": -1,
-                            "server_time_s": time.time(),
-                            "features": SERVER_FEATURES,
-                        },
-                    ),
-                ]
-            )
+            # Receiver process restarted, or idle-timed this session out, or
+            # it never reached SESSION_START here: flag it, so the client
+            # re-sends SESSION_START with resume_through and then everything
+            # still in its buffer (see the module docstring's "Recovery").
+            self._send_unknown(sock, identity, session_id)
             return
         session.identity = (
             identity  # reconnect: new TCP connection, same identity value
