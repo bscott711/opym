@@ -57,7 +57,25 @@ LIVE_LATEST_NAME = "live_latest.json"
 QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
 # omero hex colour -> napari colormap name (see ome_zarr_writer.CHANNEL_COLORS).
-_COLORMAPS = {"00FF00": "green", "FF3D3D": "red", "00B3FF": "cyan", "FFC400": "yellow"}
+# The red channel is shown in magenta.
+_COLORMAPS = {
+    "00FF00": "green",
+    "FF3D3D": "magenta",
+    "00B3FF": "cyan",
+    "FFC400": "yellow",
+}
+# Display settings each rebuilt layer takes over from the one it replaces, so
+# a new timepoint never resets what the user dialed in.
+_CARRIED = (
+    "contrast_limits",
+    "colormap",
+    "gamma",
+    "opacity",
+    "blending",
+    "rendering",
+    "interpolation3d",
+)
+_READ_POOL = None
 
 
 def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
@@ -104,6 +122,103 @@ def status_text(
         )
         text += f" · newest t={done[-1]}, updated {age:.0f}s ago"
     return text
+
+
+def read_volume(arr, t: int, c: int):
+    """`arr[t, c]` of a (t, c, z, y, x) zarr array, one z-slab of chunks per
+    thread (blosc releases the GIL): two to three times faster than zarr's
+    own chunk-by-chunk read of a 1 GB volume."""
+    import numpy as np
+
+    global _READ_POOL
+    if _READ_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _READ_POOL = ThreadPoolExecutor(16, thread_name_prefix="naparym-read")
+    out = np.empty(arr.shape[2:], arr.dtype)
+    cz = arr.chunks[2]
+
+    def read(z0: int) -> None:
+        out[z0 : z0 + cz] = arr[t, c, z0 : z0 + cz]
+
+    list(_READ_POOL.map(read, range(0, out.shape[0], cz)))
+    return out
+
+
+def map_buffer(path: Path):
+    """A view buffer (.npy) mapped read-only with every page faulted in up
+    front (MAP_POPULATE: 0.03 s for 1 GB), rather than one fault per 4 KB
+    page as napari's texture upload touches it."""
+    import math
+    import mmap
+
+    import numpy as np
+    from numpy.lib import format as npf
+
+    with open(path, "rb") as f:
+        version = npf.read_magic(f)
+        if version == (1, 0):
+            shape, fortran, dtype = npf.read_array_header_1_0(f)
+        else:
+            shape, fortran, dtype = npf.read_array_header_2_0(f)
+        if fortran:
+            raise ValueError(f"{path}: Fortran-order view buffer")
+        offset = f.tell()
+        m = mmap.mmap(
+            f.fileno(),
+            0,
+            flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
+            prot=mmap.PROT_READ,
+        )
+    return np.frombuffer(m, dtype, count=math.prod(shape), offset=offset).reshape(shape)
+
+
+class BufferedSeries:
+    """One channel of a live session as a (t, z, y, x) array for napari,
+    read a whole timepoint at a time: its RAM-disk view buffer, mapped, while
+    that exists, else level 0 of the store (`read_volume`) once the store's
+    progress file lists it, else zeros (nothing to decode yet).
+
+    Not dask: dask copies every result it computes, a fresh 1 GB allocation
+    per channel per timepoint shown, 0.3-2.7 s each on Argus with its free
+    memory low. napari takes this mapping as is.
+    """
+
+    def __init__(self, store: Path, level0, c: int, buffers_dir: Path) -> None:
+        self._store = store
+        self._level0 = level0
+        self._c = c
+        self._dir = Path(buffers_dir)
+        self.shape = (level0.shape[0], *level0.shape[2:])
+        self.dtype = level0.dtype
+        self.ndim = len(self.shape)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def volume(self, t: int):
+        import numpy as np
+
+        try:
+            return map_buffer(self._dir / buffer_name(t, self._c))
+        except (OSError, ValueError):
+            pass
+        if [t, self._c] in (read_progress(self._store) or {}).get("done", []):
+            return read_volume(self._level0, t, self._c)
+        return np.zeros(self.shape[1:], self.dtype)  # the kernel's zero page
+
+    def __getitem__(self, key):
+        import numpy as np
+
+        key = key if isinstance(key, tuple) else (key,)
+        t, rest = key[0], key[1:]
+        if isinstance(t, slice):
+            ts = range(*t.indices(self.shape[0]))
+            if len(ts) == 1:  # napari slices t:t+1, even in 3D: no copy
+                return self.volume(ts[0])[rest][np.newaxis]
+            return np.stack([self.volume(i)[rest] for i in ts])
+        t = int(t)
+        return self.volume(t + self.shape[0] if t < 0 else t)[rest]
 
 
 def qc_dir_for(store: Path) -> Path:
@@ -227,6 +342,8 @@ class LiveFollower:
     read from its uncompressed view buffer (`buffers_dir`, the one-format
     live lane's RAM-disk copy, memory-mapped: no decode) while that exists,
     else from level 0 of the store.
+
+    `replaces`: a previous feed's layers, taken down once this one's are up.
     """
 
     def __init__(
@@ -239,6 +356,7 @@ class LiveFollower:
         jobs: Path | None = None,
         buffers_dir: Path | None = None,
         qc_dir: Path | None = None,
+        replaces: list | None = None,
     ) -> None:
         self.viewer = viewer
         self.store = Path(store)
@@ -249,13 +367,14 @@ class LiveFollower:
         self.name = self.store.name.removesuffix("_dsr.ome.zarr").removesuffix(
             ".ome.zarr"
         )
-        group, ms, full = self._open()
+        group, ms, series = self._open()
         self._channels = group.attrs.get("omero", {}).get("channels", [])
         scale = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
         self._scale = [scale[0]] + scale[2:]
-        self._n_c = full.shape[1]
-        self._full = full
-        self.layers = self._add_layers(full, contrast=[[0, 300]] * self._n_c)
+        self._n_c = len(series)
+        self._series = series
+        self.layers: list = []
+        self._replaces = list(replaces or [])
         self._shown: list[int] = []
         self._contrast_set = False
         self._status = ""
@@ -263,48 +382,33 @@ class LiveFollower:
             viewer,
             Path(qc_dir) if qc_dir else qc_dir_for(self.store),
             self._scale,
-            full.shape[2],
+            series[0].shape[1],
         )
         viewer.text_overlay.visible = True
         viewer.dims.events.current_step.connect(lambda _e: self._show_text())
         self.poll()
 
     def _open(self):
-        """The DSR image group, its multiscales and a fresh full-resolution
-        (t, c, z, y, x) dask array over the store's current metadata."""
-        import dask
+        """The DSR image group, its multiscales and, per channel, a fresh
+        full-resolution (t, z, y, x) array over the store's current
+        metadata: a `BufferedSeries` for a live session, else dask."""
         import dask.array as da
-        import numpy as np
 
         group = image_group(self.store)
         ms = group.attrs["multiscales"][0]
         level0 = group[ms["datasets"][0]["path"]]
+        n_c = level0.shape[1]
         if self.buffers_dir is None:
-            return group, ms, da.from_zarr(level0)
-        n_t, n_c, *zyx = level0.shape
-
-        def load(t: int, c: int):
-            try:
-                return np.load(self.buffers_dir / buffer_name(t, c), mmap_mode="r")
-            except (OSError, ValueError):
-                return level0[t, c]
-
-        full = da.stack(
+            full = da.from_zarr(level0)
+            return group, ms, [full[:, c] for c in range(n_c)]
+        return (
+            group,
+            ms,
             [
-                da.stack(
-                    [
-                        da.from_delayed(
-                            dask.delayed(load)(t, c),
-                            shape=tuple(zyx),
-                            dtype=level0.dtype,
-                        )
-                        for c in range(n_c)
-                    ]
-                )
-                for t in range(n_t)
-            ]
+                BufferedSeries(self.store, level0, c, self.buffers_dir)
+                for c in range(n_c)
+            ],
         )
-        return group, ms, full
 
     def _done(self, progress: dict | None) -> list[int]:
         """Timepoints with every channel viewable: in the store, or with
@@ -323,26 +427,70 @@ class LiveFollower:
             done |= {t for t, cs in have.items() if len(cs) >= self._n_c}
         return sorted(done)
 
-    def _add_layers(self, full, contrast):
-        layers = self.viewer.add_image(
-            full,
-            channel_axis=1,
+    def _add_layer(self, c: int, data, before, visible: bool, contrast):
+        """Channel `c`, with `before`'s display settings if it replaces one,
+        read once: at the viewer's timepoint.
+
+        A layer reads its data as it's constructed, at t=0 wherever the
+        slider is -- during a live session, T0's buffer is long gone, so a
+        1 GB decode from the store per channel per timepoint. Built hidden
+        it reads nothing; `_slice_dims` (napari 0.7's own per-layer slicing
+        hook, private) points it at the viewer's timepoint before it's
+        shown. It must be shown before it's added: napari's 3D renderer
+        rejects a layer that has never been read.
+        """
+        from napari.layers import Image
+
+        meta = self._channels
+        if before is not None:
+            settings = {attr: getattr(before, attr) for attr in _CARRIED}
+        else:
+            color = meta[c].get("color", "") if c < len(meta) else ""
+            settings = {
+                "colormap": _COLORMAPS.get(color, "gray"),
+                "blending": "additive",
+                "contrast_limits": [0, 300],
+            }
+        if contrast:  # the first real timepoint's, over the empty store's
+            settings["contrast_limits"] = contrast[c]
+        layer = Image(
+            data,
             multiscale=False,
-            name=[
-                self._channels[c]["label"] if c < len(self._channels) else f"C{c}"
-                for c in range(self._n_c)
-            ],
-            colormap=[
-                _COLORMAPS.get(self._channels[c].get("color", ""), "gray")
-                if c < len(self._channels)
-                else "gray"
-                for c in range(self._n_c)
-            ],
-            blending="additive",
+            rgb=False,
+            name=meta[c]["label"] if c < len(meta) else f"C{c}",
             scale=self._scale,
-            contrast_limits=contrast,
+            visible=False,
+            **settings,
         )
-        return layers if isinstance(layers, list) else [layers]
+        layer._slice_dims(self.viewer.dims)
+        layer.visible = True
+        self.viewer.layers.append(layer)
+        if not visible:  # setting it True again would read it again
+            layer.visible = False
+        return layer
+
+    def _remove(self, layers: list) -> None:
+        """In one batch: napari runs a full `gc.collect()` and a GPU sync
+        after each layer removed outside one."""
+        with self.viewer.layers.batched_update():
+            for layer in layers:
+                if layer is not None:
+                    self.viewer.layers.remove(layer)
+
+    def _time_axis_stub(self):
+        """A one-voxel stand-in layer spanning this session's timepoints, so
+        the slider can be moved before a session's first real layer is in
+        (with no time axis yet, napari reads that layer at t=0, then again
+        wherever it centres the new slider)."""
+        import numpy as np
+        from napari.layers import Image
+
+        n_t = self._series[0].shape[0]
+        stub = Image(
+            np.zeros((n_t, 1, 1, 1), np.uint8), scale=self._scale, name="time axis"
+        )
+        self.viewer.layers.append(stub)
+        return stub
 
     def _show_text(self) -> None:
         qc = self.qc.summary(int(self.viewer.dims.current_step[0]))
@@ -371,7 +519,10 @@ class LiveFollower:
         now gets that same fresh construction, just without restarting the
         process: remove the old layers only after the new ones are built and
         added successfully (so a construction failure never leaves the
-        viewer blank), carrying over whatever contrast_limits was showing.
+        viewer blank), carrying over the display settings (`_CARRIED`).
+
+        The first call builds the layers even with nothing done yet, so a
+        session's channels show up as soon as it's found.
         """
         seen_s = time.time()
         progress = read_progress(self.store)
@@ -379,33 +530,13 @@ class LiveFollower:
         self._status = status_text(self.name, progress, done=done)
         self.qc.poll()
         self._show_text()
-        if done == self._shown:
+        if self.layers and done == self._shown:
             return
         new = [t for t in done if t not in self._shown]
+        self._rebuild(done, new)
         self._shown = done
-        old_layers = self.layers
-        limits = [layer.contrast_limits for layer in old_layers]
-        _group, _ms, self._full = self._open()
-        self.layers = self._add_layers(self._full, contrast=limits)
-        for layer in old_layers:
-            self.viewer.layers.remove(layer)
-        # The new image layers land at the end of the layer list (added
-        # after the QC box, which was only ever added once, in __init__) --
-        # move the box back on top so it isn't hidden under them.
-        if self.qc.layer is not None and self.qc.layer in self.viewer.layers:
-            self.viewer.layers.move(
-                self.viewer.layers.index(self.qc.layer), len(self.viewer.layers)
-            )
-        # The new layers were added while the old ones (often the same
-        # channel names) were still present, so napari auto-suffixed any
-        # collision ("GFP 488 [1]") to keep names unique at that instant.
-        # Now that the old ones are gone, restore the clean name.
-        for layer in self.layers:
-            layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
-        if not self._contrast_set and done:
-            self._set_contrast(done[0])
-        if self.follow and new:
-            self.viewer.dims.set_current_step(0, max(new))
+        if not new:
+            return
         # Layers are built and the step set; Qt paints once this returns.
         trace.record(
             "shown",
@@ -418,16 +549,81 @@ class LiveFollower:
             build_s=time.time() - seen_s,
         )
 
-    def _set_contrast(self, t: int) -> None:
-        """From every 4th voxel of the first real timepoint (the empty store
-        has no range to go on)."""
+    def _rebuild(self, done: list[int], new: list[int]) -> None:
+        """Swap in fresh layers, reading each channel once.
+
+        napari reads (slices) a visible layer on every change that touches
+        it, a whole 1 GB volume per channel in 3D. Adding the new layers
+        read the timepoint already on screen, then moving the time slider
+        read the new one, for the old layers as well; opening a session
+        read its first timepoint seven times over, three of them from the
+        compressed store, 25 s before the window could first paint (Argus,
+        2026-09-25). So the old layers are hidden and the slider moved
+        first, and each new layer is read once, at the timepoint shown
+        (`_add_layer`; `_time_axis_stub` for a session's first layers).
+        """
+        prev = self.layers
+        old = prev + self._replaces
+        target = max(new) if self.follow and new else None
+        _group, _ms, self._series = self._open()
+        contrast = None
+        if not self._contrast_set and done:
+            contrast = self._contrast(done, target)
+        visible = [layer.visible for layer in prev]
+        hidden = [layer for layer in old if layer.visible]
+        fresh = not self.viewer.layers
+        layers: list = []
+        stub = None
+        try:
+            for layer in hidden:
+                layer.visible = False
+            if target is not None:
+                if not prev:
+                    stub = self._time_axis_stub()
+                self.viewer.dims.set_current_step(0, target)
+            for c, data in enumerate(self._series):
+                before = prev[c] if c < len(prev) else None
+                shown = visible[c] if c < len(visible) else True
+                layers.append(self._add_layer(c, data, before, shown, contrast))
+        except Exception:
+            self._remove([*layers, stub])
+            for layer in hidden:
+                layer.visible = True
+            raise
+        self._remove([*old, stub])
+        if fresh:
+            self.viewer.reset_view()  # napari fit the view to the stub
+        self.layers = layers
+        self._replaces = []
+        self._contrast_set |= contrast is not None
+        # The new image layers land at the end of the layer list, after the
+        # QC box -- move the box back on top so it isn't hidden under them.
+        if self.qc.layer is not None and self.qc.layer in self.viewer.layers:
+            self.viewer.layers.move(
+                self.viewer.layers.index(self.qc.layer), len(self.viewer.layers)
+            )
+        # The new layers were added while the old ones (often the same
+        # channel names) were still present, so napari auto-suffixed any
+        # collision ("GFP 488 [1]") to keep names unique at that instant.
+        # Now that the old ones are gone, restore the clean name.
+        for layer in self.layers:
+            layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
+
+    def _contrast(self, done: list[int], target: int | None) -> list:
+        """Per channel, from every 4th voxel of the timepoint about to be
+        shown (the empty store has no range to go on): the newest one while
+        following, so it's read from its RAM-disk buffer, not decoded."""
         import numpy as np
 
-        for c, layer in enumerate(self.layers):
-            vol = np.asarray(self._full[t, c][::4, ::4, ::4])
+        t = int(self.viewer.dims.current_step[0]) if target is None else target
+        if t not in done:
+            t = done[-1]
+        limits = []
+        for series in self._series:
+            vol = np.asarray(series[t][::4, ::4, ::4])
             lo, hi = np.percentile(vol[vol > 0], [0.5, 99.9]) if vol.any() else (0, 300)
-            layer.contrast_limits = (float(lo), float(max(hi, lo + 1)))
-        self._contrast_set = True
+            limits.append((float(lo), float(max(hi, lo + 1))))
+        return limits
 
 
 class SessionWatcher:
@@ -489,9 +685,9 @@ class SessionWatcher:
         and if that fails because it isn't ready yet, leave everything
         (`self.session_id` included) exactly as it was, so the next poll
         naturally retries the same target instead of raising into napari's
-        event loop or leaving the viewer with no layers at all.
+        event loop or leaving the viewer with no layers at all. The follower
+        takes the old layers down itself (`replaces`), once its own are up.
         """
-        old_layers = list(self.viewer.layers)
         try:
             follower = LiveFollower(
                 self.viewer,
@@ -499,6 +695,7 @@ class SessionWatcher:
                 follow=self.follow,
                 session_id=session_id,
                 jobs=self.jobs,
+                replaces=list(self.viewer.layers),
                 **(extra or {}),
             )
         except (OSError, KeyError, ValueError) as exc:
@@ -508,16 +705,6 @@ class SessionWatcher:
                 f"timepoint ({store.name})..."
             )
             return
-        for layer in old_layers:
-            self.viewer.layers.remove(layer)
-        # The new follower's layers were added while the old ones (often the
-        # same channel names -- "GFP 488" showing up in nearly every
-        # acquisition) were still present, so napari auto-suffixed any
-        # collision ("GFP 488 [1]") to keep names unique at that instant.
-        # Now that the old ones are gone, that suffix no longer means
-        # anything -- restore the clean name.
-        for layer in follower.layers:
-            layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
         self.session_id = session_id
         self.follower = follower
         self.viewer.title = f"naparym-live: {store.name}"
@@ -577,9 +764,10 @@ def main(argv: list[str] | None = None) -> None:
 
     timer = QTimer()
     timer.timeout.connect(watcher.poll)
+    # The first tick picks up an already-running session. Not a poll here:
+    # before napari.run() the window can't paint, so it stays black while
+    # that session loads.
     timer.start(int(args.poll * 1000))
-    watcher.poll()  # pick up an already-running session now, not after the
-    # first --poll-second tick
     napari.run()
 
 
