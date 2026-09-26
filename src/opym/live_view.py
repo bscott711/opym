@@ -27,6 +27,9 @@ Live QC: when the dataset has `<leaf>/qc/live_qc.jsonl` (CORE's
 `celldet-live-qc`), each timepoint's cell box is drawn as a wireframe coloured
 by its verdict (green ok, orange warn, red act), and the status line adds the
 verdict, flags and first piece of advice for the timepoint on screen.
+
+The whole live path, camera to screen, with its timings and design
+choices: docs/live-view-pipeline.md.
 """
 
 from __future__ import annotations
