@@ -13,6 +13,16 @@ The DEALER socket's `zmq.IDENTITY` MUST be set to the session's `session_id`
 TCP connection) be recognized as the same logical session on the server
 side, which is the whole mechanism behind RESUME/ACK-based resumability.
 
+Links: once an ACK advertises "links", a client may send the same session
+over more connections at once, one DEALER per link, with identity
+`"<session_id>#<k>"` for link k >= 1 (link 0 keeps the bare session_id and
+is the one that sends SESSION_START). One SSH tunnel carries ~33 MB/s
+however fast the network is (sshd's 2 MB window per round trip), so N
+tunnels carry about N times that. Any message may arrive on any link, in
+any order across links; the server keys everything by the header's
+session_id, dedupes by frame_index / (t, c) / z0, and sends ACKs and QC
+back on whichever link it heard from last.
+
 Every message is a ZMQ multipart message of the form (after pyzmq's ROUTER
 auto-prepended identity frame, which callers don't construct by hand):
 
@@ -91,6 +101,18 @@ _VALID_TYPES = frozenset(
 #                               client understands beyond ACK. Only "qc" is
 #                               defined (MSG_QC below). A client that omits
 #                               it is never sent anything but ACKs.
+#   resume_through   int    -- OPTIONAL, only once an ACK advertised
+#                               "resume": this SESSION_START re-opens a
+#                               session the server no longer knows (it was
+#                               restarted, or idle-timed the session out),
+#                               and every frame_index <= resume_through was
+#                               already ACKed. The server reopens the
+#                               session's stores (tagged with its
+#                               session_id), starts its ACK floor there, and
+#                               leaves the rest of the session to the batch
+#                               pipeline (no live lane: its state is gone).
+#                               A SESSION_START for a session still open is
+#                               just re-ACKed.
 #
 # Decon parameters (PSF, wiener_alpha, edge_erosion, rl_method) are NOT
 # part of this handshake -- they're resolved server-side by the batch
@@ -159,6 +181,12 @@ _VALID_TYPES = frozenset(
 # --- SESSION_END header fields -------------------------------------------
 #
 #   reason           str    -- "complete" | "idle_timeout" | "client_abort"
+#                               | "paused": the client stopped streaming
+#                               mid-run (it could not reach the server for
+#                               longer than its RAM buffer holds). The run's
+#                               partial copy is NOT copied to raw_root, so
+#                               the full local save can be sent by Globus
+#                               into the same place.
 #
 # --- ACK header fields (server -> client, unsolicited or RESUME reply) ---
 #
@@ -170,7 +198,21 @@ _VALID_TYPES = frozenset(
 #                               retry buffer only needs to keep frames with
 #                               frame_index > through_frame_index.
 #   features         [str]  -- OPTIONAL, what this receiver supports beyond
-#                               the base protocol: "slabs", "blosc".
+#                               the base protocol: "slabs", "blosc",
+#                               "links", "resume".
+#   unknown_session  bool   -- OPTIONAL, true when the server has no open
+#                               session with this session_id (it answers a
+#                               RESUME, or a FRAME at most every 2 s, this
+#                               way). A client that saw "resume" re-sends
+#                               SESSION_START with resume_through, then
+#                               everything unACKed. through_frame_index is
+#                               -1 and means nothing here. A SESSION_END for
+#                               a session already closed is answered this
+#                               way too (it confirms the SESSION_END).
+#   ended            bool   -- OPTIONAL, true on the final ACK, sent once
+#                               the server has closed the session: it
+#                               confirms SESSION_END. A client that got no
+#                               confirmation may resend SESSION_END.
 #   server_time_s        float -- OPTIONAL, the server's epoch seconds when
 #                               it sent this ACK; lets a client estimate the
 #                               clock offset for the trace fields above.

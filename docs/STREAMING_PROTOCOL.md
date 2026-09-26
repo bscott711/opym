@@ -217,8 +217,13 @@ About 16 MB per slab keeps the per-message overhead negligible.
 ### 3. `SESSION_END`
 
 ```python
-header = {"reason": "complete"}  # or "client_abort"
+header = {"reason": "complete"}  # or "client_abort", or "paused"
 ```
+
+`"paused"` means the client stopped streaming mid-run because it couldn't
+reach Argus for longer than its RAM buffer holds. The partial copy is kept on
+the staging root for the usual retention but **not** copied to `raw_root`, so
+the run's full local save can be sent there by Globus instead.
 
 Just marks the session finished on the receiver and logs how many `(t, c)`
 pairs arrived — there is nothing to stitch or consolidate (see "Why this
@@ -237,9 +242,18 @@ Globus-landed acquisition already is (`channel_store_timepoints` in
 header = {"through_frame_index": 33, "server_time_s": 1755000000.456}
 ```
 
-`features` lists what this receiver supports beyond the base protocol;
-only `"slabs"` is defined so far. A client must not send slabs to a
-receiver that hasn't advertised them.
+`features` lists what this receiver supports beyond the base protocol:
+`"slabs"`, `"blosc"`, `"links"` and `"resume"`. A client uses a feature only
+after an ACK has advertised it.
+
+`unknown_session: true` means the receiver has no open session with this
+`session_id` (it restarted, or idle-timed the session out). It answers a
+`RESUME` this way, and a `FRAME` at most every 2 s. A client that saw
+`"resume"` then re-sends `SESSION_START` with `resume_through` (its highest
+ACKed `frame_index`), and then everything still unACKed. The session
+continues in its old stores, and the batch pipeline (not the live lane)
+processes it. A `SESSION_START` for a session that is still open is just
+re-ACKed.
 
 `server_time_s` (the server's clock when it sent the ACK) is informational:
 clients use it only to estimate their clock offset for the trace fields.
@@ -345,6 +359,26 @@ send `RESUME`, wait for the `ACK`, then resend everything left in
    --watch` finds the dataset through its normal GPFS walk once
    `SESSION_END` (or the idle timeout) finalizes it, and submits the one
    deskew/decon ticket for the whole thing, unmodified.
+
+## Links (several connections per session)
+
+One SSH connection carries ~33 MB/s to Argus however fast the network is:
+sshd's fixed 2 MB channel window allows 2 MB per round trip, and the round
+trip is ~60 ms. On Argus, a private sshd behind a 60 ms delay reproduced it
+exactly (32.7 MB/s), and 4 tunnels carried 129 MB/s.
+
+Once an ACK advertises `"links"`, a client may send one session over several
+connections at once. Link 0 keeps `IDENTITY = session_id` and sends
+`SESSION_START`; link k >= 1 uses `IDENTITY = "<session_id>#<k>"`. Through
+the tunnel, each link is its own SSH forward (`local_port + k`), all to the
+same receiver port. Any message may go on any link, and messages on
+different links arrive in any order: the receiver keys everything by the
+header's `session_id`, dedupes resends by `frame_index` / `(t, c)` / `z0`,
+and sends ACKs and QC back on the link it heard from last.
+
+Measure what the links carry from the acquisition PC with
+`python -m pymmcore_gui._argus_stream.linkbench`, against
+`python -m opym.stream.linkbench` running on Argus.
 
 ## Direct endpoint (10 GbE, no SSH tunnel)
 
