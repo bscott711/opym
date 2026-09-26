@@ -191,6 +191,12 @@ def _identity_belongs(identity: bytes, session_id: str) -> bool:
     return bool(sep) and prefix == sid and k.isdigit()
 
 
+def _link_number(identity: bytes) -> int:
+    """0 for the session_id identity, k for `<session_id>#<k>`."""
+    _prefix, sep, k = identity.rpartition(b"#")
+    return int(k) if sep and k.isdigit() else 0
+
+
 def _live_lane_enabled() -> bool:
     return os.environ.get(_LIVE_LANE_ENV_VAR, "").strip() in ("1", "true", "yes")
 
@@ -249,6 +255,10 @@ class _SlabAssembly:
     first_recv_s: float = 0.0
     raw_write_s: float = 0.0
     wire_bytes: int = 0
+    links: set[int] = field(default_factory=set)
+    """Which links (0 = the session_id identity) delivered its slabs."""
+    dups: int = 0
+    """Slabs that arrived again (resent) before the volume completed."""
 
 
 @dataclass
@@ -316,6 +326,8 @@ class SessionState:
     qc_seq_sent: int = -1
     qc_mtime: float = 0.0
     qc_checked_at: float = 0.0
+    dup_slabs: int = 0
+    """Slabs resent after their volume was already complete."""
     stage_raw_s: list[float] = field(default_factory=list)
     stage_tiff_s: list[float] = field(default_factory=list)
     staged_bytes: int = 0
@@ -964,6 +976,7 @@ class StreamReceiver:
             return
         if (t, c) in session.received_pairs:
             # The whole volume is already staged (a resend after a reconnect).
+            session.dup_slabs += 1
             session.processed_frame_indices.add(frame_index)
             self._advance_ack_floor(session)
             return
@@ -978,7 +991,9 @@ class StreamReceiver:
             )
             session.slabs[(t, c)] = asm
         asm.frame_indices.append(frame_index)
+        asm.links.add(_link_number(session.identity))
         if z0 in asm.z0s:
+            asm.dups += 1
             return  # a resend of a slab already written
         asm.wire_bytes += len(payload) if wire_bytes is None else wire_bytes
         try:
@@ -1026,6 +1041,8 @@ class StreamReceiver:
             first_recv_s=asm.first_recv_s,
             slabs=len(asm.z0s),
             wire_bytes=asm.wire_bytes,
+            links=sorted(asm.links),
+            dup_slabs=asm.dups,
         )
 
     def _raw_array(
@@ -1392,6 +1409,7 @@ def _write_stage_profile(session: SessionState, reason: str) -> None:
             "ended_at": time.time(),
             "frames": len(session.stage_raw_s),
             "staged_gb": round(session.staged_bytes / 1e9, 3),
+            "dup_slabs_after_complete": session.dup_slabs,
             "decon_staging": session.decon_enabled,
             "raw_write_s": _stage_stats(session.stage_raw_s),
             "tiff_write_s": _stage_stats(session.stage_tiff_s),

@@ -10,6 +10,7 @@ import pytest
 import zarr
 import zmq
 
+from opym.stream import trace
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -159,6 +160,8 @@ def test_slabs_spread_over_links_in_any_order_complete_the_volume(tmp_path, recv
         assert ack is not None
     assert ack["through_frame_index"] == 2
     np.testing.assert_array_equal(_read(tmp_path / "raw", 0), _volume(0))
+    [ev] = [e for e in trace.read() if e["ev"] == "frame"]
+    assert ev["links"] == [0, 1, 2] and ev["dup_slabs"] == 0
 
     # A duplicate resent on another link after completion changes nothing.
     header, payload = _slab(0, 2, 2, 1)
