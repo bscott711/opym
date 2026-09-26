@@ -209,6 +209,48 @@ def orient_zyx_for_decon_tiff(volume: np.ndarray) -> np.ndarray:
     return np.rot90(volume, k=1, axes=(-2, -1))
 
 
+def _matlab_round(x: float) -> int:
+    """MATLAB's round: halves away from zero (Python's rounds to even)."""
+    import math
+
+    return int(math.floor(abs(x) + 0.5)) * (1 if x >= 0 else -1)
+
+
+def dsr_shape_zyx(
+    raw_shape_zyx: tuple[int, int, int],
+    z_step_um: float,
+    xy_pixel_size_um: float = 0.136,
+    sheet_angle_deg: float = 60.0,
+) -> tuple[int, int, int]:
+    """The (Z, Y, X) shape of the deskewed/rotated volume PetaKit5D makes
+    from a raw (Z, Y, X) volume -- so the processed OME-Zarr can be created
+    before the first timepoint is processed.
+
+    deskewRotateFrame3D (Crop on, no resampling, not objective scan) returns
+    `round([ny, (nx-1)cos(t) + (nz-1)zAniso/sin(t), (nx-1)sin(t) - 4])` in
+    its (y, x, z) order, where zAniso = sin(t) dz / xy and (ny, nx, nz) is
+    the decon input: raw (X, Y, Z) after `orient_zyx_for_decon_tiff`. The
+    TIFF pages (and the store) are that result's (z, y, x). The live zarr
+    job fails loudly if a real result ever differs.
+    """
+    import math
+
+    nz_raw, ny_raw, nx_raw = raw_shape_zyx
+    ny, nx, nz = nx_raw, ny_raw, nz_raw
+    theta = math.radians(sheet_angle_deg)
+    z_aniso = math.sin(abs(theta)) * z_step_um / xy_pixel_size_um
+    out_y = ny
+    out_x = (nx - 1) * math.cos(theta) + (nz - 1) * z_aniso / math.sin(abs(theta))
+    out_z = (nx - 1) * math.sin(abs(theta)) - 4
+    shape = (_matlab_round(out_z), _matlab_round(out_y), _matlab_round(out_x))
+    if min(shape) < 1:
+        raise ValueError(
+            f"A raw {tuple(raw_shape_zyx)} volume deskews to {shape}: too few "
+            "rows along the tilted axis for PetaKit5D's crop"
+        )
+    return shape
+
+
 def write_decon_staged_tiff(volume_zyx: np.ndarray, dst: Path) -> None:
     """Writes one raw (Z, Y, X) volume as a decon-ready staged TIFF at `dst`,
     in the `orient_zyx_for_decon_tiff` orientation PetaKit5D's decon path

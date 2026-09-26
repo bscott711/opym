@@ -25,6 +25,29 @@ unconditionally. Patched both:
 needed only because `zarr.cpp`/`parallelreadzarr.cpp` are compiled as their
 own translation units, not linked against the shared install's object files.
 
+## N-D arrays (leading index) and opymWriteZarrBlock
+
+PetaKit5D's zarr code is 3-D throughout. The live pipeline's stores are not:
+a raw channel store is `(T, Z, Y, X)` and the processed OME-Zarr is
+`(T, C, Z, Y, X)`. Both are C order, with chunk size 1 on every leading axis
+and `/` as the dimension separator. For such an array, the block at fixed
+leading indices is exactly a 3-D array rooted at `<store>/<t>/<c>/`.
+`zarr::set_leadingIndex` (in `src/zarr.cpp`) re-roots the zarr object there
+and keeps the trailing three axes, so all the 3-D code runs unchanged. It
+never rewrites the `.zarray`.
+
+- `parallelReadZarr(store, 'leadingIndex', [t+1])` returns one raw
+  timepoint `(Z, Y, X)`. It takes 1-based indices, like `bbox`.
+- `opymWriteZarrBlock(store, data, [t+1 c+1])` (`mexSrc/opymwritezarrblockmex.cpp`)
+  writes `data` (size = the trailing shape, class = the dtype) through
+  upstream's unmodified `parallelWriteZarr` (`src/parallelwritezarr.*`, copied
+  from the shared install). It uses the array's own compressor, writes each
+  chunk to a temp name then renames it, and skips all-zero chunks.
+
+Both are checked against zarr-python in `tests/test_cpp_zarr_nd.py`
+(`-m gpu`). A 1 GB DSR block takes ~0.7 s to write to /dev/shm. A 161-plane
+raw volume takes ~0.4 s to read from GPFS.
+
 ## Rebuilding
 
 ```bash
@@ -41,6 +64,25 @@ cd mexSrc
   -lblosc2 -lz -luuid \
   parallelreadzarrmex.cpp ../src/zarr.cpp ../src/helperfunctions.cpp ../src/parallelreadzarr.cpp
 ```
+
+The block writer additionally links blosc v1 (upstream's writer calls
+`blosc_compress_ctx`):
+
+```bash
+/mmfs2/cm/shared/apps_local/matlab/R2024B/bin/mex -outdir ../linux -output opymWriteZarrBlock.mexa64 \
+  CXXOPTIMFLAGS="-DNDEBUG -O2" LDOPTIMFLAGS="-O2 -DNDEBUG" \
+  CXXFLAGS='$CXXFLAGS -fopenmp -O2' \
+  LDFLAGS="\$LDFLAGS -fopenmp -O2 -Wl,-rpath,$CONDA_LIB" \
+  -I"$CONDA_INC" -I"$NJSON_INC" -L"$CONDA_LIB" \
+  -lblosc -lblosc2 -lz -luuid \
+  opymwritezarrblockmex.cpp ../src/zarr.cpp ../src/helperfunctions.cpp \
+  ../src/parallelwritezarr.cpp ../src/parallelreadzarr.cpp
+```
+
+To run the `-m gpu` tests from a shell: `module load matlab/R2024b`,
+`LM_LICENSE_FILE=27000@pioneer`, and
+`LD_PRELOAD=/cm/shared/apps_local/matlab/R2024B/sys/os/glnxa64/libstdc++.so.6`
+(the MATLAB engine needs `GLIBCXX_3.4.30`, and the system libstdc++ lacks it).
 
 No `patchelf` ABI workaround needed (unlike the vendor's own
 `compile_parallelReadZarr.m`, written for a different MATLAB/GCC pairing):

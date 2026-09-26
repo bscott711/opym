@@ -82,8 +82,9 @@ import zmq
 
 from opym import lanes
 from opym.decon_config import resolve_decon_psf
-from opym.stream import drain, live, rawmirror, trace
+from opym.stream import drain, live, live_zarr, rawmirror, trace
 from opym.stream.live import LiveLane
+from opym.stream.live_zarr import ZarrLiveLane
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -258,6 +259,10 @@ class SessionState:
     # stays under the acquisition interval.
     live: bool = False
     """Processed timepoint by timepoint by the live lane (opym.stream.live)."""
+    live_zarr: bool = False
+    """...by the one-format lane (opym.stream.live_zarr): its GPU tickets read
+    the raw store directly, so no decon TIFF is staged."""
+    t_interval_s: float = 0.0
     accepts_qc: bool = False
     """The client listed "qc" in SESSION_START's `accepts`: forward MSG_QC."""
     sock: Any = None
@@ -571,6 +576,7 @@ class StreamReceiver:
                 decon_enabled=_decon_enabled(),
                 output_format=_requested_output_format(header, session_id),
                 accepts_qc="qc" in (header.get("accepts") or ()),
+                t_interval_s=float(header.get("t_interval_s") or 0.0),
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
@@ -661,8 +667,12 @@ class StreamReceiver:
 
     def _maybe_start_live(self, session: SessionState) -> None:
         """Hand a session to the live lane when it's enabled (OPYM_LIVE_LANE=1)
-        and decon is on: its per-timepoint input is the decon_stage/ TIFFs
-        this receiver already writes.
+        and decon is on.
+
+        The lane is created on the first live session, as the one-format
+        lane (opym.stream.live_zarr) when OPYM_LIVE_FORMAT=zarr, else the
+        TIFF lane (opym.stream.live), whose per-timepoint input is the
+        decon_stage/ TIFFs this receiver writes.
 
         Single-timepoint sessions go through it too, not just time-lapses:
         a quick alignment/test snap benefits from showing up in naparym-live
@@ -676,24 +686,37 @@ class StreamReceiver:
         if psf is None:
             return
         if self._live is None:
-            self._live = LiveLane(psf)
-        self._live.start_session(
-            session.session_id,
-            base_name=session.base_name,
-            num_timepoints=session.num_timepoints,
-            n_channels=len(session.channels),
-            frames_dir=session.decon_stage_dir,
-            stage_leaf=session.leaf_dir,
-            dest_leaf=session.dest_leaf_dir,
-            z_step_um=session.z_step_um,
-            channel_labels=[
-                live.channel_label(name)
-                for _, name in sorted(
-                    zip(session.channels, session.channel_names),
-                    key=lambda cn: session.channel_cidx[cn[0]],
-                )
-            ],
-        )
+            if live_zarr.live_format() == "zarr":
+                self._live = ZarrLiveLane(psf)
+            else:
+                self._live = LiveLane(psf)
+        by_cidx = sorted(session.channels, key=lambda c: session.channel_cidx[c])
+        labels = [
+            live.channel_label(session.channel_names[session.channels.index(c)])
+            for c in by_cidx
+        ]
+        common = {
+            "base_name": session.base_name,
+            "num_timepoints": session.num_timepoints,
+            "n_channels": len(session.channels),
+            "stage_leaf": session.leaf_dir,
+            "dest_leaf": session.dest_leaf_dir,
+            "z_step_um": session.z_step_um,
+            "channel_labels": labels,
+        }
+        if isinstance(self._live, ZarrLiveLane):
+            self._live.start_session(
+                session.session_id,
+                raw_arrays=[session.channel_store_paths[c] / "p0" for c in by_cidx],
+                raw_shape_zyx=session.shape_zyx,
+                time_interval_s=session.t_interval_s,
+                **common,
+            )
+            session.live_zarr = True
+        else:
+            self._live.start_session(
+                session.session_id, frames_dir=session.decon_stage_dir, **common
+            )
         session.live = True
 
     def _handle_frame(
@@ -887,9 +910,10 @@ class StreamReceiver:
         hand it to the live lane."""
         t_start = time.perf_counter()
         if session.decon_enabled:
-            dst = self._decon_stage_path(session, c, t)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            write_decon_staged_tiff(raw, dst)
+            if not session.live_zarr:
+                dst = self._decon_stage_path(session, c, t)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                write_decon_staged_tiff(raw, dst)
             if session.live:
                 self._live.frame_staged(
                     session.session_id, t, session.channel_cidx[c], raw=raw

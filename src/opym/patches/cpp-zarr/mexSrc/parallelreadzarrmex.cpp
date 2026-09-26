@@ -15,6 +15,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
     bool bbox = false;
     bool useCtx = true;
     bool sparse = false;
+    // opym patch: 1-based indices along the leading axes of an N-D array;
+    // see zarr::set_leadingIndex.
+    std::vector<uint64_t> leadingIndex;
     std::string folderName(mxArrayToString(prhs[0]));
 
     for(int i = 1; i < nrhs; i+=2){
@@ -40,9 +43,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
         else if(currInput == "sparse"){
             sparse = (bool)*((mxGetPr(prhs[i+1])));
         }
+        else if(currInput == "leadingIndex"){
+            if(!mxIsDouble(prhs[i+1])) mexErrMsgIdAndTxt("zarr:inputError","leadingIndex must be a double vector");
+            const uint64_t n = mxGetNumberOfElements(prhs[i+1]);
+            for(uint64_t k = 0; k < n; k++){
+                const double v = *(mxGetPr(prhs[i+1])+k);
+                if(v < 1) mexErrMsgIdAndTxt("zarr:inputError","leadingIndex values are 1-based");
+                leadingIndex.push_back((uint64_t)v - 1);
+            }
+        }
         else{
             mexErrMsgIdAndTxt("zarr:inputError","The argument \"%s\" does not match the name of any supported input name.\n \
-            Currently Supported Names: bbox, sparse\n",currInput.c_str());
+            Currently Supported Names: bbox, sparse, leadingIndex\n",currInput.c_str());
         }
     }
     
@@ -62,6 +74,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("zarr:zarrayError","Metadata is incomplete. Check the .zarray file");
         }
         else mexErrMsgIdAndTxt("zarr:zarrayError","Unknown error occurred\n");
+    }
+
+    try{
+        Zarr.set_leadingIndex(leadingIndex);
+    }
+    catch(const std::string &e){
+        mexErrMsgIdAndTxt("zarr:leadingIndex","Cannot index %s that way (%s): leadingIndex needs a C-order array with '/' separators, chunk size 1 on every leading axis, and indices in range.",folderName.c_str(),e.c_str());
     }
 
     if(endCoords[0] > Zarr.get_shape(0) || 

@@ -64,6 +64,9 @@ public:
     const std::string &get_errString() const;
     void set_errString(const std::string &errString);
     const uint64_t dtypeBytes() const;
+    // opym patch: view the trailing 3-D block of an N-D array at fixed
+    // leading indices (0-based) as an ordinary 3-D array. See zarr.cpp.
+    void set_leadingIndex(const std::vector<uint64_t> &leadingIndex);
 private:
     void set_jsonValues();
     void write_jsonValues();

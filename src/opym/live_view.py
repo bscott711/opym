@@ -39,8 +39,9 @@ import time
 from pathlib import Path
 
 from opym import lanes
-from opym.ome_zarr_writer import complete_timepoints, read_progress
+from opym.ome_zarr_writer import complete_timepoints, image_group, read_progress
 from opym.stream import trace
+from opym.stream.live_zarr import buffer_name, parse_buffer_name
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ logger = logging.getLogger(__name__)
 # SessionWatcher._switch.
 _NAPARI_DEDUP_SUFFIX = re.compile(r" \[\d+\]$")
 
-POLL_S = 2.0
+# Reading a progress file and listing a RAM-disk directory is cheap; a slow
+# poll was up to 2 s of the live view's lag.
+POLL_S = 0.25
 LIVE_LATEST_NAME = "live_latest.json"
 QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
@@ -82,10 +85,16 @@ def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
         ) from exc
 
 
-def status_text(name: str, progress: dict | None, now: float | None = None) -> str:
+def status_text(
+    name: str,
+    progress: dict | None,
+    now: float | None = None,
+    done: list[int] | None = None,
+) -> str:
+    """`done` overrides the progress file's list (live buffers land first)."""
     if not progress:
         return f"{name}: waiting for the first timepoint"
-    done = complete_timepoints(progress)
+    done = complete_timepoints(progress) if done is None else done
     n_t = int(progress.get("n_t", 0))
     state = progress.get("state", "running")
     text = f"{name}: {len(done)}/{n_t} timepoints · {state}"
@@ -210,7 +219,15 @@ class QCOverlay:
 
 
 class LiveFollower:
-    """Keeps a napari viewer's layers in step with a growing store."""
+    """Keeps a napari viewer's layers in step with a growing store.
+
+    One single-resolution layer per channel, full resolution: napari's 3D
+    view only ever renders the coarsest level of a multiscale layer, which
+    for a pyramid of three is a quarter of the resolution. A timepoint is
+    read from its uncompressed view buffer (`buffers_dir`, the one-format
+    live lane's RAM-disk copy, memory-mapped: no decode) while that exists,
+    else from level 0 of the store.
+    """
 
     def __init__(
         self,
@@ -220,46 +237,97 @@ class LiveFollower:
         follow: bool = True,
         session_id: str | None = None,
         jobs: Path | None = None,
+        buffers_dir: Path | None = None,
+        qc_dir: Path | None = None,
     ) -> None:
         self.viewer = viewer
         self.store = Path(store)
         self.follow = follow
         self.session_id = session_id
         self.jobs = jobs
+        self.buffers_dir = Path(buffers_dir) if buffers_dir else None
         self.name = self.store.name.removesuffix("_dsr.ome.zarr").removesuffix(
             ".ome.zarr"
         )
-        root, ms, levels = self._open_levels()
-        self._channels = root.attrs.get("omero", {}).get("channels", [])
+        group, ms, full = self._open()
+        self._channels = group.attrs.get("omero", {}).get("channels", [])
         scale = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
         self._scale = [scale[0]] + scale[2:]
-        self._n_c = levels[0].shape[1]
-        self._levels = levels
-        self.layers = self._add_layers(levels, contrast=[[0, 300]] * self._n_c)
+        self._n_c = full.shape[1]
+        self._full = full
+        self.layers = self._add_layers(full, contrast=[[0, 300]] * self._n_c)
         self._shown: list[int] = []
         self._contrast_set = False
         self._status = ""
         self.qc = QCOverlay(
-            viewer, qc_dir_for(self.store), self._scale, levels[0].shape[2]
+            viewer,
+            Path(qc_dir) if qc_dir else qc_dir_for(self.store),
+            self._scale,
+            full.shape[2],
         )
         viewer.text_overlay.visible = True
         viewer.dims.events.current_step.connect(lambda _e: self._show_text())
         self.poll()
 
-    def _open_levels(self):
-        """Fresh dask arrays wrapping the store's current zarr metadata."""
+    def _open(self):
+        """The DSR image group, its multiscales and a fresh full-resolution
+        (t, c, z, y, x) dask array over the store's current metadata."""
+        import dask
         import dask.array as da
-        import zarr
+        import numpy as np
 
-        root = zarr.open_group(str(self.store), mode="r")
-        ms = root.attrs["multiscales"][0]
-        return root, ms, [da.from_zarr(root[d["path"]]) for d in ms["datasets"]]
+        group = image_group(self.store)
+        ms = group.attrs["multiscales"][0]
+        level0 = group[ms["datasets"][0]["path"]]
+        if self.buffers_dir is None:
+            return group, ms, da.from_zarr(level0)
+        n_t, n_c, *zyx = level0.shape
 
-    def _add_layers(self, levels, contrast):
+        def load(t: int, c: int):
+            try:
+                return np.load(self.buffers_dir / buffer_name(t, c), mmap_mode="r")
+            except (OSError, ValueError):
+                return level0[t, c]
+
+        full = da.stack(
+            [
+                da.stack(
+                    [
+                        da.from_delayed(
+                            dask.delayed(load)(t, c),
+                            shape=tuple(zyx),
+                            dtype=level0.dtype,
+                        )
+                        for c in range(n_c)
+                    ]
+                )
+                for t in range(n_t)
+            ]
+        )
+        return group, ms, full
+
+    def _done(self, progress: dict | None) -> list[int]:
+        """Timepoints with every channel viewable: in the store, or with
+        every channel's buffer on the RAM disk (those land first)."""
+        done = set(complete_timepoints(progress))
+        if self.buffers_dir is not None:
+            have: dict[int, set[int]] = {}
+            try:
+                names = [p.name for p in self.buffers_dir.iterdir()]
+            except OSError:
+                names = []
+            for name in names:
+                tc = parse_buffer_name(name)
+                if tc is not None:
+                    have.setdefault(tc[0], set()).add(tc[1])
+            done |= {t for t, cs in have.items() if len(cs) >= self._n_c}
+        return sorted(done)
+
+    def _add_layers(self, full, contrast):
         layers = self.viewer.add_image(
-            levels,
+            full,
             channel_axis=1,
-            multiscale=True,
+            multiscale=False,
             name=[
                 self._channels[c]["label"] if c < len(self._channels) else f"C{c}"
                 for c in range(self._n_c)
@@ -307,18 +375,18 @@ class LiveFollower:
         """
         seen_s = time.time()
         progress = read_progress(self.store)
-        self._status = status_text(self.name, progress)
+        done = self._done(progress)
+        self._status = status_text(self.name, progress, done=done)
         self.qc.poll()
         self._show_text()
-        done = complete_timepoints(progress)
         if done == self._shown:
             return
         new = [t for t in done if t not in self._shown]
         self._shown = done
         old_layers = self.layers
         limits = [layer.contrast_limits for layer in old_layers]
-        _root, _ms, self._levels = self._open_levels()
-        self.layers = self._add_layers(self._levels, contrast=limits)
+        _group, _ms, self._full = self._open()
+        self.layers = self._add_layers(self._full, contrast=limits)
         for layer in old_layers:
             self.viewer.layers.remove(layer)
         # The new image layers land at the end of the layer list (added
@@ -351,13 +419,12 @@ class LiveFollower:
         )
 
     def _set_contrast(self, t: int) -> None:
-        """From the coarsest level of the first real timepoint (the empty
-        store has no range to go on)."""
+        """From every 4th voxel of the first real timepoint (the empty store
+        has no range to go on)."""
         import numpy as np
 
-        coarse = self._levels[-1]
         for c, layer in enumerate(self.layers):
-            vol = np.asarray(coarse[t, c])
+            vol = np.asarray(self._full[t, c][::4, ::4, ::4])
             lo, hi = np.percentile(vol[vol > 0], [0.5, 99.9]) if vol.any() else (0, 300)
             layer.contrast_limits = (float(lo), float(max(hi, lo + 1)))
         self._contrast_set = True
@@ -393,14 +460,24 @@ class SessionWatcher:
             "naparym-live: waiting for a live acquisition to start..."
         )
 
-    def _latest(self) -> tuple[str | None, Path | None]:
+    def _latest(self) -> tuple[str | None, Path | None, dict]:
+        """The newest session, the store to show it from -- its RAM-disk
+        copy while that exists (one-format lane), else the GPFS one -- and
+        the follower's other inputs."""
         try:
             d = json.loads((self.jobs / LIVE_LATEST_NAME).read_text())
-            return d.get("session_id"), Path(d["store"])
+            store = Path(d["store"])
         except (OSError, ValueError, KeyError):
-            return None, None
+            return None, None, {}
+        view = d.get("view_store")
+        if view and Path(view).exists():
+            extra = {"buffers_dir": d.get("buffers_dir"), "qc_dir": d.get("qc_dir")}
+            return d.get("session_id"), Path(view), extra
+        return d.get("session_id"), store, {"qc_dir": d.get("qc_dir")}
 
-    def _switch(self, store: Path, session_id: str | None) -> None:
+    def _switch(
+        self, store: Path, session_id: str | None, extra: dict | None = None
+    ) -> None:
         """Try to switch to `store`. `live_latest.json` is written the
         moment a session starts (SESSION_START), well before the first
         timepoint's zarr group actually exists on disk -- that only happens
@@ -422,6 +499,7 @@ class SessionWatcher:
                 follow=self.follow,
                 session_id=session_id,
                 jobs=self.jobs,
+                **(extra or {}),
             )
         except (OSError, KeyError, ValueError) as exc:
             logger.debug("naparym-live: %s not ready yet (%r); retrying", store, exc)
@@ -451,11 +529,11 @@ class SessionWatcher:
             else:
                 self.follower.poll()
             return
-        session_id, store = self._latest()
+        session_id, store, extra = self._latest()
         if store is None:
             return  # nothing new; keep showing the waiting message
         if session_id != self.session_id:
-            self._switch(store, session_id)
+            self._switch(store, session_id, extra)
         elif self.follower is not None:
             self.follower.poll()
 

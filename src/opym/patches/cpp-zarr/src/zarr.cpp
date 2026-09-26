@@ -630,3 +630,34 @@ const std::string &zarr::get_errString() const{
 void zarr::set_errString(const std::string &errString){
     this->errString = errString;
 }
+
+// opym patch: N-D arrays through the 3-D machinery.
+//
+// PetaKit5D's zarr code is 3-D throughout. The live pipeline's stores are
+// not: a raw channel store is (T, Z, Y, X) and the processed OME-Zarr is
+// (T, C, Z, Y, X), both C order with chunk size 1 along every leading axis
+// and "/" as the dimension separator. For such an array the block at fixed
+// leading indices (t, c) is exactly a 3-D array whose chunks live under
+// fileName/t/c/ -- chunk key "t/c/z/y/x" is the path t/c/z/y/x. So this
+// re-roots fileName there and keeps the trailing three axes' shape and
+// chunks; everything downstream (chunk naming, reading, writing) is the
+// unchanged 3-D code. The .zarray itself is never rewritten.
+void zarr::set_leadingIndex(const std::vector<uint64_t> &leadingIndex){
+    const uint64_t nLead = leadingIndex.size();
+    if(!nLead) return;
+    if(shape.size() != nLead + 3 || chunks.size() != nLead + 3){
+        throw std::string("leadingIndex:rank");
+    }
+    if(dimension_separator != "/") throw std::string("leadingIndex:separator");
+    if(order != "C") throw std::string("leadingIndex:order");
+    if(shard) throw std::string("leadingIndex:shard");
+    for(uint64_t i = 0; i < nLead; i++){
+        if(chunks[i] != 1) throw std::string("leadingIndex:chunk");
+        if(leadingIndex[i] >= shape[i]) throw std::string("leadingIndex:range");
+    }
+    for(uint64_t i = 0; i < nLead; i++){
+        fileName += "/" + std::to_string(leadingIndex[i]);
+    }
+    shape = std::vector<uint64_t>(shape.end() - 3, shape.end());
+    chunks = std::vector<uint64_t>(chunks.end() - 3, chunks.end());
+}

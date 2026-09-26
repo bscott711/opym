@@ -46,6 +46,8 @@ dependencies = [
     "pyyaml",
     "pyzmq",
     "msgpack",
+    # OME-XML for the processed OME-Zarr (ome_zarr_writer.create_processed_store).
+    "ome-types>=0.6",
 ]
 
 [project.optional-dependencies]
