@@ -179,100 +179,180 @@ def _write(jobs, name, events):
     path.write_text("".join(json.dumps(e) + "\n" for e in events))
 
 
-def _synthetic(jobs, with_client=True):
-    """Two timepoints of a 2-channel session, 10 s apart, with known hops."""
+def _synthetic(jobs, with_client=True, legacy_profiles=False):
+    """Two timepoints of a 2-channel session, 10 s apart, with known hops.
+    The channels are acquired one after the other (the 488 stack, then the
+    561 stack), so each point of C1 comes 2 s after C0's; a timepoint's
+    time at each point is C1's. Per channel c, relative to base + 2c:
+
+        last plane 0, sent 0.25, received 0.5, staged 0.6, ticket 0.7,
+        claimed 0.8, view buffer 1.5, store 1.7, completed 1.8, reaped 1.9
+
+    then the viewer sees both at +3.6, shows at +4.0, paints at +4.5, and
+    the timepoint is archived at +4.2 (all relative to base)."""
     events, view, prof = [], [], []
     for t in (0, 1):
         base = 1000.0 + 10 * t
         for c in (0, 1):
+            b = base + 2 * c
             ev = {
                 "ev": "frame",
-                "at": base + 3 + c,
+                "at": b + 0.5,
                 "session_id": "sess-abc",
                 "base_name": "Cell_011",
                 "t": t,
                 "c": c,
                 "cidx": c,
                 "bytes": 100_000_000,
-                "recv_s": base + 3 + c,  # C1 lands 1 s after C0
-                "staged_s": base + 3.2 + c,
+                "recv_s": b + 0.5,
+                "staged_s": b + 0.6,
             }
             if with_client:
                 # client clock is 50 s behind Argus
                 ev |= {
-                    "acq_last_s": base - 50,
-                    "sent_s": base - 50 + 1 + c,
+                    "acq_last_s": b - 50,
+                    "sent_s": b - 50 + 0.25,
                     "clock_offset_s": 50.0,
                 }
             events.append(ev)
-        name = f"LIVE_Cell_011_{t}.json"
-        events.append(
-            {
-                "ev": "ticket",
-                "at": base + 4.5,
-                "session_id": "sess-abc",
+            name = f"LIVE_Cell_011_T{t:04d}_C{c}.json"
+            events.append(
+                {
+                    "ev": "ticket",
+                    "at": b + 0.7,
+                    "session_id": "sess-abc",
+                    "ticket": name,
+                    "timepoints": [t],
+                    "c": c,
+                    "attempt": 1,
+                }
+            )
+            rec = {
                 "ticket": name,
-                "timepoints": [t],
-                "attempt": 1,
+                "server_id": str(c + 1),
+                "started_at": b + 0.8,
+                "read_s": 0.1,
+                "decon_s": 0.4,
+                "dsr_s": 0.1,
+                "view_s": 0.1,
+                "write_s": 0.2,
+                "total_s": 1.0,
             }
-        )
-        prof.append({"ticket": name, "started_at": base + 5.0, "total_s": 3.0})
+            if not legacy_profiles:
+                rec |= {"buffer_at": b + 1.5, "store_at": b + 1.7, "done_at": b + 1.8}
+            prof.append(rec)
+            events.append(
+                {
+                    "ev": "ticket_done",
+                    "at": b + 1.9,
+                    "session_id": "sess-abc",
+                    "ticket": name,
+                    "timepoints": [t],
+                    "c": c,
+                }
+            )
         events.append(
-            {
-                "ev": "ticket_done",
-                "at": base + 8.25,
-                "session_id": "sess-abc",
-                "ticket": name,
-                "timepoints": [t],
-            }
-        )
-        events.append(
-            {"ev": "view_ready", "at": base + 10.0, "session_id": "sess-abc", "t": t}
+            {"ev": "archived", "at": base + 4.2, "session_id": "sess-abc", "t": t}
         )
         view.append(
             {
                 "ev": "shown",
-                "at": base + 11.0,
+                "at": base + 4.0,
+                "session_id": "sess-abc",
+                "timepoints": [t],
+                "seen_s": base + 3.6,
+            }
+        )
+        view.append(
+            {
+                "ev": "painted",
+                "at": base + 4.5,
                 "session_id": "sess-abc",
                 "timepoints": [t],
             }
         )
     _write(jobs, trace.TRACE_NAME, events)
     _write(jobs, trace.VIEW_TRACE_NAME, view)
-    _write(jobs, "S1.jsonl", prof)
+    _write(jobs, "S1.jsonl", [r for r in prof if r["server_id"] == "1"])
+    _write(jobs, "S2.jsonl", [r for r in prof if r["server_id"] == "2"])
+
+
+def _summary(jobs):
+    events = trace.read(jobs=jobs)
+    sid = trace_report.pick_session(events, None, None)
+    profiles = trace_report._server_profiles(jobs)
+    rows = trace_report.timeline(
+        sid, events, trace.read(trace.VIEW_TRACE_NAME, jobs=jobs), profiles
+    )
+    return trace_report.summarize(rows, profiles)
 
 
 def test_report_breaks_each_timepoint_into_hops(tmp_path):
     _synthetic(tmp_path)
-    events = trace.read(jobs=tmp_path)
-    sid = trace_report.pick_session(events, None, None)
-    rows = trace_report.timeline(
-        sid,
-        events,
-        trace.read(trace.VIEW_TRACE_NAME, jobs=tmp_path),
-        trace_report._server_profiles(tmp_path),
-    )
-    summary = trace_report.summarize(rows)
+    summary = _summary(tmp_path)
     hops = {k: v["p50"] for k, v in summary["hops"].items()}
-    # Each point is the timepoint's LAST channel (C1).
+    # Each point is the timepoint's LAST channel (C1, the 561 stack).
     assert hops == pytest.approx(
         {
-            "client": 2.0,  # acq_last -> C1 sent
-            "wire": 2.0,  # C1 sent (base+2) -> C1 received (base+4)
-            "stage": 0.2,
-            "dispatch": 0.3,
-            "claim": 0.5,
-            "gpu": 3.0,
-            "reap": 0.25,
-            "copy": 1.75,
-            "viewer": 1.0,
+            "client": 0.25,
+            "wire": 0.25,
+            "stage": 0.1,
+            "dispatch": 0.1,
+            "claim": 0.1,
+            "gpu": 0.7,  # claimed -> view buffer
+            "detect": 0.1,  # buffer (C1, base+3.5) -> seen (base+3.6)
+            "build": 0.4,
+            "paint": 0.5,
         }
     )
-    assert summary["headline_from"] == "acq_last"
-    assert summary["headline"]["p50"] == pytest.approx(11.0)
+    side = {k: v["p50"] for k, v in summary["side"].items()}
+    assert side == pytest.approx(
+        {"encode": 0.2, "finish": 0.1, "reap": 0.1, "archive": 0.3}
+    )
+    assert (summary["headline_from"], summary["headline_to"]) == (
+        "acq_last",
+        "painted",
+    )
+    assert summary["headline"]["p50"] == pytest.approx(2.5)  # base+2 -> base+4.5
     assert summary["arrival_interval"]["p50"] == pytest.approx(10.0)
-    # 100 MB per frame: C0 takes 2 s on the wire, C1 2 s too.
-    assert summary["wire_mb_per_s"]["p50"] == pytest.approx(50.0)
+    assert summary["wire_mb_per_s"]["p50"] == pytest.approx(400.0)
+    gpu = summary["gpu_servers"]
+    assert set(gpu) == {"1", "2"} and gpu["1"]["n"] == 2
+    assert gpu["2"]["decon_s"] == pytest.approx(0.4)
+
+
+def test_old_profiles_place_the_view_buffer_from_stage_durations(tmp_path):
+    _synthetic(tmp_path, legacy_profiles=True)
+    summary = _summary(tmp_path)
+    # started 0.8 + read/decon/dsr/view 0.7 = 1.5: the same buffer time
+    assert summary["hops"]["gpu"]["p50"] == pytest.approx(0.7)
+    assert summary["side"]["encode"]["p50"] == pytest.approx(0.2)
+    # completed = started + total_s = 1.8
+    assert summary["side"]["finish"]["p50"] == pytest.approx(0.1)
+
+
+def test_flatness_reports_a_growing_lag():
+    rows = {
+        t: {"acq_last": 100.0 * t, "painted": 100.0 * t + 2.0 + 0.1 * t}
+        for t in range(9)
+    }
+    flat = trace_report.summarize(rows)["flatness"]
+    assert flat["slope_s_per_t"] == pytest.approx(0.1)
+    assert flat["first_third_p95"] == pytest.approx(2.2)
+    assert flat["last_third_p95"] == pytest.approx(2.8)
+
+
+def test_out_writes_the_summary_and_a_row_per_timepoint(tmp_path, capsys):
+    _synthetic(tmp_path)
+    out = tmp_path / "run"
+    trace_report.main(["--jobs", str(tmp_path), "--out", str(out)])
+    text = capsys.readouterr().out
+    assert "last plane -> painted" in text and "flatness" not in text  # 2 points
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["session_id"] == "sess-abc"
+    lines = (out / "timeline.csv").read_text().splitlines()
+    assert lines[0].startswith("t,acq_last,sent,recv") and lines[0].endswith(",lag_s")
+    assert len(lines) == 3 and lines[1].split(",")[-1] == "2.5000"
 
 
 def test_report_falls_back_to_received_without_client_timestamps(tmp_path, capsys):
@@ -280,11 +360,11 @@ def test_report_falls_back_to_received_without_client_timestamps(tmp_path, capsy
     trace_report.main(["--jobs", str(tmp_path), "--base", "Cell_011"])
     out = capsys.readouterr().out
     assert "Session sess-abc (Cell_011): 2 timepoint(s)" in out
-    assert "received -> shown" in out
+    assert "received -> painted" in out
     trace_report.main(["--jobs", str(tmp_path), "--json"])
     summary = json.loads(capsys.readouterr().out)
     assert summary["hops"]["wire"] == {"n": 0}
-    assert summary["headline"]["p50"] == pytest.approx(11.0 - 4.0)
+    assert summary["headline"]["p50"] == pytest.approx(4.5 - 2.5)
 
 
 def test_report_rejects_an_unknown_session(tmp_path):
@@ -300,5 +380,5 @@ def test_frames_sent_before_the_first_ack_use_the_sessions_clock_offset(tmp_path
         if e["ev"] == "frame" and e["t"] == 0:
             del e["clock_offset_s"]
     rows = trace_report.timeline("sess-abc", events, [], {})
-    assert rows[0]["acq_last"] == pytest.approx(1000.0)
-    assert rows[0]["sent"] == pytest.approx(1002.0)
+    assert rows[0]["acq_last"] == pytest.approx(1002.0)
+    assert rows[0]["sent"] == pytest.approx(1002.25)

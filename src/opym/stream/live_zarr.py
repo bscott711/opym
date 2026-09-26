@@ -458,6 +458,12 @@ class ZarrLiveLane(LiveLane):
             changed = True
             if self._all_channels(session, session.archived, tc[0]):
                 session.done.add(tc[0])
+                trace.record(
+                    "archived",
+                    jobs=self._jobs,
+                    session_id=session.session_id,
+                    t=tc[0],
+                )
                 if session.first_done_at is None:
                     session.first_done_at = self._clock()
         if changed:

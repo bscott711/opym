@@ -206,6 +206,7 @@ while true
         'started_at', posixtime(datetime('now', 'TimeZone', 'UTC')), ...
         'job_type', '', 'data_dir', '', 'n_input_tifs', NaN, ...
         'decon_s', NaN, 'dsr_s', NaN, 'read_s', NaN, 'view_s', NaN, 'write_s', NaN, ...
+        'buffer_at', NaN, 'store_at', NaN, 'done_at', NaN, ...
         'total_s', NaN, 'status', '', 'error', '');
     % Defined before the try: the catch block reads it, and a ticket that fails
     % before its jobType is parsed (e.g. malformed JSON) would otherwise throw
@@ -557,6 +558,8 @@ while true
                 prof.dsr_s = liveStats.dsr_s;
                 prof.write_s = liveStats.write_s;
                 prof.view_s = liveStats.view_s;
+                prof.buffer_at = liveStats.buffer_at;
+                prof.store_at = liveStats.store_at;
 
             case 'live'
                 % Streamed timepoints (opym.stream.live): decon -> DSR per
@@ -794,6 +797,7 @@ while true
 
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
             movefile(activePath, fullfile(done_dir, currentFile));
+            prof.done_at = posixtime(datetime('now', 'TimeZone', 'UTC'));
             logMsg('[Server] <<< Finished: %s', currentFile);
 
             % --- FREE GPU MEMORY --- except between live tickets: a reset

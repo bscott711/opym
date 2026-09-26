@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
-from opym import local_gpu_worker
+import pytest
+
+from opym import lanes, local_gpu_worker
 from opym.local_gpu_worker import (
     MAX_REQUEUES,
     ServerSupervisor,
@@ -464,3 +467,43 @@ def test_status_reports_lanes(tmp_path):
     assert status["live_lease_active"] is True
     assert status["live_queued"] == 1
     assert status["backfill_queued"] == 1
+
+
+def test_servers_from_env():
+    assert local_gpu_worker.servers_from_env(None) == local_gpu_worker.DEFAULT_SERVERS
+    assert local_gpu_worker.servers_from_env(" ") == local_gpu_worker.DEFAULT_SERVERS
+    assert local_gpu_worker.servers_from_env("lv1:0, lv2:1") == (
+        ("lv1", "0"),
+        ("lv2", "1"),
+    )
+    with pytest.raises(ValueError):
+        local_gpu_worker.servers_from_env("lv1")
+
+
+def test_server_pids_only_match_their_own_jobs_dir(tmp_path):
+    """A test stack beside production: same server id, different jobs dir,
+    never mistaken for each other (a kill would take down the wrong one)."""
+    import subprocess
+    import sys
+
+    ours, theirs = tmp_path / "ours", tmp_path / "theirs"
+    env = {k: v for k, v in os.environ.items() if k != "PETAKIT_JOBS_DIR"}
+    sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
+    procs = [
+        subprocess.Popen(
+            sleeper,
+            env=env | {"PETAKIT_SERVER_ID": "tpid", "PETAKIT_JOBS_DIR": str(ours)},
+        ),
+        subprocess.Popen(sleeper, env=env | {"PETAKIT_SERVER_ID": "tpid"}),
+    ]
+    try:
+        with_ours, default_dir = procs[0].pid, procs[1].pid
+        assert local_gpu_worker._server_pids("tpid", ours) == [with_ours]
+        assert local_gpu_worker._server_pids("tpid", theirs) == []
+        assert local_gpu_worker._server_pids("tpid", Path(lanes.DEFAULT_JOBS_DIR)) == [
+            default_dir
+        ]
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait()
