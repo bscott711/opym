@@ -140,6 +140,15 @@ def test_processed_store_ome_xml_is_valid_and_describes_both_images(tmp_path):
     assert px.time_increment == 9.5
     assert [c.name for c in px.channels] == ["GFP 488", "mScarlet 561"]
     assert [c.excitation_wavelength for c in px.channels] == [488, 561]
+    # Green/magenta, never red/green (Fiji and other OME readers use these).
+    assert [c.color.as_rgb_tuple(alpha=False) for c in px.channels] == [
+        (0, 255, 0),
+        (255, 0, 255),
+    ]
+    assert [c["color"] for c in w.image_group(out).attrs["omero"]["channels"]] == [
+        "00FF00",
+        "FF00FF",
+    ]
     assert mip.pixels.size_z == 1
 
 
