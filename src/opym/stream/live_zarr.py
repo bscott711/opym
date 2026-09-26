@@ -27,6 +27,9 @@ this one is proven in production. Per session:
   uncompressed buffers; older ones are read from the store. A session's
   view directory stays until a later session starts (so the last
   acquisition remains viewable), then goes.
+
+The whole live path, camera to screen, with its timings and design
+choices: docs/live-view-pipeline.md.
 """
 
 from __future__ import annotations
