@@ -164,11 +164,12 @@ if present()
     discard(tmpPath, isDir);
     return;
 end
-try
-    movefile(tmpPath, finalPath);
-catch ME
+% One rename(2): a file lands atomically, replacing an identical one (never
+% a moment without it, as movefile's delete-then-move could leave); a
+% directory can't replace one that's already there, which is fine too.
+if ~java.io.File(tmpPath).renameTo(java.io.File(finalPath))
     if ~present()
-        rethrow(ME);
+        error('run_live_frames:publish', 'Cannot move %s to %s', tmpPath, finalPath);
     end
     discard(tmpPath, isDir);
 end

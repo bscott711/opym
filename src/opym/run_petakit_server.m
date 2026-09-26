@@ -190,8 +190,7 @@ while true
     for k = 1:numel(jobFiles)
         srcPath = fullfile(claim_dir, jobFiles(k).name);
         activePath = fullfile(claim_dir, ['.active_' jobFiles(k).name]);
-        [status, ~] = movefile(srcPath, activePath);
-        if status
+        if claimFile(srcPath, activePath)
             currentFile = jobFiles(k).name;
             break;
         end
@@ -818,7 +817,12 @@ while true
         prof.status = 'failed';
         prof.error = ME.message;
         if ~ismember(jobType, {'pipeline', 'pipeline_batch'})
-            movefile(activePath, fullfile(fail_dir, currentFile));
+            % Never let a missing claim take the server down with it.
+            if exist(activePath, 'file')
+                movefile(activePath, fullfile(fail_dir, currentFile));
+            else
+                logMsg('[Server] !!! Claim %s is gone; nothing to move to failed/.', activePath);
+            end
             errLog = fullfile(fail_dir, [currentFile '.log']);
             fid = fopen(errLog, 'w');
             fprintf(fid, '%s\n', getReport(ME));
@@ -836,6 +840,16 @@ while true
     clearClaim(claimPath);
     prof.total_s = toc(tTicket);
     writeProfile(profiling_dir, envServerId, prof);
+end
+
+function ok = claimFile(src, dst)
+    % Claim a ticket with one rename(2) (through Java): atomic, and a server
+    % that loses the race finds its source gone and touches nothing. Not
+    % MATLAB's movefile -- with two servers racing for one ticket, the
+    % loser's movefile left the winner without its claim file in 7 of 150
+    % contested claims (2026-09-25; 0 of 150 with rename). That crashed a
+    % server on the very next line, fopen of its own claim.
+    ok = java.io.File(src).renameTo(java.io.File(dst));
 end
 
 function pool = ensurePool(pool, numCPUs, targetGpu)
