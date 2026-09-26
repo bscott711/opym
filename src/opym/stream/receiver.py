@@ -532,6 +532,11 @@ class StreamReceiver:
         elif msg_type == MSG_FRAME:
             self._notice_unknown(sock, identity, session_id)
             return
+        elif msg_type == MSG_SESSION_END:
+            # Already closed (the client missed the final ACK and resent
+            # SESSION_END): confirm it again.
+            self._send_unknown(sock, identity, session_id)
+            return
         if msg_type == MSG_FRAME:
             self._handle_frame(session_id, header, payload)
         elif msg_type == MSG_SESSION_END:
@@ -1118,12 +1123,14 @@ class StreamReceiver:
             processed.discard(session.ack_floor + 1)
             session.ack_floor += 1
 
-    def _send_ack(self, session: SessionState) -> None:
+    def _send_ack(self, session: SessionState, ended: bool = False) -> None:
         header = {
             "through_frame_index": session.ack_floor,
             "server_time_s": time.time(),
             "features": SERVER_FEATURES,
         }
+        if ended:
+            header["ended"] = True
         session.sock.send_multipart(
             [session.identity, *pack_message(MSG_ACK, session.session_id, header)]
         )
@@ -1189,8 +1196,9 @@ class StreamReceiver:
         # ACK that was simply never going to come, even though every frame
         # had already been durably staged. Send one final ACK at the true
         # ack_floor before the session state (and the identity needed to
-        # reach the client) is gone.
-        self._send_ack(session)
+        # reach the client) is gone; `ended` tells the client its
+        # SESSION_END landed.
+        self._send_ack(session, ended=True)
 
         if reason == "paused":
             self._retain_paused(session)

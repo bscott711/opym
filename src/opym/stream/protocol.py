@@ -206,7 +206,13 @@ _VALID_TYPES = frozenset(
 #                               way). A client that saw "resume" re-sends
 #                               SESSION_START with resume_through, then
 #                               everything unACKed. through_frame_index is
-#                               -1 and means nothing here.
+#                               -1 and means nothing here. A SESSION_END for
+#                               a session already closed is answered this
+#                               way too (it confirms the SESSION_END).
+#   ended            bool   -- OPTIONAL, true on the final ACK, sent once
+#                               the server has closed the session: it
+#                               confirms SESSION_END. A client that got no
+#                               confirmation may resend SESSION_END.
 #   server_time_s        float -- OPTIONAL, the server's epoch seconds when
 #                               it sent this ACK; lets a client estimate the
 #                               clock offset for the trace fields above.

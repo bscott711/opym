@@ -318,3 +318,23 @@ def test_a_paused_run_is_never_copied_to_raw_root(tmp_path, recv, monkeypatch):
     # Kept on staging for the usual retention, then evicted.
     assert _store(stage).exists()
     assert _store(stage) in recv._drain_pool._drained["sess-stage"].stage_dirs
+
+
+def test_the_final_ack_confirms_session_end_and_a_repeat_is_confirmed_too(
+    tmp_path, recv
+):
+    sock = _dealer(recv, "sess-end")
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, "sess-end", _header(tmp_path / "raw"))
+    )
+    _pump(recv, sock)
+    sock.send_multipart(
+        pack_message(MSG_SESSION_END, "sess-end", {"reason": "complete"})
+    )
+    assert _pump(recv, sock)["ended"] is True
+    # The client missed that ACK and sends SESSION_END again.
+    sock.send_multipart(
+        pack_message(MSG_SESSION_END, "sess-end", {"reason": "complete"})
+    )
+    assert _pump(recv, sock)["unknown_session"] is True
+    sock.close()
