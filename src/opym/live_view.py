@@ -556,32 +556,24 @@ class LiveFollower:
         self.viewer.text_overlay.text = self._status + (f"\n{qc}" if qc else "")
 
     def poll(self) -> None:
-        """Rebuild the image layers from scratch on every new timepoint,
-        rather than update the existing ones in place.
+        """Show each new timepoint as soon as every channel of it is in.
 
-        Found live on Argus (2026-09-25): the volume stayed black in the
-        open window while the store kept growing, and only closing and
-        reopening naparym-live ever showed the real data -- a fresh process
-        always works because it builds its layers via `add_image` from
-        scratch. Two narrower fixes (fresh dask arrays reassigned onto the
-        existing layers' `.data`; then adding an explicit `layer.refresh()`
-        alongside that, once tracing napari's event wiring showed the vispy
-        renderer only listens for `events.set_data`, fired only from
-        `refresh()`) each turned out to be necessary but not sufficient --
-        `set_data` was confirmed (by a listener attached in the test) to
-        already fire even without either fix, meaning whatever the real
-        remaining gap is sits deeper in napari's rendering pipeline than
-        either fix reached, in a part not reachable from here to inspect (no
-        working GPU/software-GL context on Argus to render a real frame and
-        compare pixels -- confirmed while investigating this). Since a full
-        restart is the one thing actually confirmed to work, every timepoint
-        now gets that same fresh construction, just without restarting the
-        process: remove the old layers only after the new ones are built and
-        added successfully (so a construction failure never leaves the
-        viewer blank), carrying over the display settings (`_CARRIED`).
+        The first call builds a session's layers (`_rebuild`), even with
+        nothing done yet, so its channels show up as soon as it's found.
+        After that a new timepoint only moves the time slider (`_advance`):
+        napari re-slices the same layers, each reading that timepoint once
+        (its mapped view buffer, or the store), and vispy replaces the
+        texture's contents.
 
-        The first call builds the layers even with nothing done yet, so a
-        session's channels show up as soon as it's found.
+        Until 2026-09-26 every timepoint rebuilt the layers from scratch: on
+        2026-09-25 the volume stayed black in an open window while dask
+        arrays were reassigned onto existing layers, and a fresh build was
+        the one thing known to work. That cost about 1 s per timepoint --
+        two new layers, then tearing down the old two (opym-live-trace's
+        `build`, 2026-09-26) -- on top of the paint. Moving the slider over
+        layers whose data reads each timepoint afresh (`BufferedSeries`, or
+        dask with napari's cache off) reassigns nothing; it was checked on
+        the DCV display that every timepoint paints its own data.
         """
         seen_s = time.time()
         progress = read_progress(self.store)
@@ -592,7 +584,10 @@ class LiveFollower:
         if self.layers and done == self._shown:
             return
         new = [t for t in done if t not in self._shown]
-        phases = self._rebuild(done, new)
+        if self.layers:
+            phases = self._advance(done, new)
+        else:
+            phases = self._rebuild(done, new)
         self._shown = done
         if not new:
             return
@@ -611,8 +606,36 @@ class LiveFollower:
         if self.painter is not None:
             self.painter.expect(session_id=self.session_id, timepoints=new)
 
+    def _advance(self, done: list[int], new: list[int]) -> dict[str, float]:
+        """Show a new timepoint on the layers already up: follow it with the
+        time slider (napari re-slices each visible layer, reading it once),
+        or, if the timepoint on screen is the one that just came in, re-read
+        it in place. Returns how long each step took, in seconds."""
+        phases: dict[str, float] = {}
+        t0 = time.perf_counter()
+        target = max(new) if self.follow and new else None
+        if not self._contrast_set and done:
+            for layer, limits in zip(
+                self.layers, self._contrast(done, target), strict=False
+            ):
+                layer.contrast_limits = limits
+            self._contrast_set = True
+            phases["contrast"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        current = int(self.viewer.dims.current_step[0])
+        if target is not None and target != current:
+            self.viewer.dims.set_current_step(0, target)
+            phases["slice"] = time.perf_counter() - t0
+        elif current in new:
+            for layer in self.layers:
+                if layer.visible:
+                    layer.refresh()
+            phases["refresh"] = time.perf_counter() - t0
+        return phases
+
     def _rebuild(self, done: list[int], new: list[int]) -> dict[str, float]:
-        """Swap in fresh layers, reading each channel once.
+        """Build a session's layers, reading each channel once (replacing a
+        previous session's, `replaces`, once they are up).
 
         napari reads (slices) a visible layer on every change that touches
         it, a whole 1 GB volume per channel in 3D. Adding the new layers

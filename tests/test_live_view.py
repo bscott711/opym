@@ -95,13 +95,11 @@ def test_follower_tracks_new_timepoints(tmp_path):
     # multiscale layer's coarsest level.
     assert not follower.layers[1].multiscale
     assert follower.layers[1].data.shape == (3, 8, 16, 12)
-    # A whole new layer, not the same object with new data assigned onto it
-    # -- see poll()'s docstring for why this is the fix, not the narrower
-    # ones tried first. The old layer is gone from the viewer entirely.
-    assert follower.layers[1] is not first_layer
-    assert first_layer not in viewer.layers
-    # A rebuild must not silently wipe out the current contrast, whether
-    # it's the auto-set value above or something the user dialed in by hand.
+    # The same layers, re-sliced at t=1 (no rebuild per timepoint: see
+    # poll()'s docstring), and what napari holds for display is t=1's data.
+    assert follower.layers[1] is first_layer and first_layer in viewer.layers
+    assert int(np.asarray(first_layer._slice.image.raw).max()) == 210
+    # A new timepoint never touches what the user dialed in.
     assert follower.layers[0].contrast_limits == list(user_limits)
 
     follower.follow = False
@@ -109,6 +107,28 @@ def test_follower_tracks_new_timepoints(tmp_path):
     follower.poll()
     assert viewer.dims.current_step[0] == 1
     assert viewer.text_overlay.text.endswith("complete")
+
+
+def test_follower_rereads_the_timepoint_on_screen_when_it_comes_in(tmp_path):
+    """Not following, parked on a timepoint that isn't processed yet: when
+    it comes in, the layers on screen re-read it in place."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    resize_dask_cache(0)
+    store = _store(tmp_path)
+    done: list = []
+    _finish(store, 0, done)
+    viewer = ViewerModel()
+    follower = live_view.LiveFollower(viewer, store, follow=False)
+    viewer.dims.set_current_step(0, 2)
+    layer = follower.layers[0]
+    assert int(np.asarray(layer._slice.image.raw).max()) == 0  # not in yet
+    _finish(store, 2, done)
+    follower.poll()
+    assert follower.layers[0] is layer
+    assert int(np.asarray(layer._slice.image.raw).max()) == 300
 
 
 def _qc_line(path, rec):
@@ -358,7 +378,9 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     assert shown["ev"] == "shown" and shown["session_id"] == "sess-v"
     assert shown["timepoints"] == [0]
     assert shown["build_s"] >= 0 and shown["seen_s"] <= shown["at"]
-    assert {"open", "slider", "slice_c0", "append_c1", "remove"} <= set(shown["phases"])
+    # The layers were built when the session was found; t=0 is read into
+    # them in place (slider moved to it, or re-read if already there).
+    assert set(shown["phases"]) in ({"contrast", "slice"}, {"contrast", "refresh"})
 
 
 def test_paint_clock_traces_the_first_frame_after_a_timepoint_is_shown(tmp_path):
