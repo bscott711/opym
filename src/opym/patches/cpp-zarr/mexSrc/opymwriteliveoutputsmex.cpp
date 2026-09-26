@@ -39,6 +39,10 @@
 //
 // Returns t = [view_s, write_s]: seconds to the published view buffer, then
 // for all the zarr writes.
+//
+// opymWriteLiveOutputs('prepare', dir, [Y X Z]) only readies a view buffer
+// for a (Y, X, Z) volume in dir, in the background -- what a server's
+// warm-up does before a session's first volume arrives.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -289,6 +293,21 @@ std::string dirOf(const std::string &path)
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
+    if (nrhs == 3 && mxIsChar(prhs[0])) {
+        if (str(prhs[0], "command") != "prepare")
+            mexErrMsgIdAndTxt("opymLive:input", "Usage: opymWriteLiveOutputs('prepare', dir, [Y X Z])");
+        const std::string dir = str(prhs[1], "dir");
+        if (dir.empty() || !mxIsDouble(prhs[2]) || mxGetNumberOfElements(prhs[2]) != 3)
+            mexErrMsgIdAndTxt("opymLive:input", "Usage: opymWriteLiveOutputs('prepare', dir, [Y X Z])");
+        const double *sz = mxGetPr(prhs[2]);
+        const uint64_t Y = (uint64_t)sz[0], X = (uint64_t)sz[1], Z = (uint64_t)sz[2];
+        const uint64_t size = npyHeader(Z, Y, X).size() + Z * Y * X * sizeof(uint16_t);
+        joinPrep();
+        if (prep.map && prep.dir == dir && prep.size == size) return;
+        dropPrep();
+        startPrep(dir, size, nullptr, 0);
+        return;
+    }
     if (nrhs != 5)
         mexErrMsgIdAndTxt("opymLive:input",
                           "Usage: t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex)");

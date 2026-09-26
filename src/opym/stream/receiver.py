@@ -103,7 +103,7 @@ DEFAULT_BIND_ADDR = "tcp://127.0.0.1:5555"
 ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
-POLL_TIMEOUT_MS = 500
+POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
 # thousand earlier acquisitions under one name means something is wrong

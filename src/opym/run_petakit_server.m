@@ -131,31 +131,17 @@ catch e
     logMsg('[Server] ❌ Failed to lock GPU %d: %s', targetGpu, e.message);
 end
 
-% --- PARPOOL INITIALIZATION ----------------------------------------------
-pool = gcp('nocreate');
-if isempty(pool) || pool.NumWorkers ~= numCPUs
-    try
-        delete(pool);
-        pc = parcluster('local');
-        envServer = getenv('PETAKIT_SERVER_ID');
-        if isempty(envServer), envServer = num2str(targetGpu); end
-        pc.JobStorageLocation = fullfile(getenv('HOME'), '.matlab', 'local_cluster_jobs', sprintf('server_%s', envServer));
-        if ~exist(pc.JobStorageLocation, 'dir')
-            mkdir(pc.JobStorageLocation);
-        end
-        pool = parpool(pc, numCPUs, 'IdleTimeout', Inf);
-    catch
-        logMsg('[Server] Warning: Could not start parpool. Continuing...');
-    end
-end
-
-% Prevent the pool from shutting down after 30 minutes of inactivity
-pool = gcp('nocreate');
-if ~isempty(pool)
-    pool.IdleTimeout = Inf;
-end
+% --- PARPOOL ---------------------------------------------------------------
+% Started on the first job that needs it (ensurePool), not here: it takes
+% ~24 s of a ~40 s boot, and live tickets never use it, so a server launched
+% for an acquisition is ready that much sooner.
+pool = [];
 
 logMsg('[Server] Ready. Watching: %s', queue_dir);
+% The live-session warm-up spec (opym.stream.live_zarr.WARMUP_NAME) and the
+% last one this server acted on.
+warmupPath = fullfile(base_queue_dir, 'live_warmup.json');
+warmedStamp = 0;
 
 % --- MAIN SERVER LOOP ----------------------------------------------------
 envTimeout = getenv('PETAKIT_IDLE_TIMEOUT');
@@ -170,6 +156,12 @@ while true
     [jobFiles, claim_dir, liveActive] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
 
     if isempty(jobFiles)
+        % A new live session: warm up for it while there's nothing to do.
+        [warmedStamp, warmed] = maybeWarmup(warmupPath, warmedStamp, numCPUs, profiling_dir, envServerId);
+        if warmed
+            idleTimer = 0;
+            continue;
+        end
         % Short poll: a live ticket waiting here is time the live view is
         % behind (up to 2 s per timepoint with the old 2 s pause). dir() on
         % the tmpfs queue is cheap; poll hardest while an acquisition holds
@@ -188,15 +180,23 @@ while true
     % Reset the timer the moment we find work
     idleTimer = 0;
 
-    currentFile = jobFiles(1).name;
+    % Atomic file lock (prevents both GPUs from grabbing same job): the
+    % oldest ticket this server manages to rename is its. One the other
+    % server just took is skipped, not waited out -- a live timepoint's two
+    % channels land together, and the old rand()*1.5 s backoff after losing
+    % the first could hold the second back that long.
     [~, claimLane] = fileparts(claim_dir);
-    srcPath = fullfile(claim_dir, currentFile);
-    activePath = fullfile(claim_dir, ['.active_' currentFile]);
-
-    % Atomic file lock (prevents both GPUs from grabbing same job)
-    [status, ~] = movefile(srcPath, activePath);
-    if status == 0
-        pause(rand() * 1.5);
+    currentFile = '';
+    for k = 1:numel(jobFiles)
+        srcPath = fullfile(claim_dir, jobFiles(k).name);
+        activePath = fullfile(claim_dir, ['.active_' jobFiles(k).name]);
+        [status, ~] = movefile(srcPath, activePath);
+        if status
+            currentFile = jobFiles(k).name;
+            break;
+        end
+    end
+    if isempty(currentFile)
         continue;
     end
 
@@ -228,6 +228,9 @@ while true
         jobType = safelyGetParam(job, 'jobType', 'deskew');
         prof.job_type = jobType;
         prof.data_dir = safelyGetParam(job, 'dataDir', '');
+        if ~strcmp(jobType, 'live_zarr')
+            pool = ensurePool(pool, numCPUs, targetGpu);
+        end
 
         % Echo the revision of the opym checkout that BUILT this ticket. This
         % MATLAB process loads run_petakit_server.m exactly once at startup,
@@ -835,6 +838,62 @@ while true
     writeProfile(profiling_dir, envServerId, prof);
 end
 
+function pool = ensurePool(pool, numCPUs, targetGpu)
+    % The parallel pool every non-live job type may use (parfeval'd pipeline
+    % jobs, parseParfor wrappers), started on first need.
+    if ~isempty(pool) && isvalid(pool)
+        return;
+    end
+    pool = gcp('nocreate');
+    if isempty(pool) || pool.NumWorkers ~= numCPUs
+        try
+            delete(pool);
+            pc = parcluster('local');
+            envServer = getenv('PETAKIT_SERVER_ID');
+            if isempty(envServer), envServer = num2str(targetGpu); end
+            pc.JobStorageLocation = fullfile(getenv('HOME'), '.matlab', 'local_cluster_jobs', sprintf('server_%s', envServer));
+            if ~exist(pc.JobStorageLocation, 'dir')
+                mkdir(pc.JobStorageLocation);
+            end
+            logMsg('[Server] Starting parallel pool (%d workers) for non-live work...', numCPUs);
+            pool = parpool(pc, numCPUs, 'IdleTimeout', Inf);
+        catch
+            logMsg('[Server] Warning: Could not start parpool. Continuing...');
+        end
+    end
+    % Prevent the pool from shutting down after 30 minutes of inactivity
+    pool = gcp('nocreate');
+    if ~isempty(pool)
+        pool.IdleTimeout = Inf;
+    end
+end
+
+function [stamp, warmed] = maybeWarmup(path, stamp, numCPUs, profiling_dir, serverId)
+    % Once per new warm-up spec (its mtime), if it is fresh: a live session
+    % started in the last 10 minutes. Never allowed to break the server.
+    warmed = false;
+    d = dir(path);
+    if isempty(d) || d(1).datenum == stamp
+        return;
+    end
+    stamp = d(1).datenum;
+    if (now - stamp) * 86400 > 600
+        return;
+    end
+    warmed = true;
+    t0 = tic;
+    try
+        spec = jsondecode(fileread(path));
+        logMsg('[Server] Warming up for live session %s ...', spec.session_id);
+        s = run_live_zarr(spec.parameters, numCPUs);
+        logMsg('[Server] Warm for session %s (%.1f s).', spec.session_id, s.decon_s);
+        writeProfile(profiling_dir, serverId, struct('ticket', ['warmup:' spec.session_id], ...
+            'job_type', 'live_warmup', 'total_s', toc(t0), 'status', 'done', 'error', ''));
+    catch ME
+        logMsg('[Server] Warm-up failed (the first timepoint will just be slower): %s', ME.message);
+    end
+end
+
 function [jobFiles, fromDir, liveActive] = nextJobFiles(liveDir, backfillDir, leasePath)
     % Claimable tickets, oldest name first, from the live queue if it has
     % any, else from the backfill queue unless a live lease is fresh.
@@ -932,7 +991,10 @@ end
 
 % --- HELPER: Forced Flushing Log ---
 function logMsg(fmt, varargin)
-    % Prints to stdout (1) and pauses briefly to force buffer flush
+    % Prints to stdout (1). Under `matlab -batch` (how local_gpu_worker.py
+    % launches this) each line reaches the log as it is printed; the
+    % pause(0.05) this used to add cost a live ticket ~0.15 s before its job
+    % started, for nothing (checked 2026-09-25: a line printed right before a
+    % 6 s busy loop was in the log 6 s before the next one).
     fprintf(1, [fmt '\n'], varargin{:});
-    pause(0.05);
 end

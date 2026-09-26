@@ -34,8 +34,16 @@ function stats = run_live_zarr(p, numCPUs)
 %                   uint16 .npy on the RAM disk (numpy memory-maps it: no
 %                   decode). It lands before the compressed store is written,
 %                   so the view never waits on encoding.
-%   psf_path, decon_dir (per-session cache: generated PSF, OMW back projector,
-%                   erosion mask), plus a 'live' ticket's decon and DSR fields.
+%   psf_path, decon_dir (the session's work dir), plus a 'live' ticket's
+%                   decon and DSR fields
+%   psf_cache_dir   optional: where the generated PSF and OMW back projector
+%                   live (<dir>/psfgen), shared by every acquisition with the
+%                   same PSF, settings and shape (default decon_dir)
+%   warmup          optional: true for the warm-up a server runs when a
+%                   session starts (see opym.stream.live_zarr.WARMUP_NAME) --
+%                   a decon + DSR of a constant volume of raw_shape_zyx,
+%                   discarded, and the first view buffer readied in view_dir.
+%                   Nothing is read or written besides the PSF cache.
 
 t = double(p.t);
 c = double(p.c);
@@ -66,10 +74,11 @@ end
 
 if ~exist(deconDir, 'dir'), mkdir(deconDir); end
 stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'view_s', 0, 'write_s', 0);
+cacheRoot = char(getp(p, 'psf_cache_dir', deconDir));
 
-% --- once per session: generated PSF, exactly as XR_decon_data_wrapper ---
-% (same code and cache location as run_live_frames.m; RLdecon loads it)
-psfgenDir = fullfile(deconDir, 'psfgen');
+% --- once per PSF cache: generated PSF, exactly as XR_decon_data_wrapper ---
+% (same code as run_live_frames.m; RLdecon loads it from <its output dir>/psfgen)
+psfgenDir = fullfile(cacheRoot, 'psfgen');
 if ~exist(psfgenDir, 'dir'), mkdir(psfgenDir); end
 [~, psfFsn] = fileparts(psf);
 psfgenFn = sprintf('%s/%s_%s.tif', psfgenDir, psfFsn, method);
@@ -91,6 +100,46 @@ if ~exist(psfgenFn, 'file')
     publishOnce(tmpFn, psfgenFn, false);
 end
 
+% RLdecon exactly as XR_RLdeconFrame3D calls it (its defaults for what
+% run_live_frames.m doesn't pass: Reverse true, fixIter false, mipAxis
+% [0 0 1]), with the volume in memory and nothing written: save3Dstack all
+% false returns the result, and the output name only places the PSF cache.
+% The erosion mask is applied by this job rather than by RLdecon: given a
+% mask file it runs the core with EdgeErosion 0, then reads the file and
+% multiplies by it on every call -- EdgeErosion 0 with no file is that same
+% core call, and zeroing the mask's voxels is that same product.
+rlArgs = {'save16bit', true, 'SkewAngle', ang, 'Deskew', false, 'Rotate', false, 'DSRCombined', true, ...
+    'Reverse', true, 'Background', bg, 'DeconIter', iter, 'RLMethod', method, 'skewed', true, ...
+    'wienerAlpha', alpha, 'OTFCumThresh', otfCT, 'hannWinBounds', hann, 'saveZarr', false, ...
+    'blockSize', [256, 256, 256], 'fixIter', false, 'dampFactor', damp, 'scaleFactor', 1, ...
+    'deconOffset', 0, 'EdgeErosion', 0, 'ErodeMaskfile', '', 'errThresh', [], ...
+    'saveStep', 5, 'useGPU', gpu, 'psfGen', true, 'debug', false, ...
+    'save3Dstack', [false, false, false], 'mipAxis', [0, 0, 1]};
+% The DSRCombined call patches/XR_deskewRotateFrame.m makes for this
+% configuration (no stage scan, so skewAngle_1 = skewAngle).
+dsrArgs = {'reverse', reverse, 'crop', true, 'objectiveScan', false, ...
+    'resampleFactor', [], 'interpMethod', interp, 'xStepThresh', 2.0, 'save16bit', true};
+
+% --- warm-up: the same decon and DSR on a constant volume of the session's
+% shape, discarded. Compiles the code paths, builds the back projector into
+% the cache, plans the FFTs and leaves the OTF on the GPU
+% (decon_lucy_omw_function keys it on size and back projector, so the first
+% real ticket reuses it), then readies the first view buffer. ---
+if getp(p, 'warmup', false)
+    t0 = tic;
+    rs = double(p.raw_shape_zyx(:)');
+    dummy = repmat(uint16(bg + 1), rs([3, 2, 1]));   % (X, Y, Z), as the read returns
+    d = uint16(RLdecon('', fullfile(cacheRoot, 'warmup.tif'), psf, xy, dz, dzPSF, ...
+        'rawdata', dummy, rlArgs{:}));
+    clear dummy;
+    d = deskewRotateFrame3D(d, ang, dz, xy, dsrArgs{:});
+    if isfield(p, 'view_dir') && ~isempty(p.view_dir)
+        opymWriteLiveOutputs('prepare', char(p.view_dir), double(size(d, 1 : 3)));
+    end
+    stats.decon_s = toc(t0);
+    return;
+end
+
 % --- once per session and server: the first-time-point erosion mask
 % (erodeByFTP), kept in memory as the voxels it zeroes ---
 zeroIdx = [];
@@ -103,25 +152,11 @@ t0 = tic;
 raw = parallelReadZarr(char(p.raw_store), 'leadingIndex', t + 1, 'orientForDecon', true);
 stats.read_s = toc(t0);
 
-% --- decon: RLdecon exactly as XR_RLdeconFrame3D calls it (its defaults for
-% what run_live_frames.m doesn't pass: Reverse true, fixIter false, mipAxis
-% [0 0 1]), with the volume in memory and nothing written. The output name
-% only places RLdecon's PSF cache (deconDir/psfgen); save3Dstack all false
-% returns the uint16 result instead of writing it. The erosion mask is
-% applied here rather than by RLdecon: given a mask file it runs the core
-% with EdgeErosion 0, then reads the file and multiplies by it on every
-% call -- EdgeErosion 0 with no file is that same core call, and zeroing
-% the cached voxels is that same product. ---
+% --- decon ---
 t0 = tic;
 fsname = sprintf('live_T%04d_C%d', t, c);
-deconvolved = RLdecon('', fullfile(deconDir, [fsname '.tif']), psf, xy, dz, dzPSF, 'rawdata', raw, ...
-    'save16bit', true, 'SkewAngle', ang, 'Deskew', false, 'Rotate', false, 'DSRCombined', true, ...
-    'Reverse', true, 'Background', bg, 'DeconIter', iter, 'RLMethod', method, 'skewed', true, ...
-    'wienerAlpha', alpha, 'OTFCumThresh', otfCT, 'hannWinBounds', hann, 'saveZarr', false, ...
-    'blockSize', [256, 256, 256], 'fixIter', false, 'dampFactor', damp, 'scaleFactor', 1, ...
-    'deconOffset', 0, 'EdgeErosion', 0, 'ErodeMaskfile', '', 'errThresh', [], ...
-    'saveStep', 5, 'useGPU', gpu, 'psfGen', true, 'debug', false, ...
-    'save3Dstack', [false, false, false], 'mipAxis', [0, 0, 1]);
+deconvolved = RLdecon('', fullfile(cacheRoot, [fsname '.tif']), psf, xy, dz, dzPSF, ...
+    'rawdata', raw, rlArgs{:});
 clear raw;
 % What the TIFF path writes and XR_deskewRotateFrame reads back (RLdecon's
 % save branch does this cast; the early return above skips it).
@@ -129,13 +164,9 @@ deconvolved = uint16(deconvolved);
 deconvolved(zeroIdx) = 0;
 stats.decon_s = toc(t0);
 
-% --- deskew/rotate: the DSRCombined call patches/XR_deskewRotateFrame.m
-% makes for this configuration (no stage scan, so skewAngle_1 = skewAngle). ---
+% --- deskew/rotate ---
 t0 = tic;
-dsr = deskewRotateFrame3D(deconvolved, ang, dz, xy, ...
-    'reverse', reverse, 'crop', true, 'objectiveScan', false, ...
-    'resampleFactor', [], 'interpMethod', interp, ...
-    'xStepThresh', 2.0, 'save16bit', true);
+dsr = deskewRotateFrame3D(deconvolved, ang, dz, xy, dsrArgs{:});
 clear deconvolved;
 dsr = uint16(dsr);                        % the wrapper's writetiff(uint16(dsr))
 stats.dsr_s = toc(t0);
