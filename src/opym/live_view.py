@@ -338,6 +338,53 @@ class QCOverlay:
         return qc_summary(self.raw.get(t))
 
 
+class PaintClock:
+    """Traces `painted`: when a timepoint naparym-live has shown is actually
+    on screen -- the first frame swapped after its layers were updated.
+
+    `shown` is recorded when `LiveFollower.poll` returns, before Qt has
+    painted anything: uploading the new volumes to the GPU and drawing them
+    happens in the paint that follows, and that is a hop of its own
+    (opym-live-trace's `paint`). vispy's Qt canvas is a QOpenGLWidget, whose
+    `frameSwapped` fires once a frame is on the window; without it (another
+    backend), the canvas's draw event stands in.
+    """
+
+    def __init__(self, jobs: Path | None = None) -> None:
+        self.jobs = jobs
+        self._pending: list[tuple[float, dict]] = []
+
+    def attach(self, viewer) -> bool:
+        try:
+            canvas = viewer.window._qt_viewer.canvas
+        except AttributeError:  # no Qt window (headless ViewerModel)
+            return False
+        swapped = getattr(canvas.native, "frameSwapped", None)
+        if swapped is not None:
+            swapped.connect(self.frame)
+        else:
+            canvas._scene_canvas.events.draw.connect(lambda _event: self.frame())
+        return True
+
+    def expect(self, **fields) -> None:
+        """A timepoint was just shown; trace the next frame as its paint."""
+        self._pending.append((time.time(), fields))
+
+    def frame(self) -> None:
+        if not self._pending:
+            return
+        now = time.time()
+        pending, self._pending = self._pending, []
+        for shown_at, fields in pending:
+            trace.record(
+                "painted",
+                name=trace.VIEW_TRACE_NAME,
+                jobs=self.jobs,
+                paint_s=now - shown_at,
+                **fields,
+            )
+
+
 class LiveFollower:
     """Keeps a napari viewer's layers in step with a growing store.
 
@@ -349,6 +396,7 @@ class LiveFollower:
     else from level 0 of the store.
 
     `replaces`: a previous feed's layers, taken down once this one's are up.
+    `painter`: traces when each shown timepoint is painted (`PaintClock`).
     """
 
     def __init__(
@@ -362,8 +410,10 @@ class LiveFollower:
         buffers_dir: Path | None = None,
         qc_dir: Path | None = None,
         replaces: list | None = None,
+        painter: PaintClock | None = None,
     ) -> None:
         self.viewer = viewer
+        self.painter = painter
         self.store = Path(store)
         self.follow = follow
         self.session_id = session_id
@@ -432,7 +482,7 @@ class LiveFollower:
             done |= {t for t, cs in have.items() if len(cs) >= self._n_c}
         return sorted(done)
 
-    def _add_layer(self, c: int, data, before, visible: bool, contrast):
+    def _add_layer(self, c: int, data, before, visible: bool, contrast, phases: dict):
         """Channel `c`, with `before`'s display settings if it replaces one,
         read once: at the viewer's timepoint.
 
@@ -467,11 +517,15 @@ class LiveFollower:
             visible=False,
             **settings,
         )
+        t0 = time.perf_counter()
         layer._slice_dims(self.viewer.dims)
         layer.visible = True
+        t1 = time.perf_counter()
         self.viewer.layers.append(layer)
         if not visible:  # setting it True again would read it again
             layer.visible = False
+        phases[f"slice_c{c}"] = t1 - t0
+        phases[f"append_c{c}"] = time.perf_counter() - t1
         return layer
 
     def _remove(self, layers: list) -> None:
@@ -538,7 +592,7 @@ class LiveFollower:
         if self.layers and done == self._shown:
             return
         new = [t for t in done if t not in self._shown]
-        self._rebuild(done, new)
+        phases = self._rebuild(done, new)
         self._shown = done
         if not new:
             return
@@ -552,9 +606,12 @@ class LiveFollower:
             timepoints=new,
             seen_s=seen_s,
             build_s=time.time() - seen_s,
+            phases={k: round(v, 4) for k, v in phases.items()},
         )
+        if self.painter is not None:
+            self.painter.expect(session_id=self.session_id, timepoints=new)
 
-    def _rebuild(self, done: list[int], new: list[int]) -> None:
+    def _rebuild(self, done: list[int], new: list[int]) -> dict[str, float]:
         """Swap in fresh layers, reading each channel once.
 
         napari reads (slices) a visible layer on every change that touches
@@ -566,14 +623,27 @@ class LiveFollower:
         2026-09-25). So the old layers are hidden and the slider moved
         first, and each new layer is read once, at the timepoint shown
         (`_add_layer`; `_time_axis_stub` for a session's first layers).
+
+        Returns how long each phase took, in seconds (traced with `shown`).
         """
+        phases: dict[str, float] = {}
+        tick = time.perf_counter()
+
+        def lap(name: str) -> None:
+            nonlocal tick
+            now = time.perf_counter()
+            phases[name] = now - tick
+            tick = now
+
         prev = self.layers
         old = prev + self._replaces
         target = max(new) if self.follow and new else None
         _group, _ms, self._series = self._open()
+        lap("open")
         contrast = None
         if not self._contrast_set and done:
             contrast = self._contrast(done, target)
+            lap("contrast")
         visible = [layer.visible for layer in prev]
         hidden = [layer for layer in old if layer.visible]
         fresh = not self.viewer.layers
@@ -586,16 +656,19 @@ class LiveFollower:
                 if not prev:
                     stub = self._time_axis_stub()
                 self.viewer.dims.set_current_step(0, target)
+            lap("slider")
             for c, data in enumerate(self._series):
                 before = prev[c] if c < len(prev) else None
                 shown = visible[c] if c < len(visible) else True
-                layers.append(self._add_layer(c, data, before, shown, contrast))
+                layers.append(self._add_layer(c, data, before, shown, contrast, phases))
+            tick = time.perf_counter()
         except Exception:
             self._remove([*layers, stub])
             for layer in hidden:
                 layer.visible = True
             raise
         self._remove([*old, stub])
+        lap("remove")
         if fresh:
             self.viewer.reset_view()  # napari fit the view to the stub
         self.layers = layers
@@ -613,6 +686,8 @@ class LiveFollower:
         # Now that the old ones are gone, restore the clean name.
         for layer in self.layers:
             layer.name = _NAPARI_DEDUP_SUFFIX.sub("", layer.name)
+        lap("tidy")
+        return phases
 
     def _contrast(self, done: list[int], target: int | None) -> list:
         """Per channel, from every 4th voxel of the timepoint about to be
@@ -649,8 +724,12 @@ class SessionWatcher:
         explicit_store: Path | None = None,
         follow: bool = True,
         jobs: Path | None = None,
+        painter: PaintClock | None = None,
+        title: str = "naparym-live",
     ) -> None:
         self.viewer = viewer
+        self.painter = painter
+        self.title = title
         self.explicit_store = explicit_store
         self.follow = follow
         self.jobs = jobs or lanes.jobs_dir()
@@ -701,6 +780,7 @@ class SessionWatcher:
                 session_id=session_id,
                 jobs=self.jobs,
                 replaces=list(self.viewer.layers),
+                painter=self.painter,
                 **(extra or {}),
             )
         except (OSError, KeyError, ValueError) as exc:
@@ -712,7 +792,7 @@ class SessionWatcher:
             return
         self.session_id = session_id
         self.follower = follower
-        self.viewer.title = f"naparym-live: {store.name}"
+        self.viewer.title = f"{self.title}: {store.name}"
 
     def poll(self) -> None:
         if self.explicit_store is not None:
@@ -744,6 +824,9 @@ def main(argv: list[str] | None = None) -> None:
         "--no-follow", action="store_true", help="don't jump to new timepoints"
     )
     ap.add_argument("--poll", type=float, default=POLL_S, help="seconds between checks")
+    ap.add_argument(
+        "--title", default="naparym-live", help="window title (e.g. for a test stack)"
+    )
     args = ap.parse_args(argv)
 
     import napari
@@ -755,9 +838,15 @@ def main(argv: list[str] | None = None) -> None:
     # but the no-argument "whatever's newest" case never has a bad path to
     # fail on, so it's the SessionWatcher's job, not this lookup's.
     explicit_store = resolve_store(args.store) if args.store else None
-    viewer = napari.Viewer(title="naparym-live", ndisplay=3)
+    viewer = napari.Viewer(title=args.title, ndisplay=3)
+    painter = PaintClock(jobs=lanes.jobs_dir())
+    painter.attach(viewer)
     watcher = SessionWatcher(
-        viewer, explicit_store=explicit_store, follow=not args.no_follow
+        viewer,
+        explicit_store=explicit_store,
+        follow=not args.no_follow,
+        painter=painter,
+        title=args.title,
     )
 
     @viewer.bind_key("f")

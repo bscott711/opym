@@ -73,7 +73,8 @@ if getp(p, 'objective_scan', false) || getp(p, 'z_stage_scan', false)
 end
 
 if ~exist(deconDir, 'dir'), mkdir(deconDir); end
-stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'view_s', 0, 'write_s', 0);
+stats = struct('frames', 1, 'read_s', 0, 'decon_s', 0, 'dsr_s', 0, 'view_s', 0, 'write_s', 0, ...
+    'buffer_at', NaN, 'store_at', NaN);
 cacheRoot = char(getp(p, 'psf_cache_dir', deconDir));
 
 % --- once per PSF cache: generated PSF, exactly as XR_decon_data_wrapper ---
@@ -179,9 +180,14 @@ viewNpy = '';
 if isfield(p, 'view_npy') && ~isempty(p.view_npy)
     viewNpy = char(p.view_npy);
 end
+% (Absolute times too, for opym-live-trace: the view buffer is what the
+% viewer shows, so its landing time is where the viewer's hops start.)
+tCall = posixtime(datetime('now', 'TimeZone', 'UTC'));
 tt = opymWriteLiveOutputs(dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]);
 stats.view_s = tt(1);
 stats.write_s = tt(2);
+stats.buffer_at = tCall + tt(1);
+stats.store_at = tCall + tt(1) + tt(2);
 end
 
 

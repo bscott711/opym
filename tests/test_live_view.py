@@ -358,6 +358,49 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     assert shown["ev"] == "shown" and shown["session_id"] == "sess-v"
     assert shown["timepoints"] == [0]
     assert shown["build_s"] >= 0 and shown["seen_s"] <= shown["at"]
+    assert {"open", "slider", "slice_c0", "append_c1", "remove"} <= set(shown["phases"])
+
+
+def test_paint_clock_traces_the_first_frame_after_a_timepoint_is_shown(tmp_path):
+    """`painted` closes opym-live-trace's view path: the paint after `shown`
+    (texture upload + draw), traced once per shown batch."""
+    from opym.stream import trace
+
+    clock = live_view.PaintClock(jobs=tmp_path)
+    clock.frame()  # a repaint with nothing shown: not traced
+    clock.expect(session_id="sess-p", timepoints=[4])
+    clock.frame()
+    clock.frame()  # later frames (a rotation, say) are not paints of t=4
+    [painted] = trace.read(trace.VIEW_TRACE_NAME, jobs=tmp_path)
+    assert painted["ev"] == "painted" and painted["timepoints"] == [4]
+    assert painted["session_id"] == "sess-p" and painted["paint_s"] >= 0
+
+
+def test_paint_clock_needs_a_qt_window():
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    assert live_view.PaintClock().attach(ViewerModel()) is False
+
+
+def test_watcher_hands_its_paint_clock_to_each_follower(tmp_path):
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    from opym.stream import trace
+
+    jobs = tmp_path / "jobs"
+    store = _store(tmp_path)
+    _write_latest(jobs, store, "sess-w")
+    clock = live_view.PaintClock(jobs=jobs)
+    watcher = live_view.SessionWatcher(ViewerModel(), jobs=jobs, painter=clock)
+    watcher.poll()
+    done: list = []
+    _finish(store, 0, done)
+    watcher.poll()
+    clock.frame()
+    evs = [e["ev"] for e in trace.read(trace.VIEW_TRACE_NAME, jobs=jobs)]
+    assert evs == ["shown", "painted"]
 
 
 def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
