@@ -4,7 +4,8 @@
 #   lv-receive  a receiver on 127.0.0.1:$PORT with the one-format live lane
 #   lv-qc       CORE's live QC service on the test jobs dir
 #   lv-sample   GPU / RAM disk / memory / production-activity sampler
-# usage: stack.sh up | down | status | clean
+# usage: stack.sh up | down | status | clean | receiver
+#   receiver: (re)start only lv-receive, e.g. after killing it mid-run (R3)
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -33,12 +34,7 @@ up() {
     --setenv=OPYM_LIVE_PREEMPT=1 --setenv=OPYM_LIVE_PREEMPT_AFTER_S=30 \
     -p StandardOutput="append:$LV/logs/lv-serve.log" -p StandardError="append:$LV/logs/lv-serve.log" \
     "$PY" -m opym.local_gpu_worker
-  systemd-run "${common[@]}" --unit=lv-receive \
-    --setenv=OPYM_DECON_PSF="$PSF" --setenv=OPYM_STREAM_STAGE_ROOT="$STAGE" \
-    --setenv=OPYM_LIVE_LANE=1 --setenv=OPYM_LIVE_QC=1 --setenv=OPYM_LIVE_FORMAT=zarr \
-    --setenv=OPYM_LIVE_VIEW_ROOT="$VIEW" \
-    -p StandardOutput="append:$LV/logs/lv-receive.log" -p StandardError="append:$LV/logs/lv-receive.log" \
-    "$PY" "$LB_DIR/receiver.py" --bind "tcp://127.0.0.1:$PORT"
+  receiver
   if [ -x "$HOME/projects/CORE/.venv/bin/celldet-live-qc" ]; then
     systemd-run --user --collect --unit=lv-qc -p WorkingDirectory="$HOME/projects/CORE" \
       --setenv=CUDA_VISIBLE_DEVICES= --setenv=OMP_NUM_THREADS=4 --setenv=PYTHONUNBUFFERED=1 "$thp" \
@@ -49,6 +45,17 @@ up() {
     -p StandardOutput="append:$LV/logs/lv-sample.log" -p StandardError="append:$LV/logs/lv-sample.log" \
     "$PY" "$LB_DIR/sample.py" --out "$LV/sample.jsonl"
   status
+}
+
+receiver() {
+  if systemctl --user is-active -q lv-receive; then echo "lv-receive already running" >&2; exit 1; fi
+  systemctl --user reset-failed lv-receive 2>/dev/null || true
+  systemd-run "${common[@]}" --unit=lv-receive \
+    --setenv=OPYM_DECON_PSF="$PSF" --setenv=OPYM_STREAM_STAGE_ROOT="$STAGE" \
+    --setenv=OPYM_LIVE_LANE=1 --setenv=OPYM_LIVE_QC=1 --setenv=OPYM_LIVE_FORMAT=zarr \
+    --setenv=OPYM_LIVE_VIEW_ROOT="$VIEW" \
+    -p StandardOutput="append:$LV/logs/lv-receive.log" -p StandardError="append:$LV/logs/lv-receive.log" \
+    "$PY" "$LB_DIR/receiver.py" --bind "tcp://127.0.0.1:$PORT"
 }
 
 down() {
