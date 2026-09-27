@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A test naparym-live on the DCV display, following the test stack.
 # usage: viewer.sh start | stop | shot NAME
+#   LB_VIEWER_ARGS: extra naparym-live flags, e.g. "--bits 16 --vram-gb 0"
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 export DISPLAY="${LB_DISPLAY:-:2}"
@@ -9,7 +10,7 @@ case "${1:-}" in
   start)
     mkdir -p "$LV/logs" "$LV/shots"
     PETAKIT_JOBS_DIR="$JOBS" PYTHONPATH="$WT/src" setsid nohup "$PY" -m opym.live_view \
-      --title "naparym-live [TEST]" >>"$LV/logs/viewer.log" 2>&1 &
+      --title "naparym-live [TEST]" ${LB_VIEWER_ARGS:-} >>"$LV/logs/viewer.log" 2>&1 &
     echo $! >"$LV/viewer.pid"; echo "test viewer pid $(cat "$LV/viewer.pid")" ;;
   stop)
     [ -f "$LV/viewer.pid" ] && kill "$(cat "$LV/viewer.pid")" 2>/dev/null || true
