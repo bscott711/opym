@@ -23,3 +23,18 @@ scripts/live_bench/stack.sh down && scripts/live_bench/stack.sh clean
 Results land in `~/projects/bioimaging/logs/live-view-2026-09-26/<run>/`:
 `report.txt` (`opym-live-trace` per hop), `summary.json`, `timeline.csv`,
 `verify.json`, the raw traces and GPU profiles, and screenshots.
+
+## Fault tests (R1–R6)
+
+Run each during a replay into the test stack; the pass bar is no manual
+action and every (t, c) bit-identical, processed and archived (`collect.sh`).
+
+| | Fault | How | Result (2026-09-26) |
+|---|---|---|---|
+| R1 | A server hangs on a live ticket | `inject_fault.py lv1 stop 80` beside a replay | killed at 32 s, ticket to the other GPU; one timepoint 30 s late |
+| R2 | A server crashes | `inject_fault.py lv2 kill 240` | requeued on the next pass, no timepoint delayed |
+| R3 | The receiver crashes | `kill -9` lv-receive's pid, then `stack.sh receiver`; drive the run with `gui_replay_direct.py` (only pymmcore-gui's session code resumes) | resumed live in 10 s, 60/60 bit-identical |
+| R4 | naparym-live restarts; a new session | `viewer.sh start`, kill its pid mid-run, start again; run a second replay | reattached within 15 s; followed the new session |
+| R5 | RAM-disk pressure | `OPYM_STREAM_STAGE_FLOOR_GB` high enough to trip it | unit-tested only |
+| R6 | A session starts while both GPUs run backfill | copy a dataset, `queue_backfill.py TICKET DATA`, wait for both claims, then replay (with and without `--prepare-s`) | not run yet |
+
