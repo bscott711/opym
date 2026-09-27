@@ -74,13 +74,16 @@ def matlab_engine():
         pytest.skip(f"No usable CUDA GPU for matlab.engine: {e}")
 
     eng.addpath(str(OPYM_SRC_DIR), nargout=0)
-    eng.addpath(str(OPYM_SRC_DIR / "patches"), nargout=0)
     if eng.exist("XR_deskew_rotate_data_wrapper", "file", nargout=1) == 0:
         setup_m = PETAKIT_ROOT / "setup.m"
         if not setup_m.exists():
             eng.quit()
             pytest.skip(f"PetaKit5D setup.m not found at {setup_m}")
         eng.run(str(setup_m), nargout=0)
+    # After setup.m, as run_petakit_server.m does: setup.m prepends
+    # PetaKit5D's own directories, so patches/ added before it lost to the
+    # shared copies it is meant to shadow.
+    eng.addpath(str(OPYM_SRC_DIR / "patches"), "-begin", nargout=0)
 
     yield eng
     eng.quit()

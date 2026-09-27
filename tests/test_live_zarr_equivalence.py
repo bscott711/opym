@@ -52,6 +52,14 @@ def eng(matlab_engine):
     return matlab_engine
 
 
+def test_the_engine_runs_opyms_patches_not_the_shared_copies(eng):
+    """What the servers run: patches/ shadows the shared PetaKit5D install
+    (run_petakit_server.m adds it after setup.m)."""
+    for fn in ("decon_lucy_omw_function", "decon_lucy_function", "XR_deskewRotateFrame"):
+        where = eng.which(fn, nargout=1)
+        assert "/opym/patches/" in where, (fn, where)
+
+
 def _run(eng, ticket: Path, fn: str) -> None:
     eng.eval(
         f"job = jsondecode(fileread('{ticket}')); {fn}(job.parameters, 16);", nargout=0
