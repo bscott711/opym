@@ -38,3 +38,18 @@ action and every (t, c) bit-identical, processed and archived (`collect.sh`).
 | R5 | RAM-disk pressure | restart the receiver with a high floor, `LB_STAGE_FLOOR_GB=N stack.sh receiver`; for hold-back, a `fallocate` filler under `/dev/shm/opym_lv` and `gui_replay_direct.py` | eviction: 4 drained sessions oldest first, then finished view stores (never the newest), a running session untouched (20/20), evicted ones still 60/60 from GPFS; hold-back: 4 T held, 40/40 after space came back, but only once the client called its link stale (~3 min): the receiver now asks for a resend at once |
 | R6 | A session starts while both GPUs run backfill | copy a dataset, `queue_backfill.py TICKET DATA` (each split ticket gets its own hard-linked data dir), wait for both claims, then replay (with and without `--prepare-s`) | one GPU preempted at once, the other joined live after its ticket; T0 last plane → painted 4.06 s without PREPARE (GFP 9.6 s), 0.76 s with; live queue ≤ 1; 60/60 both runs; the killed ticket's half-written outputs are now swept |
 
+
+## Viewer benches (2026-09-27)
+
+- `viewer_bench.py` times rotation and time-slider steps in a naparym-live on
+  DCV `:2`, each step split into read / `set_data` / GL flush (the upload) /
+  the rest, and by the texture path it took. `LB_BITS=8|16`,
+  `LB_VRAM_GB=0|N|auto`, `LB_VRAM_RESERVE_GB`; `OPYM_VIEW_RESIDENT=0` turns off
+  the off-screen draw that places cached textures in VRAM.
+- `bitdepth_compare.py [STORE] --t T` opens one timepoint as 16-bit | 8-bit |
+  8-bit wide, side by side with one camera, to judge the 8-bit display by eye.
+- `LB_VIEW_BITS=8|16 stack.sh receiver` picks the view buffers' bit depth;
+  `LB_VIEWER_ARGS="--bits 16 --vram-gb 0" viewer.sh start` the test viewer's.
+
+Results: `bioimaging/logs/live-view-2026-09-26/viewer-bench-vram/` and the
+`lv_bits*`, `lv_g*`, `lv_fft` runs.
