@@ -115,11 +115,11 @@ def _run_deskew_only(matlab_engine, tmp_path: Path, raw_volume: np.ndarray) -> n
         name_value_args.append(v)
 
     # No psf_path / decon parameters anywhere in this call -- that IS the
-    # decon skip. nargout=2 matches `function [ds, dsr] = XR_deskewRotateFrame(...)`;
-    # DSRCombined=True means `ds` is unset/empty (the DS-only branch is
-    # skipped entirely), so only `dsr` is used below.
+    # decon skip. nargout=0: DSRCombined=True leaves `ds` unassigned (the
+    # DS-only branch is skipped entirely), and MATLAB refuses to return an
+    # unassigned output; the result is read back from the DSR TIFF below.
     matlab_engine.XR_deskewRotateFrame(
-        str(frame_path), XY_PIXEL_SIZE, DZ, *name_value_args, nargout=2
+        str(frame_path), XY_PIXEL_SIZE, DZ, *name_value_args, nargout=0
     )
 
     dsr_dir = frame_path.parent / DSR_KWARGS["DSRDirName"]
