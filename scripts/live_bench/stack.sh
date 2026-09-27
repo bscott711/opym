@@ -7,7 +7,8 @@
 # usage: stack.sh up | down | status | clean | receiver
 #   receiver: (re)start only lv-receive, e.g. after killing it mid-run (R3)
 # LB_STAGE_FLOOR_GB=N sets lv-receive's RAM-disk floor (R5; default: the
-# receiver's own, 20 GB).
+# receiver's own, 20 GB); LB_VIEW_BITS=8|16 its view buffers' bit depth
+# (default: the receiver's own, 8).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -54,6 +55,7 @@ receiver() {
   systemctl --user reset-failed lv-receive 2>/dev/null || true
   local floor=()
   [ -n "${LB_STAGE_FLOOR_GB:-}" ] && floor=(--setenv=OPYM_STREAM_STAGE_FLOOR_GB="$LB_STAGE_FLOOR_GB")
+  [ -n "${LB_VIEW_BITS:-}" ] && floor+=(--setenv=OPYM_LIVE_VIEW_BITS="$LB_VIEW_BITS")
   systemd-run "${common[@]}" "${floor[@]}" --unit=lv-receive \
     --setenv=OPYM_DECON_PSF="$PSF" --setenv=OPYM_STREAM_STAGE_ROOT="$STAGE" \
     --setenv=OPYM_LIVE_LANE=1 --setenv=OPYM_LIVE_QC=1 --setenv=OPYM_LIVE_FORMAT=zarr \
