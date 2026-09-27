@@ -1,5 +1,6 @@
-"""Once a second: GPU use per device, RAM disk and memory, and whether
-production is busy (a contaminated test window shows up here)."""
+"""Once a second: GPU use per device, RAM disk and memory, huge-page
+compaction, and whether production is busy (a contaminated test window shows
+up here)."""
 
 import argparse
 import json
@@ -37,6 +38,18 @@ def mem_available_gb() -> float:
     return float("nan")
 
 
+def vmstat() -> dict:
+    """Cumulative, machine-wide counters: a rise in compact_stall during a run
+    means some allocation waited on direct compaction (THP defrag)."""
+    keep = ("compact_stall", "thp_fault_alloc", "thp_fault_fallback")
+    out = {}
+    for line in Path("/proc/vmstat").read_text().splitlines():
+        key, _, val = line.partition(" ")
+        if key in keep:
+            out[key] = int(val)
+    return out
+
+
 def count(d: Path) -> int:
     try:
         return sum(1 for p in d.iterdir() if not p.name.startswith("."))
@@ -57,6 +70,7 @@ while True:
         "shm_used_gb": round(shm.used / 1e9, 2),
         "mem_available_gb": round(mem_available_gb(), 2),
         "load1": os.getloadavg()[0],
+        **vmstat(),
         "prod_claims": count(PROD / "claims"),
         "prod_queue": count(PROD / "queue"),
         "prod_queue_live": count(PROD / "queue_live"),
