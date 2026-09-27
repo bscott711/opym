@@ -55,8 +55,9 @@ Argus (micro001)                                          v
      read (cpp-zarr N-D mex) -> OMW decon, 2 iterations (GPU) -> linear deskew/rotate
      -> opymWriteLiveOutputs: view buffer .npy FIRST, then the processed store
      │
-     ├──> buffers/T<t>_C<c>.npy on /dev/shm (uncompressed, 419 × 1458 × 833, 1.02 GB)
-     │        └──> naparym-live (mmap, full resolution, 3D) ──> DCV ──> your screen
+     ├──> buffers/T<t>_C<c>.npy on /dev/shm (uncompressed 8-bit, 419 × 1458 × 833, 0.51 GB;
+     │        each channel's shift in buffers/display_C<c>.json)
+     │        └──> naparym-live (mmap, full resolution, 3D, 8-bit) ──> DCV ──> your screen
      └──> processed OME-Zarr on /dev/shm (bioformats2raw layout 3: 3 levels + Z-MIP)
               └──> archived per (t, c) to <leaf>/viewer/<base>_dsr.ome.zarr on GPFS
 
@@ -83,30 +84,29 @@ Code, in path order:
 
 Shape: 161 planes × 490 × 1458, 2 channels, dz 0.5 µm. The table follows
 the last channel (561), from its last plane: GFP was processed about one
-stack earlier and is waiting.
+stack earlier and is already on screen (about 6.5 s ahead of the full
+timepoint).
 
-**Status: estimates.** The wire hop is measured (2026-09-26 replays from the
-PC). The GPU steps come from production profiles of full-size timepoints.
-The viewer steps come from a DCV session on 2026-09-26. The first full
-end-to-end measurement is in progress; this table will be replaced by it.
+**Measured 2026-09-27** on the test stack (`scripts/live_bench`, run
+`lv_fft`): 30 timepoints replayed from Argus at the rig's pace (13.2 s per
+timepoint), 8-bit view buffers, FFT-friendly decon, test naparym-live on
+DCV. The wire hop is from the PC replays (2026-09-26); on Argus it is ~0.01 s.
 
-| After the last plane | Time | What happens |
+| After the last plane | p50 (p95) | What happens |
 |---|---|---|
-| Last slab on the wire | 0.09 s p50, 0.22 s p95 (measured) | The final ~6 MB leaves on a free link. |
-| Staged, ticket queued | ~0.02–0.05 s | The receiver writes the slab, marks (t, 561) complete, and the lane writes its `live_zarr` ticket in the same loop pass. |
-| Claimed | ≤ 0.02 s | Servers poll `queue_live/` every 0.02 s while a lease is held. |
-| Read | 0.02–0.04 s | Straight from the RAM-disk raw store into decon orientation. |
-| Decon | 0.46–0.52 s | OMW, 2 iterations, on the GPU. The largest GPU step. |
-| Deskew/rotate | 0.06–0.09 s | Linear. |
-| View buffer written | 0.05–0.06 s | Uncompressed `.npy`, published before anything is encoded. |
-| Viewer notices | ≤ 0.1 s | naparym-live polls every 0.1 s. |
-| Layers built | ~0.7 s | Both channels' layers are rebuilt each timepoint; the layer thumbnail alone costs 0.17 s per channel. |
-| Painted | ~0.6 s | Two 1 GB 3D textures uploaded to the GPU, GFP's included, although it was ready one stack earlier. |
-| **Last plane → on screen** | **~2.2 s typical, up to ~2.4 s (estimate)** | About 60% of it is the viewer. |
+| Last slab on the wire | 0.09 s (0.22 s), PC over 4 links | The final ~6 MB leaves on a free link. |
+| Staged, ticket queued | 0.01 s (0.02 s) | The receiver writes the slab, marks (t, 561) complete, and the lane writes its `live_zarr` ticket in the same loop pass. |
+| Claimed | 0.02 s (0.03 s) | Servers poll `queue_live/` every 0.02 s while a lease is held. |
+| Read, decon, DSR, view buffer | 0.34 s (0.40 s) | read 0.04, OMW decon 0.19 (2 iterations, GPU, z padded 161 → 162), linear DSR 0.03, 8-bit view buffer 0.07. |
+| Viewer notices | 0.06 s (0.09 s) | naparym-live polls every 0.1 s. |
+| Built | 0.08 s (0.11 s) | The layers stay; the time slider moves and the new channel is re-read in place from the mapped buffer. |
+| Painted | 0.08 s (0.09 s) | One 0.5 GB 8-bit texture uploaded. |
+| **Last plane → on screen** | **0.60 s (0.65 s)** | Flat: −3.6 ms per timepoint over the run; 60/60 volumes bit-identical, processed and archived. |
 
 Off the view path, after the buffer: the pyramid and Z-MIP are written into
-the processed store (0.13–0.16 s), the lane archives the chunks to GPFS, and
-the live QC verdict reaches pymmcore-gui about 0.9 s after the last plane.
+the processed store (0.15 s), the lane archives the chunks to GPFS (0.41 s),
+and the live QC verdict reaches pymmcore-gui about 0.9 s after the last
+plane.
 
 **Cold start.** If the servers have been idle for an hour
 (`PETAKIT_IDLE_TIMEOUT`, 3600 s in production), the first timepoint takes
@@ -131,6 +131,9 @@ steady one does.
 | **Live queue first, lease, preemption** | Streaming always has a GPU. A backfill server is killed and its ticket requeued when live work has none. | Waiting for backfill tickets, which run for minutes. |
 | **View buffer before the store** | The viewer maps the uncompressed volume; it never waits on encoding. | The viewer decoding 1 GB per channel from the compressed store every timepoint. |
 | **Full resolution in the viewer** | napari's 3D view only ever renders a multiscale's coarsest level. | Multiscale layers (a quarter of the resolution). |
+| **8-bit display, written by the GPU server** | Half the bytes to write, map and upload: last plane → painted 0.73 → 0.63 s p50, scrubbing ~35% faster. Side by side on DCV, 16-bit and 8-bit looked the same: the processed data spans ~60–800 counts, and each channel keeps ≥ 120 grey levels below its display window (a per-session power-of-two shift, `display_C<c>.json`). The stores stay 16-bit. | Converting in the viewer (paint 0.13 → 0.07 s, but the conversion cost as much on the UI thread). |
+| **FFT-friendly decon sizes** | cuFFT is slow on large primes (161 = 7 × 23): padding to 162 takes the decon from 0.21 to 0.19 s. Differences ≤ 14 counts at a few voxels; live and batch both pad. | Unpadded (the archives before 2026-09-27). |
+| **No VRAM texture cache by default** (`--vram-gb`) | Measured: a cached timepoint still costs ~0.1 s per step (after the upload, not paging), and once dozens of textures exist, misses slow from 0.14 to ~0.4 s. | On by default (the fixes and a residency draw are in; it stays opt-in). |
 | **Session warm-up and shared PSF cache; no GPU reset between live tickets** | The first timepoint costs what the others do; cached OTFs and FFT plans are reused. | Resetting the GPU after each ticket (about 0.3 s, and loses the caches). |
 | **Claims by one rename(2)** | Atomic between two servers. MATLAB's `movefile` lost the winner's claim in 7 of 150 contested claims. | `movefile`. |
 | **Channel 2 in magenta** | The lab's standard: green/magenta, never red/green. | Red. |
@@ -142,7 +145,8 @@ steady one does.
 | 2026-09-25 morning | about 28 s (about 2.2 timepoints behind) | Wire: 13 s through one SSH tunnel at 31–35 MB/s. GPFS copy-out: 10 s. MATLAB: 3 s. napari: 1.5 s. |
 | 2026-09-25 evening | 0.62–0.71 s to *viewable* (buffers and store written) | One-format lane and perf round: GPU time per (t, c) 3.4 s → 0.6–1.0 s, server boot 60 s → 10 s. |
 | 2026-09-26 | wire 0.09 s p50 / 0.22 s p95 | 4 parallel links. Every replayed volume bit-identical. |
-| next | to be measured end to end | This round: measure every hop to *painted*, then cut the largest. |
+| 2026-09-26 | 2.41 s p50 / 2.98 s p95 to *painted* (PC replay, 100 T) | The viewer, ~80%: layers rebuilt every timepoint. Reworked (in-place layers, per-channel follow): 0.73 s p50 / 0.82 s p95 (local replays; the report counted this wrong until 2026-09-27, see opym#34). |
+| 2026-09-27 | **0.60 s p50 / 0.65 s p95** to *painted* | 8-bit view buffers from the GPU server (−0.10 s) and FFT-friendly decon (−0.015 s per ticket). |
 
 ## When something fails
 
@@ -155,16 +159,20 @@ steady one does.
 | A live ticket fails | Retried once, then that timepoint is left to the batch backfill. |
 | A MATLAB server dies | The supervisor requeues its ticket on the next pass (2 s) and relaunches it after 15 s. Tested: SIGKILL mid-ticket, no timepoint delayed. |
 | A MATLAB server hangs on a live ticket | Killed 30 s after its claim (`OPYM_SERVE_LIVE_DEADLINE_S`) and the ticket requeued for the other GPU. Tested: SIGSTOP mid-ticket, that one timepoint shown 30 s late, the next on time. Backfill tickets keep the 60 min `OPYM_SERVE_HANG_MIN` check. |
-| Both GPUs are on backfill when a session starts | One backfill server is killed at once and its ticket requeued; the second after a live ticket waits 30 s. A PREPARE while the MDA is set up does the first part before the run starts. Not yet measured under a real backfill load (R6). |
-| The RAM disk runs short | Below twice `OPYM_STREAM_STAGE_FLOOR_GB` (20) free, drained sessions are evicted early, then finished view stores. Below the floor, frames are held back unACKed; the client resends them, or pauses if space never returns. |
+| Both GPUs are on backfill when a session starts | One backfill server is killed at once and its ticket requeued (not counted against its cap), and its half-written outputs removed; the other finishes its ticket, then takes live work. A PREPARE while the MDA is set up does the first part before the run starts. Tested (R6, a real 6-minute backfill ticket on both GPUs): first timepoint 4.1 s without PREPARE, 0.76 s with; the live queue never above 1; both backfill tickets completed afterwards. |
+| The RAM disk runs short | Below twice `OPYM_STREAM_STAGE_FLOOR_GB` (20) free, drained sessions are evicted early, oldest first, then finished view stores (never the newest one). Below the floor, frames are held back unACKed; once space is back the receiver asks the client to resend them at once (an ACK with `resend`), or the client pauses if space never returns. Tested (R5): eviction with a session running, 20/20 untouched; hold-back released 40 ms after space returned, 40/40 bit-identical. |
 | The live lane's work is lost with the receiver | `.live_status.json` goes stale after 300 s, and the backfill reprocesses the dataset in batch. |
 | naparym-live is (re)started mid-session | It follows the newest session and reads timepoints whose buffers are gone from the store. Tested: SIGKILL and relaunch mid-run, showing the newest timepoint with the whole time axis within 15 s; a new session is followed on its own. |
 
 Known gaps:
 
-- R6 is not measured yet: a session starting while both GPUs run long
-  backfill tickets (`scripts/live_bench/queue_backfill.py` sets it up).
-- The RAM-disk floor is unit-tested, not yet exercised on the test stack.
+- A scrub step to a timepoint already in memory still takes ~0.1 s after
+  its upload is done (napari's re-slice and draw), even from a texture in
+  VRAM.
+- The paused path (the client's buffer overflows while the RAM disk stays
+  full) is unit-tested only.
+- `test_deskew_only_regression` fails: its no-decon peaks don't match the
+  decon-included golden, and its own golden was never committed.
 
 ## Measuring it
 
