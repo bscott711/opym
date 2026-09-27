@@ -6,6 +6,8 @@
 #   lv-sample   GPU / RAM disk / memory / production-activity sampler
 # usage: stack.sh up | down | status | clean | receiver
 #   receiver: (re)start only lv-receive, e.g. after killing it mid-run (R3)
+# LB_STAGE_FLOOR_GB=N sets lv-receive's RAM-disk floor (R5; default: the
+# receiver's own, 20 GB).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -50,7 +52,9 @@ up() {
 receiver() {
   if systemctl --user is-active -q lv-receive; then echo "lv-receive already running" >&2; exit 1; fi
   systemctl --user reset-failed lv-receive 2>/dev/null || true
-  systemd-run "${common[@]}" --unit=lv-receive \
+  local floor=()
+  [ -n "${LB_STAGE_FLOOR_GB:-}" ] && floor=(--setenv=OPYM_STREAM_STAGE_FLOOR_GB="$LB_STAGE_FLOOR_GB")
+  systemd-run "${common[@]}" "${floor[@]}" --unit=lv-receive \
     --setenv=OPYM_DECON_PSF="$PSF" --setenv=OPYM_STREAM_STAGE_ROOT="$STAGE" \
     --setenv=OPYM_LIVE_LANE=1 --setenv=OPYM_LIVE_QC=1 --setenv=OPYM_LIVE_FORMAT=zarr \
     --setenv=OPYM_LIVE_VIEW_ROOT="$VIEW" \

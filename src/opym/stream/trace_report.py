@@ -23,8 +23,12 @@ finish (store -> ticket completed), reap (completed -> the lane noticed),
 archive (noticed -> every channel's chunks copied to GPFS).
 
 A timepoint's time at each point is its LAST channel's: the view can't show
-t until every channel of t is there. Client times are converted to Argus
-time with the offset the client measured (see protocol.py). The headline is
+t until every channel of t is there. naparym-live shows each channel as soon
+as it lands (GFP about one stack before mScarlet), so t is shown and painted
+when its last channel is; the per-channel rows give each channel's own lag,
+and how far ahead of the whole timepoint it was on screen. Client times are
+converted to Argus time with the offset the client measured (see
+protocol.py). The headline is
 "last plane -> painted" when both ends exist, falling back to "received"
 for the start and "shown" (layers updated) for the end. Flatness: the
 least-squares slope of the headline lag against t, and its p95 over the
@@ -217,23 +221,68 @@ def timeline(
             and e["recv_s"] > sent
         ]
 
-    # naparym-live: the first time each timepoint was shown, and the first
-    # frame painted after that.
+    # Each channel's own points, for the per-channel rows.
+    chan: dict[int, dict[int, dict]] = {}
+    for (t, c), pts in per_tc.items():
+        if c is not None:
+            chan.setdefault(t, {})[int(c)] = {
+                k: pts.get(k) for k in ("ticket", "claim", "buffer")
+            }
+    for t, evs in frames.items():
+        for e in evs:
+            if e.get("c") is None:
+                continue
+            p = chan.setdefault(t, {}).setdefault(int(e["c"]), {})
+            p["recv"] = _latest([p.get("recv"), e.get("recv_s")])
+            p["acq_last"] = _latest(
+                [p.get("acq_last"), _client_time(e, "acq_last_s", session_offset)]
+            )
+
+    # naparym-live: when each channel of a timepoint was first shown, and
+    # the first frame painted after that. Events name their channels; a
+    # viewer that predates showing them one at a time doesn't, and its
+    # events cover every channel (key c = None).
+    view: dict[tuple[int, int | None], dict] = {}
     for e in sorted(view_events, key=lambda e: e.get("at", 0)):
         if e.get("session_id") != session_id:
             continue
         for t in e.get("timepoints") or ():
-            r = rows.setdefault(int(t), {"tickets": []})
-            if e.get("ev") == "shown" and r.get("shown") is None:
-                r["shown"] = e["at"]
-                r["seen"] = e.get("seen_s")
-                r["phases"] = e.get("phases")
-            elif (
-                e.get("ev") == "painted"
-                and r.get("shown") is not None
-                and r.get("painted") is None
-            ):
-                r["painted"] = e["at"]
+            rows.setdefault(int(t), {"tickets": []})
+            for c in e.get("channels") or [None]:
+                v = view.setdefault((int(t), c), {})
+                if e.get("ev") == "shown" and "shown" not in v:
+                    v.update(
+                        shown=e["at"], seen=e.get("seen_s"), phases=e.get("phases")
+                    )
+                elif e.get("ev") == "painted" and "shown" in v and "painted" not in v:
+                    v["painted"] = e["at"]
+
+    for t, r in rows.items():
+        channels = chan.get(t, {})
+        whole = view.get((t, None))
+        if whole is not None:
+            views = {c: whole for c in channels} or {None: whole}
+        else:
+            views = {
+                c: view.get((t, c), {})
+                for c in set(channels) | {c for (tt, c) in view if tt == t}
+            }
+        # t is on screen once its last channel is.
+        if views and all("shown" in v for v in views.values()):
+            last = max(views.values(), key=lambda v: v["shown"])
+            r["shown"], r["seen"], r["phases"] = (
+                last["shown"],
+                last["seen"],
+                last["phases"],
+            )
+            if all("painted" in v for v in views.values()):
+                r["painted"] = max(v["painted"] for v in views.values())
+        for c, v in views.items():
+            if c is not None:
+                p = channels.setdefault(c, {})
+                p["shown"], p["painted"] = v.get("shown"), v.get("painted")
+        if channels:
+            r["channels"] = channels
     return rows
 
 
@@ -317,6 +366,28 @@ def gpu_breakdown(rows: dict[int, dict], profiles: dict) -> dict[str, dict]:
     return out
 
 
+def channel_summary(rows: dict[int, dict]) -> dict[str, dict]:
+    """Per channel: its own headline lag (its last plane -> it painted) and
+    flatness, and how far ahead of the whole timepoint it was on screen."""
+    start, end = headline_points(rows)
+    out = {}
+    for c in sorted({c for r in rows.values() for c in r.get("channels", {})}):
+        points, ahead = [], []
+        for t, r in rows.items():
+            p = r.get("channels", {}).get(c, {})
+            if p.get(start) is not None and p.get(end) is not None:
+                points.append((t, p[end] - p[start]))
+            if p.get(end) is not None and r.get(end) is not None:
+                ahead.append(r[end] - p[end])
+        points.sort()
+        out[str(c)] = {
+            "headline": _stats([y for _, y in points]),
+            "flatness": flatness(points),
+            "ahead_s": _stats(ahead),
+        }
+    return out
+
+
 def summarize(rows: dict[int, dict], profiles: dict | None = None) -> dict:
     start, end = headline_points(rows)
     lag_points = lags(rows)
@@ -332,6 +403,7 @@ def summarize(rows: dict[int, dict], profiles: dict | None = None) -> dict:
         "headline_to": end,
         "headline": _stats([y for _, y in lag_points]),
         "flatness": flatness(lag_points),
+        "channels": channel_summary(rows),
         "arrival_interval": _stats([b - a for a, b in zip(recv, recv[1:])]),
         "wire_mb_per_s": _stats(wire),
         "gpu_servers": gpu_breakdown(rows, profiles or {}),
@@ -417,6 +489,9 @@ def main(argv: list[str] | None = None) -> None:
             f" p95 first third {flat['first_third_p95']:.2f} s,"
             f" last third {flat['last_third_p95']:.2f} s"
         )
+    for c, ch in summary["channels"].items():
+        print(f"  channel {c:<10}{_fmt(ch['headline'])}")
+        print(f"    {'ahead of t':<16}{_fmt(ch['ahead_s'])}")
     print("off the view path")
     for name, _a, _b in SIDE_PATH:
         print(f"  {name:<18}{_fmt(summary['side'][name])}")
