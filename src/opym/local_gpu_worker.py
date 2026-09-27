@@ -15,6 +15,10 @@ Supervisor for the PetaKit job queue: one PetaKit5D MATLAB server
 - A claim whose dataDir has had no file written for `hang_after_s` is
   flagged; with `kill_hung`, its server is killed, which requeues the ticket
   and frees the GPU.
+- A live claim held longer than `live_deadline_s` (a live ticket takes
+  under a second, ~10 s cold) is treated as hung at once: its server is
+  killed (SIGKILL after a short grace) and the ticket requeued, so the live
+  view loses seconds instead of the hour the dataDir check allows.
 - Live work goes first (see opym.lanes). Servers are started as soon as a
   live lease or a warm lease (an acquisition being set up) appears, and if
   a live ticket has waited `preempt_after_s` while a server works on a
@@ -91,6 +95,11 @@ HANG_CHECK_EVERY_S = 300.0
 ORPHAN_SWEEP_EVERY_S = 60.0
 DEFAULT_PREEMPT_AFTER_S = 30.0
 KILL_GRACE_S = 20.0
+# A live ticket runs in ~0.5 s warm and ~10 s cold (PSF cache built, code
+# compiled); past this, its server is hung. A stopped or wedged Matlab may
+# never act on SIGTERM, so the live deadline escalates to SIGKILL quickly.
+DEFAULT_LIVE_DEADLINE_S = 30.0
+LIVE_KILL_GRACE_S = 2.0
 
 
 def _next_backoff_sec(
@@ -269,6 +278,7 @@ class ServerSupervisor:
         preempt_after_s: float = DEFAULT_PREEMPT_AFTER_S,
         lease_active: Callable[[], bool] | None = None,
         warm_active: Callable[[], bool] | None = None,
+        live_deadline_s: float | None = DEFAULT_LIVE_DEADLINE_S,
     ) -> None:
         self.base_dir = Path(base_dir)
         self.queue_dir = lanes.backfill_queue_dir(self.base_dir)
@@ -283,6 +293,7 @@ class ServerSupervisor:
             lambda: lanes.warm_lease_active(self.base_dir)
         )
         self._last_preempt = float("-inf")
+        self.live_deadline_s = live_deadline_s
         self.idle_timeout_sec = idle_timeout_sec
         self.hang_after_s = hang_after_s
         self.kill_hung = kill_hung
@@ -341,6 +352,9 @@ class ServerSupervisor:
             ):
                 slot.last_hang_check = now
                 self._check_hang(slot, now)
+
+        if self.live_deadline_s and self.live_deadline_s > 0:
+            self._check_live_deadline(now)
 
         if self.preempt:
             self._maybe_preempt(now)
@@ -466,6 +480,25 @@ class ServerSupervisor:
             )
             self._kill(slot)
 
+    def _check_live_deadline(self, now: float) -> None:
+        for slot in self.slots:
+            if slot.proc is None or slot.preempting:
+                continue
+            claim = self._read_claim(slot)
+            if claim is None or claim.lane != lanes.LIVE_QUEUE_NAME:
+                continue
+            held = now - claim.claimed_at
+            if held < self.live_deadline_s or slot.hang_flagged_ticket == claim.ticket:
+                continue
+            slot.hang_flagged_ticket = claim.ticket
+            print(
+                f"⏰ Server {slot.server_id} has held live ticket {claim.ticket} "
+                f"for {held:.0f}s (deadline {self.live_deadline_s:.0f}s): killing "
+                "it; the ticket is requeued for the other GPU.",
+                flush=True,
+            )
+            self._kill(slot, grace_s=LIVE_KILL_GRACE_S)
+
     # --- preemption -----------------------------------------------------------
 
     def _maybe_preempt(self, now: float) -> None:
@@ -535,10 +568,11 @@ class ServerSupervisor:
                 return True
         return False
 
-    def _kill(self, slot: ServerSlot) -> None:
+    def _kill(self, slot: ServerSlot, grace_s: float = KILL_GRACE_S) -> None:
         """Terminate the server's whole process tree: the bash wrapper,
-        Matlab, and its parpool workers (all carry its PETAKIT_SERVER_ID)."""
-        for sig, wait_s in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, 5.0)):
+        Matlab, and its parpool workers (all carry its PETAKIT_SERVER_ID).
+        SIGTERM, then SIGKILL for whatever is left after `grace_s`."""
+        for sig, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 5.0)):
             pids = _server_pids(slot.server_id, self.base_dir)
             if slot.proc is not None and slot.proc.poll() is None:
                 pids.append(slot.proc.pid)
@@ -626,9 +660,10 @@ class ServerSupervisor:
 
 def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     """Supervise the servers until interrupted. Hang handling is set by
-    OPYM_SERVE_HANG_MIN (default 60) and OPYM_SERVE_KILL_HUNG (default 1);
-    live preemption by OPYM_LIVE_PREEMPT (default 1) and
-    OPYM_LIVE_PREEMPT_AFTER_S (default 30)."""
+    OPYM_SERVE_HANG_MIN (default 60), OPYM_SERVE_KILL_HUNG (default 1) and
+    OPYM_SERVE_LIVE_DEADLINE_S (default 30, 0 turns it off); live preemption
+    by OPYM_LIVE_PREEMPT (default 1) and OPYM_LIVE_PREEMPT_AFTER_S (default
+    30)."""
     hang_after_s = (
         float(os.environ.get("OPYM_SERVE_HANG_MIN", DEFAULT_HANG_AFTER_S / 60)) * 60
     )
@@ -641,6 +676,9 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
     preempt_after_s = float(
         os.environ.get("OPYM_LIVE_PREEMPT_AFTER_S", DEFAULT_PREEMPT_AFTER_S)
     )
+    live_deadline_s = float(
+        os.environ.get("OPYM_SERVE_LIVE_DEADLINE_S", DEFAULT_LIVE_DEADLINE_S)
+    )
     sup = ServerSupervisor(
         BASE_DIR,
         idle_timeout_sec=idle_timeout_sec,
@@ -648,6 +686,7 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
         kill_hung=kill_hung,
         preempt=preempt,
         preempt_after_s=preempt_after_s,
+        live_deadline_s=live_deadline_s,
     )
 
     print("=" * 60)
@@ -665,9 +704,14 @@ def process_queue(idle_timeout_sec: int = 300, poll_interval: int = 2):
         f" ⚠️  Failure Backoff: {FAILURE_BACKOFF_BASE_SEC}s-{FAILURE_BACKOFF_CAP_SEC}s "
         "(exponential, per server)"
     )
+    live_rule = (
+        f"live tickets after {live_deadline_s:.0f}s"
+        if live_deadline_s > 0
+        else "no live deadline"
+    )
     print(
         f" 🧊 Hang Handling:   flag after {hang_after_s / 60:.0f} min idle, "
-        f"kill={'on' if kill_hung else 'off'}"
+        f"kill={'on' if kill_hung else 'off'}; {live_rule}"
     )
     print(
         f" ⏩ Live Preemption: {'on' if preempt else 'off'}: at once when live "

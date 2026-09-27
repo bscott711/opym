@@ -63,9 +63,7 @@ def test_drain_covers_multiple_items_and_is_all_or_nothing_visible(tmp_path):
     pool = DrainPool(num_workers=1, retention_s=9999, high_water_bytes=10**12)
     pool.start()
     try:
-        pool.enqueue(
-            DrainJob("sess-multi", [(stage_c0, dest_c0), (stage_c1, dest_c1)])
-        )
+        pool.enqueue(DrainJob("sess-multi", [(stage_c0, dest_c0), (stage_c1, dest_c1)]))
         assert _wait_until(lambda: dest_c0.exists() and dest_c1.exists())
         assert (dest_c0 / "a.bin").read_bytes() == b"c0-data"
         assert (dest_c1 / "a.bin").read_bytes() == b"c1-data"
@@ -185,7 +183,6 @@ def test_concurrent_sweeps_evict_each_session_exactly_once(
     assert not [r for r in caplog.records if "Failed to evict" in r.getMessage()]
 
 
-
 def test_retention_survives_a_restart(tmp_path):
     """A drained session's RAM copy must still be evicted after the process
     that drained it restarts (2026-09-24: one restart orphaned 110 GB)."""
@@ -194,8 +191,9 @@ def test_retention_survives_a_restart(tmp_path):
     manifests = tmp_path / "stage" / ".drain_manifests"
     _make_tree(stage_dir, {"a.bin": b"hello"})
 
-    first = DrainPool(num_workers=1, retention_s=9999, high_water_bytes=10**12,
-                      manifest_dir=manifests)
+    first = DrainPool(
+        num_workers=1, retention_s=9999, high_water_bytes=10**12, manifest_dir=manifests
+    )
     first.start()
     try:
         first.enqueue(DrainJob("sess-1", [(stage_dir, dest_dir)]))
@@ -204,8 +202,9 @@ def test_retention_survives_a_restart(tmp_path):
         first.stop()
     assert stage_dir.exists()  # retention not yet expired when it "died"
 
-    restarted = DrainPool(num_workers=1, retention_s=0.05, high_water_bytes=10**12,
-                          manifest_dir=manifests)
+    restarted = DrainPool(
+        num_workers=1, retention_s=0.05, high_water_bytes=10**12, manifest_dir=manifests
+    )
     restarted.start()
     try:
         assert _wait_until(lambda: not stage_dir.exists(), timeout=5.0)
@@ -213,3 +212,25 @@ def test_retention_survives_a_restart(tmp_path):
     finally:
         restarted.stop()
     assert (dest_dir / "a.bin").read_bytes() == b"hello"
+
+
+def test_free_up_evicts_drained_sessions_oldest_first_until_enough(tmp_path):
+    """R5: the RAM disk runs short before retention expires."""
+    stage = {k: tmp_path / "stage" / k for k in "abc"}
+    for p in stage.values():
+        _make_tree(p, {"f.bin": b"x" * 1000})
+    pool = DrainPool(num_workers=1, retention_s=9999, high_water_bytes=10**12)
+    pool.start()
+    try:
+        for k, p in stage.items():
+            pool.enqueue(DrainJob(f"sess-{k}", [(p, tmp_path / "raw" / k)]))
+            assert _wait_until(lambda k=k: (tmp_path / "raw" / k).exists())
+            time.sleep(0.01)  # distinct drained_at order
+        assert pool.free_up(1500) == 2000  # a, then b: 1000 is not enough
+        assert not stage["a"].exists() and not stage["b"].exists()
+        assert stage["c"].exists()
+        assert (tmp_path / "raw" / "a" / "f.bin").exists()  # GPFS copy kept
+        assert pool.free_up(10**9) == 1000 and not stage["c"].exists()
+        assert pool.free_up(1) == 0  # nothing left to evict
+    finally:
+        pool.stop()

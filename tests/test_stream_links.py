@@ -256,6 +256,48 @@ def test_resume_after_a_receiver_restart_continues_in_the_same_stores(tmp_path):
         second.close()
 
 
+def test_resume_counts_volumes_on_disk_and_finishes_a_half_received_one(tmp_path):
+    """R3: the receiver restarts with t=0 complete and t=1 half-received. The
+    ACKed slabs of t=1 are never resent, so the new receiver must finish t=1
+    from the planes already written, and count t=0 as received."""
+    raw = tmp_path / "raw"
+    first = _receiver()
+    sock = _dealer(first, "sess-r3")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-r3", _header(raw)))
+    _pump(first, sock)
+    slabs = [(0, 0, 3, 0), (0, 3, 3, 1), (1, 0, 2, 2), (1, 2, 2, 3)]
+    for t, z0, n, fi in slabs:
+        header, payload = _slab(t, z0, n, fi)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(first, sock)
+    assert first.sessions["sess-r3"].received_pairs == {(0, 0)}
+    sock.close()
+    first.close()  # the receiver restarts
+
+    second = _receiver()
+    try:
+        sock = _dealer(second, "sess-r3")
+        sock.send_multipart(
+            pack_message(MSG_SESSION_START, "sess-r3", _header(raw, resume_through=3))
+        )
+        _pump(second, sock)
+        session = second.sessions["sess-r3"]
+        assert session.received_pairs == {(0, 0)}  # found complete on disk
+        # z 2-3 again (unACKed before the restart, say): no double count.
+        header, payload = _slab(1, 2, 2, 4)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(second, sock)
+        assert (1, 0) not in session.received_pairs
+        header, payload = _slab(1, 4, 2, 5)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(second, sock)
+        assert (1, 0) in session.received_pairs
+        np.testing.assert_array_equal(_read(raw, 1), _volume(1))
+        sock.close()
+    finally:
+        second.close()
+
+
 def _stream_and_drain(recv, raw, stage, frames, reason="complete", resume=None):
     extra = {} if resume is None else {"resume_through": resume}
     sock = _dealer(recv, "sess-stage")
@@ -340,4 +382,71 @@ def test_the_final_ack_confirms_session_end_and_a_repeat_is_confirmed_too(
         pack_message(MSG_SESSION_END, "sess-end", {"reason": "complete"})
     )
     assert _pump(recv, sock)["unknown_session"] is True
+    sock.close()
+
+
+class _FakeDisk:
+    """shutil.disk_usage with a free figure the test sets (GB)."""
+
+    def __init__(self, free_gb):
+        self.free_gb = free_gb
+
+    def __call__(self, _path):
+        import collections
+
+        usage = collections.namedtuple("usage", "total used free")
+        return usage(252 * 10**9, 0, int(self.free_gb * 1e9))
+
+
+def test_below_the_ram_disk_floor_frames_wait_and_are_taken_once_space_is_back(
+    tmp_path, recv, monkeypatch
+):
+    """R5: below the floor the receiver holds frames back unACKed (the
+    client keeps and resends them) instead of filling tmpfs."""
+    import shutil
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
+    disk = _FakeDisk(free_gb=150)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    sock = _dealer(recv, "sess-floor")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-floor", _header(raw)))
+    assert _pump(recv, sock) is not None
+
+    disk.free_gb = 12
+    recv._check_stage_space()
+    header, payload = _frame(0, 0)
+    sock.send_multipart(pack_message(MSG_FRAME, "sess-floor", header, payload))
+    assert _pump(recv, sock, timeout=0.5) is None  # no ACK: held back
+    assert (0, 0) not in recv.sessions["sess-floor"].received_pairs
+
+    disk.free_gb = 150  # eviction (or anything else) freed space
+    sock.send_multipart(pack_message(MSG_FRAME, "sess-floor", header, payload))
+    assert _pump(recv, sock)["through_frame_index"] == 0
+    assert (0, 0) in recv.sessions["sess-floor"].received_pairs
+    sock.close()
+
+
+def test_a_session_start_frees_ram_disk_space_before_refusing(
+    tmp_path, recv, monkeypatch
+):
+    import shutil
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    disk = _FakeDisk(free_gb=0.0)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    asked = []
+
+    def free_up(nbytes):
+        asked.append(nbytes)
+        disk.free_gb = 150  # the oldest drained sessions went
+        return nbytes
+
+    monkeypatch.setattr(recv._drain_pool, "free_up", free_up)
+    sock = _dealer(recv, "sess-room")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-room", _header(raw)))
+    assert _pump(recv, sock) is not None
+    assert asked and "sess-room" in recv.sessions
     sock.close()

@@ -80,8 +80,20 @@ Recovery ("resume"): a FRAME or RESUME for a session this process doesn't
 know (it restarted, or idle-timed the session out) is answered with
 `unknown_session`, and the client re-sends SESSION_START with
 `resume_through`. The session then continues in its old stores -- on the
-staging root if its copy is still there, else straight into raw_root -- and
-goes to the batch pipeline rather than the live lane.
+staging root if its copy is still there, else straight into raw_root. With
+the one-format live lane it stays live: volumes already complete in the raw
+store (one chunk file per plane, so completeness is on disk) are handed to
+the lane again, a half-received volume is finished from the planes already
+written, and the lane picks its view and archive stores up where they were.
+Otherwise it goes to the batch pipeline.
+
+RAM-disk floor: the staging root shares tmpfs with the live view stores,
+PetaKit5D's queue and every other session. Below twice the floor
+(`OPYM_STREAM_STAGE_FLOOR_GB`, default 20) free, drained sessions are evicted
+early (they are safe on GPFS), oldest first, then finished view stores. Below
+the floor itself, frames are held back unACKed: the client keeps them and
+resends, and if space never comes back its own buffer fills and it pauses
+(below), so tmpfs never fills mid-session.
 
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
@@ -96,6 +108,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -213,6 +226,21 @@ def _holds_files(path: Path) -> bool:
     return path.is_dir() and any(p.is_file() for p in path.rglob("*"))
 
 
+_STAGE_FLOOR_ENV_VAR = "OPYM_STREAM_STAGE_FLOOR_GB"
+_DEFAULT_STAGE_FLOOR_GB = 20.0
+_SPACE_CHECK_EVERY_S = 5.0
+_SHORT_WARN_EVERY_S = 10.0
+
+
+def _stage_floor_bytes() -> int:
+    """Free space the staging RAM disk keeps; see the module docstring."""
+    try:
+        gb = float(os.environ.get(_STAGE_FLOOR_ENV_VAR, _DEFAULT_STAGE_FLOOR_GB))
+    except ValueError:
+        gb = _DEFAULT_STAGE_FLOOR_GB
+    return int(gb * 1e9)
+
+
 def _stage_root_from_env() -> Path | None:
     val = os.environ.get(_STAGE_ROOT_ENV_VAR, "").strip()
     return Path(val) if val else None
@@ -251,7 +279,9 @@ class _SlabAssembly:
 
     volume: np.ndarray
     z0s: set[int] = field(default_factory=set)
-    planes: int = 0
+    have: np.ndarray | None = None
+    """Which planes are in: a mask, not a count, so a plane written before a
+    receiver restart and resent after it isn't counted twice."""
     frame_indices: list[int] = field(default_factory=list)
     first_recv_s: float = 0.0
     raw_write_s: float = 0.0
@@ -398,6 +428,10 @@ class StreamReceiver:
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
+        self._last_space_check = float("-inf")
+        self._stage_short = False
+        self._last_short_warning = float("-inf")
+        self._freeing: threading.Thread | None = None
         # Created on the first live session (see _maybe_start_live), so the
         # env switches stay readable per session like the others here.
         self._live: LiveLane | None = None
@@ -503,6 +537,8 @@ class StreamReceiver:
                 self._handle_incoming(sock)
         self._flush_pending_acks()
         self._sweep_idle_sessions()
+        if time.monotonic() - self._last_space_check >= _SPACE_CHECK_EVERY_S:
+            self._check_stage_space()
         # Held while any session is open; refreshed every few seconds so it
         # goes stale (and frees the GPUs) within a minute if we crash.
         if self._live is not None:
@@ -511,6 +547,71 @@ class StreamReceiver:
         # The lease also covers live work still in flight after SESSION_END.
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
+
+    def _running_live_sessions(self) -> set[str]:
+        return set(self._live.sessions) if self._live is not None else set()
+
+    def _free_stage_space(
+        self, stage_root: Path, want_free: int, running: set[str] | None = None
+    ) -> int:
+        """Evict what is safe to evict until `want_free` bytes are free on
+        the staging RAM disk: drained sessions oldest first, then finished
+        view stores (not those in `running`, snapshotted by the caller on
+        the receiver's own thread). Returns the bytes free afterwards."""
+        if running is None:
+            running = self._running_live_sessions()
+        free = shutil.disk_usage(stage_root).free
+        if free >= want_free:
+            return free
+        self._drain_pool.free_up(want_free - free)
+        free = shutil.disk_usage(stage_root).free
+        if free < want_free:
+            live_zarr.evict_finished_views(lanes.jobs_dir(), running=running)
+            free = shutil.disk_usage(stage_root).free
+        return free
+
+    def _check_stage_space(self) -> None:
+        """Every few seconds: flag the RAM disk short below the floor (frames
+        are then held back), and below twice the floor free space in the
+        background."""
+        self._last_space_check = time.monotonic()
+        stage_root = _stage_root_from_env()
+        if stage_root is None or not stage_root.exists():
+            self._stage_short = False
+            return
+        floor = _stage_floor_bytes()
+        free = shutil.disk_usage(stage_root).free
+        self._stage_short = free < floor
+        if free < 2 * floor and not (self._freeing and self._freeing.is_alive()):
+            self._freeing = threading.Thread(
+                target=self._free_stage_space,
+                args=(stage_root, 2 * floor, self._running_live_sessions()),
+                name="stage-free-up",
+                daemon=True,
+            )
+            self._freeing.start()
+
+    def _held_back(self, session: SessionState) -> bool:
+        """True while this session's frames must wait: it stages on the RAM
+        disk and that is below the floor (see the module docstring)."""
+        if not self._stage_short or session.write_root == session.raw_root:
+            return False
+        stage_root = _stage_root_from_env()
+        free = shutil.disk_usage(stage_root).free if stage_root else 0
+        if free >= _stage_floor_bytes():
+            self._stage_short = False
+            return False
+        now = time.monotonic()
+        if now - self._last_short_warning >= _SHORT_WARN_EVERY_S:
+            self._last_short_warning = now
+            logger.warning(
+                "RAM disk below its floor (%.1f GB free < %.1f GB): holding "
+                "frames of session %s back; the client resends them",
+                free / 1e9,
+                _stage_floor_bytes() / 1e9,
+                session.session_id,
+            )
+        return True
 
     def _handle_incoming(self, sock: zmq.Socket) -> None:
         identity, *rest = sock.recv_multipart()
@@ -615,6 +716,8 @@ class StreamReceiver:
                 # a session that starts right at the edge would starve
                 # whichever one grows next. See module docstring.
                 if estimated_bytes * 2 > free_bytes:
+                    free_bytes = self._free_stage_space(stage_root, estimated_bytes * 2)
+                if estimated_bytes * 2 > free_bytes:
                     raise ValueError(
                         f"staging root {stage_root} has {free_bytes / 1e9:.1f} GB "
                         f"free, need >= {estimated_bytes * 2 / 1e9:.1f} GB "
@@ -669,17 +772,21 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         self._unknown_noticed.pop(session_id, None)
+        self._maybe_start_live(session)
         if session.resumed:
+            restaged = self._restage_from_raw_store(session)
             logger.warning(
                 "Session %s resumed after frame %d (this receiver restarted or "
-                "idle-timed it out): continuing in %s; the batch pipeline, not "
-                "the live lane, processes it",
+                "idle-timed it out): continuing in %s, %d volume(s) already "
+                "complete; %s",
                 session_id,
                 session.ack_floor,
                 session.leaf_dir,
+                restaged,
+                "the live lane picks up where it was"
+                if session.live
+                else "the batch pipeline, not the live lane, processes it",
             )
-        else:
-            self._maybe_start_live(session)
         logger.info(
             "Session %s started: base_name=%s grid=%dT x %dC -> %s "
             "(decon_enabled=%s, staging=%s)",
@@ -875,6 +982,8 @@ class StreamReceiver:
         """
         if not (_live_lane_enabled() and session.decon_enabled):
             return
+        if session.resumed and live_zarr.live_format() != "zarr":
+            return  # only the one-format lane can pick a session up again
         psf = resolve_decon_psf()
         if psf is None:
             return
@@ -903,14 +1012,65 @@ class StreamReceiver:
                 raw_arrays=[session.channel_store_paths[c] / "p0" for c in by_cidx],
                 raw_shape_zyx=session.shape_zyx,
                 time_interval_s=session.t_interval_s,
+                resume=session.resumed,
                 **common,
             )
             session.live_zarr = True
+        elif session.resumed:
+            return
         else:
             self._live.start_session(
                 session.session_id, frames_dir=session.decon_stage_dir, **common
             )
         session.live = True
+
+    def _raw_planes_on_disk(self, session: SessionState, t: int, c: int):
+        """Which z-planes of (t, c) are already in the raw store (one chunk
+        file per plane, `rawmirror.write_planes`), as a bool mask; None if
+        the channel's store has no array yet."""
+        p0 = session.channel_store_paths[c] / "p0"
+        try:
+            nz = int(json.loads((p0 / ".zarray").read_text())["shape"][1])
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return None
+        tdir = p0 / str(t)
+        if not tdir.is_dir():
+            return np.zeros(nz, dtype=bool)
+        return np.array([(tdir / str(z) / "0" / "0").exists() for z in range(nz)])
+
+    def _restage_from_raw_store(self, session: SessionState) -> int:
+        """A resumed session's volumes that were already complete in the raw
+        store: count them as received and hand them to the live lane, which
+        skips whichever it had already processed. Returns how many."""
+        n = 0
+        for c in session.channels:
+            for t in range(session.num_timepoints):
+                have = self._raw_planes_on_disk(session, t, c)
+                if have is None:
+                    break
+                if not have.all():
+                    continue
+                session.received_pairs.add((t, c))
+                n += 1
+                if session.live and self._live is not None:
+                    self._live.frame_staged(
+                        session.session_id, t, session.channel_cidx[c]
+                    )
+        return n
+
+    def _seed_from_raw_store(
+        self, session: SessionState, t: int, c: int, asm: _SlabAssembly
+    ) -> None:
+        """A volume of a resumed session that was half-received before the
+        restart: its slabs already ACKed are never resent, so start the
+        assembly from the planes already on disk."""
+        have = self._raw_planes_on_disk(session, t, c)
+        if have is None or not have.any() or have.shape != asm.have.shape:
+            return
+        arr = self._raw_array(session, c, asm.volume.shape, asm.volume.dtype.str)
+        for z in np.flatnonzero(have):
+            asm.volume[z] = arr[t, int(z)]
+        asm.have |= have
 
     def _handle_frame(
         self, session_id: str, header: dict[str, Any], payload: bytes | None
@@ -926,6 +1086,8 @@ class StreamReceiver:
             logger.warning(
                 "FRAME with no payload for session %s -- dropped", session_id
             )
+            return
+        if self._held_back(session):
             return
 
         recv_s = time.time()
@@ -1026,8 +1188,11 @@ class StreamReceiver:
             nz = int(header["nz"])
             asm = _SlabAssembly(
                 volume=np.empty((nz, *slab.shape[1:]), dtype=dtype),
+                have=np.zeros(nz, dtype=bool),
                 first_recv_s=recv_s,
             )
+            if session.resumed:
+                self._seed_from_raw_store(session, t, c, asm)
             session.slabs[(t, c)] = asm
         asm.frame_indices.append(frame_index)
         asm.links.add(_link_number(session.identity))
@@ -1053,8 +1218,8 @@ class StreamReceiver:
             return
         asm.volume[z0 : z0 + slab.shape[0]] = slab
         asm.z0s.add(z0)
-        asm.planes += slab.shape[0]
-        if asm.planes < asm.volume.shape[0]:
+        asm.have[z0 : z0 + slab.shape[0]] = True
+        if not asm.have.all():
             return
 
         del session.slabs[(t, c)]

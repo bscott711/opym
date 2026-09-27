@@ -234,6 +234,32 @@ class DrainPool:
         for sid, entry in hits:
             self._evict(sid, entry)
 
+    def free_up(self, bytes_wanted: int) -> int:
+        """Evicts drained sessions, oldest first, until `bytes_wanted` are
+        freed or none is left; returns the bytes freed. For when the RAM
+        disk runs short before retention expires: each one is already safe
+        on GPFS (or, if paused, its full local save goes there by Globus)."""
+        with self._lock:
+            picked: list[tuple[str, _DrainedEntry]] = []
+            freed = 0
+            for sid, entry in sorted(
+                self._drained.items(), key=lambda kv: kv[1].drained_at
+            ):
+                if freed >= bytes_wanted:
+                    break
+                picked.append((sid, entry))
+                freed += entry.size_bytes
+            for sid, _ in picked:
+                del self._drained[sid]
+        for sid, entry in picked:
+            logger.info(
+                "RAM disk short: evicting drained session %s early (%.1f GB)",
+                sid,
+                entry.size_bytes / 1e9,
+            )
+            self._evict(sid, entry)
+        return freed
+
     def retain(self, session_id: str, stage_paths: list[Path]) -> None:
         """Keeps a session's staging copies for the usual retention, then
         evicts them, without copying them anywhere. For a session the client

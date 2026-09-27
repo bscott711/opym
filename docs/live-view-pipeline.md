@@ -149,29 +149,22 @@ steady one does.
 | Failure | What happens now |
 |---|---|
 | A link drops | The client resends what that link carried on the others. |
-| The receiver restarts mid-run | The client resumes the session (`resume_through`) and resends unACKed volumes. The resumed session goes to the batch backfill, **not** the live lane. |
+| The receiver restarts mid-run | The client resumes the session (`resume_through`). The live lane picks up where it was: volumes already on disk count as received, a half-received one is finished from the planes already written, and processed ones aren't redone. Tested: receiver SIGKILLed mid-run, back in 10 s, 60/60 volumes bit-identical, 30/30 processed live. |
 | The PC can't reach Argus for longer than its RAM buffer | The run is marked "paused"; the full local save goes to GPFS by Globus instead. |
 | SESSION_END | Confirmed by an "ended" ACK, so a run never waits out the receiver's idle timeout. |
 | A live ticket fails | Retried once, then that timepoint is left to the batch backfill. |
-| A MATLAB server dies | The supervisor relaunches it and requeues its ticket. |
-| A MATLAB server hangs | Flagged and killed after `OPYM_SERVE_HANG_MIN` (60 min), for live tickets too. |
-| Both GPUs are on backfill when a session starts | One backfill server is killed at once and its ticket requeued; the second after a live ticket waits 30 s. |
+| A MATLAB server dies | The supervisor requeues its ticket on the next pass (2 s) and relaunches it after 15 s. Tested: SIGKILL mid-ticket, no timepoint delayed. |
+| A MATLAB server hangs on a live ticket | Killed 30 s after its claim (`OPYM_SERVE_LIVE_DEADLINE_S`) and the ticket requeued for the other GPU. Tested: SIGSTOP mid-ticket, that one timepoint shown 30 s late, the next on time. Backfill tickets keep the 60 min `OPYM_SERVE_HANG_MIN` check. |
+| Both GPUs are on backfill when a session starts | One backfill server is killed at once and its ticket requeued; the second after a live ticket waits 30 s. A PREPARE while the MDA is set up does the first part before the run starts. Not yet measured under a real backfill load (R6). |
+| The RAM disk runs short | Below twice `OPYM_STREAM_STAGE_FLOOR_GB` (20) free, drained sessions are evicted early, then finished view stores. Below the floor, frames are held back unACKed; the client resends them, or pauses if space never returns. |
 | The live lane's work is lost with the receiver | `.live_status.json` goes stale after 300 s, and the backfill reprocesses the dataset in batch. |
-| naparym-live is (re)started mid-session | It follows the newest session and reads timepoints whose buffers are gone from the store. |
+| naparym-live is (re)started mid-session | It follows the newest session and reads timepoints whose buffers are gone from the store. Tested: SIGKILL and relaunch mid-run, showing the newest timepoint with the whole time axis within 15 s; a new session is followed on its own. |
 
-Known gaps, being worked on now:
+Known gaps:
 
-- Every earlier self-test on Argus sent both channels at the same moment,
-  and PC replays used a made-up pace (1.6 s for both stacks). The replay is
-  being changed to pace itself from the MDA save's recorded frame times:
-  the real stack length, the gap between channels and the cadence.
-- A hung live ticket stalls the view for up to an hour.
-- A resumed session doesn't come back to the live lane.
-- /dev/shm pressure: a 100-timepoint session holds about 100 GB (raw
-  0.46 GB and processed 0.5 GB per timepoint, plus 6 GB of view buffers),
-  and the previous session's view store is kept.
-- Server crash, hang and preemption recovery have not been measured under
-  a live run.
+- R6 is not measured yet: a session starting while both GPUs run long
+  backfill tickets (`scripts/live_bench/queue_backfill.py` sets it up).
+- The RAM-disk floor is unit-tested, not yet exercised on the test stack.
 
 ## Measuring it
 
