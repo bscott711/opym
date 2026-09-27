@@ -80,8 +80,12 @@ Recovery ("resume"): a FRAME or RESUME for a session this process doesn't
 know (it restarted, or idle-timed the session out) is answered with
 `unknown_session`, and the client re-sends SESSION_START with
 `resume_through`. The session then continues in its old stores -- on the
-staging root if its copy is still there, else straight into raw_root -- and
-goes to the batch pipeline rather than the live lane.
+staging root if its copy is still there, else straight into raw_root. With
+the one-format live lane it stays live: volumes already complete in the raw
+store (one chunk file per plane, so completeness is on disk) are handed to
+the lane again, a half-received volume is finished from the planes already
+written, and the lane picks its view and archive stores up where they were.
+Otherwise it goes to the batch pipeline.
 
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
@@ -251,7 +255,9 @@ class _SlabAssembly:
 
     volume: np.ndarray
     z0s: set[int] = field(default_factory=set)
-    planes: int = 0
+    have: np.ndarray | None = None
+    """Which planes are in: a mask, not a count, so a plane written before a
+    receiver restart and resent after it isn't counted twice."""
     frame_indices: list[int] = field(default_factory=list)
     first_recv_s: float = 0.0
     raw_write_s: float = 0.0
@@ -669,17 +675,21 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         self._unknown_noticed.pop(session_id, None)
+        self._maybe_start_live(session)
         if session.resumed:
+            restaged = self._restage_from_raw_store(session)
             logger.warning(
                 "Session %s resumed after frame %d (this receiver restarted or "
-                "idle-timed it out): continuing in %s; the batch pipeline, not "
-                "the live lane, processes it",
+                "idle-timed it out): continuing in %s, %d volume(s) already "
+                "complete; %s",
                 session_id,
                 session.ack_floor,
                 session.leaf_dir,
+                restaged,
+                "the live lane picks up where it was"
+                if session.live
+                else "the batch pipeline, not the live lane, processes it",
             )
-        else:
-            self._maybe_start_live(session)
         logger.info(
             "Session %s started: base_name=%s grid=%dT x %dC -> %s "
             "(decon_enabled=%s, staging=%s)",
@@ -875,6 +885,8 @@ class StreamReceiver:
         """
         if not (_live_lane_enabled() and session.decon_enabled):
             return
+        if session.resumed and live_zarr.live_format() != "zarr":
+            return  # only the one-format lane can pick a session up again
         psf = resolve_decon_psf()
         if psf is None:
             return
@@ -903,14 +915,65 @@ class StreamReceiver:
                 raw_arrays=[session.channel_store_paths[c] / "p0" for c in by_cidx],
                 raw_shape_zyx=session.shape_zyx,
                 time_interval_s=session.t_interval_s,
+                resume=session.resumed,
                 **common,
             )
             session.live_zarr = True
+        elif session.resumed:
+            return
         else:
             self._live.start_session(
                 session.session_id, frames_dir=session.decon_stage_dir, **common
             )
         session.live = True
+
+    def _raw_planes_on_disk(self, session: SessionState, t: int, c: int):
+        """Which z-planes of (t, c) are already in the raw store (one chunk
+        file per plane, `rawmirror.write_planes`), as a bool mask; None if
+        the channel's store has no array yet."""
+        p0 = session.channel_store_paths[c] / "p0"
+        try:
+            nz = int(json.loads((p0 / ".zarray").read_text())["shape"][1])
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return None
+        tdir = p0 / str(t)
+        if not tdir.is_dir():
+            return np.zeros(nz, dtype=bool)
+        return np.array([(tdir / str(z) / "0" / "0").exists() for z in range(nz)])
+
+    def _restage_from_raw_store(self, session: SessionState) -> int:
+        """A resumed session's volumes that were already complete in the raw
+        store: count them as received and hand them to the live lane, which
+        skips whichever it had already processed. Returns how many."""
+        n = 0
+        for c in session.channels:
+            for t in range(session.num_timepoints):
+                have = self._raw_planes_on_disk(session, t, c)
+                if have is None:
+                    break
+                if not have.all():
+                    continue
+                session.received_pairs.add((t, c))
+                n += 1
+                if session.live and self._live is not None:
+                    self._live.frame_staged(
+                        session.session_id, t, session.channel_cidx[c]
+                    )
+        return n
+
+    def _seed_from_raw_store(
+        self, session: SessionState, t: int, c: int, asm: _SlabAssembly
+    ) -> None:
+        """A volume of a resumed session that was half-received before the
+        restart: its slabs already ACKed are never resent, so start the
+        assembly from the planes already on disk."""
+        have = self._raw_planes_on_disk(session, t, c)
+        if have is None or not have.any() or have.shape != asm.have.shape:
+            return
+        arr = self._raw_array(session, c, asm.volume.shape, asm.volume.dtype.str)
+        for z in np.flatnonzero(have):
+            asm.volume[z] = arr[t, int(z)]
+        asm.have |= have
 
     def _handle_frame(
         self, session_id: str, header: dict[str, Any], payload: bytes | None
@@ -1026,8 +1089,11 @@ class StreamReceiver:
             nz = int(header["nz"])
             asm = _SlabAssembly(
                 volume=np.empty((nz, *slab.shape[1:]), dtype=dtype),
+                have=np.zeros(nz, dtype=bool),
                 first_recv_s=recv_s,
             )
+            if session.resumed:
+                self._seed_from_raw_store(session, t, c, asm)
             session.slabs[(t, c)] = asm
         asm.frame_indices.append(frame_index)
         asm.links.add(_link_number(session.identity))
@@ -1053,8 +1119,8 @@ class StreamReceiver:
             return
         asm.volume[z0 : z0 + slab.shape[0]] = slab
         asm.z0s.add(z0)
-        asm.planes += slab.shape[0]
-        if asm.planes < asm.volume.shape[0]:
+        asm.have[z0 : z0 + slab.shape[0]] = True
+        if not asm.have.all():
             return
 
         del session.slabs[(t, c)]

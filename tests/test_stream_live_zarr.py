@@ -57,7 +57,7 @@ def _raw(tmp_path, n_t, n_c):
     return arrays
 
 
-def _session(lane, tmp_path, n_t=4, n_c=2, sid="sess"):
+def _session(lane, tmp_path, n_t=4, n_c=2, sid="sess", **kw):
     return lane.start_session(
         sid,
         base_name="Cell_030",
@@ -70,6 +70,7 @@ def _session(lane, tmp_path, n_t=4, n_c=2, sid="sess"):
         z_step_um=0.5,
         channel_labels=["GFP 488", "mScarlet 561"][:n_c],
         time_interval_s=10.0,
+        **kw,
     )
 
 
@@ -299,6 +300,63 @@ def test_finished_volumes_are_viewable_then_archived_unchanged(tmp_path, psf):
     assert read_live_status(s.dsr_dir)["timepoints_done"] == [0, 1]
     events = [e["ev"] for e in trace.read(jobs=jobs)]
     assert events.count("view_ready") == 2 and events.count("view_buffer") == 4
+
+
+def test_a_restarted_receiver_resumes_the_session_where_it_was(tmp_path, psf):
+    """R3: the receiver died mid-session. A new lane on the same stores keeps
+    what was processed, archives what was processed but not yet copied, and
+    dispatches only the rest."""
+    lane, jobs = _lane(tmp_path, psf)
+    s = _session(lane, tmp_path, n_t=3)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    _stage_all(lane, s, 2, 2)
+    lane.pump()
+    for path, tk in _tickets(jobs):
+        if (tk["parameters"]["t"], tk["parameters"]["c"]) != (1, 1):
+            _complete(jobs, path, tk, shape)
+    assert _pump_until(lane, lambda: s.archived >= {(0, 0), (0, 1), (1, 0)})
+    # The crash: (1, 1)'s ticket is lost, and (1, 0) was viewed but its
+    # archive copy hadn't been recorded yet.
+    for path, _ in _tickets(jobs):
+        path.unlink()
+    w.write_progress(
+        s.archive_store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running"
+    )
+
+    again = ZarrLiveLane(psf, jobs=jobs, qc=False)
+    r = _session(again, tmp_path, n_t=3, resume=True)
+    assert r.viewed == {(0, 0), (0, 1), (1, 0)}
+    assert r.done == {0}
+    np.testing.assert_array_equal(  # the view store was picked up, not wiped
+        w.image_group(r.view_store)["0"][0, 1], _volume(0, 1, shape)
+    )
+    _stage_all(again, r, 3, 2)  # the receiver re-stages what is on disk
+    again.pump()
+    todo = sorted(
+        (tk["parameters"]["t"], tk["parameters"]["c"]) for _, tk in _tickets(jobs)
+    )
+    assert todo == [(1, 1), (2, 0), (2, 1)]
+    for path, tk in _tickets(jobs):
+        _complete(jobs, path, tk, shape)
+    assert _pump_until(again, lambda: r.done == {0, 1, 2})
+    again.end_session("sess")
+    assert _pump_until(again, lambda: "sess" not in again.sessions)
+    assert w.complete_timepoints(w.read_progress(r.archive_store)) == [0, 1, 2]
+    np.testing.assert_array_equal(
+        w.image_group(r.archive_store)["0"][1, 0], _volume(1, 0, shape)
+    )
+    assert read_live_status(r.dsr_dir)["state"] == "complete"
+
+
+def test_resume_starts_fresh_when_the_old_stores_are_another_grid(tmp_path, psf):
+    lane, jobs = _lane(tmp_path, psf)
+    old = _session(lane, tmp_path, n_t=2)
+    for store in (old.view_store, old.archive_store):
+        w.write_progress(store, n_t=2, n_c=2, done=[[0, 0]], state="running")
+    again = ZarrLiveLane(psf, jobs=jobs, qc=False)
+    r = _session(again, tmp_path, n_t=3, resume=True)
+    assert r.viewed == set() and r.archived == set()
+    assert w.image_group(r.view_store)["0"].shape[0] == 3  # re-created
 
 
 def test_only_the_newest_timepoints_keep_uncompressed_buffers(tmp_path, psf):

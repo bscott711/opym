@@ -256,6 +256,48 @@ def test_resume_after_a_receiver_restart_continues_in_the_same_stores(tmp_path):
         second.close()
 
 
+def test_resume_counts_volumes_on_disk_and_finishes_a_half_received_one(tmp_path):
+    """R3: the receiver restarts with t=0 complete and t=1 half-received. The
+    ACKed slabs of t=1 are never resent, so the new receiver must finish t=1
+    from the planes already written, and count t=0 as received."""
+    raw = tmp_path / "raw"
+    first = _receiver()
+    sock = _dealer(first, "sess-r3")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-r3", _header(raw)))
+    _pump(first, sock)
+    slabs = [(0, 0, 3, 0), (0, 3, 3, 1), (1, 0, 2, 2), (1, 2, 2, 3)]
+    for t, z0, n, fi in slabs:
+        header, payload = _slab(t, z0, n, fi)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(first, sock)
+    assert first.sessions["sess-r3"].received_pairs == {(0, 0)}
+    sock.close()
+    first.close()  # the receiver restarts
+
+    second = _receiver()
+    try:
+        sock = _dealer(second, "sess-r3")
+        sock.send_multipart(
+            pack_message(MSG_SESSION_START, "sess-r3", _header(raw, resume_through=3))
+        )
+        _pump(second, sock)
+        session = second.sessions["sess-r3"]
+        assert session.received_pairs == {(0, 0)}  # found complete on disk
+        # z 2-3 again (unACKed before the restart, say): no double count.
+        header, payload = _slab(1, 2, 2, 4)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(second, sock)
+        assert (1, 0) not in session.received_pairs
+        header, payload = _slab(1, 4, 2, 5)
+        sock.send_multipart(pack_message(MSG_FRAME, "sess-r3", header, payload))
+        _pump(second, sock)
+        assert (1, 0) in session.received_pairs
+        np.testing.assert_array_equal(_read(raw, 1), _volume(1))
+        sock.close()
+    finally:
+        second.close()
+
+
 def _stream_and_drain(recv, raw, stage, frames, reason="complete", resume=None):
     extra = {} if resume is None else {"resume_through": resume}
     sock = _dealer(recv, "sess-stage")

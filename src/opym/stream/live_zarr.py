@@ -47,6 +47,8 @@ from opym.decon_config import XY_PIXEL_SIZE_UM, deskew_decon_kwargs
 from opym.ome_zarr_writer import (
     ProcessedArrays,
     create_processed_store,
+    processed_arrays,
+    read_progress,
     write_progress,
 )
 from opym.petakit import live_zarr_parameters, submit_live_zarr_job
@@ -80,6 +82,23 @@ WARMUP_NAME = "live_warmup.json"
 # (idle timeout, crash) would otherwise never warm for it.
 PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
+
+
+def _resumable_pairs(store: Path, n_t: int, n_c: int, shape_zyx) -> set | None:
+    """The (t, c) pairs an existing processed store of exactly this grid
+    already holds, per its progress file; None when there is no such store
+    to pick up (absent, never progressed, or another grid)."""
+    progress = read_progress(store)
+    if not progress or (progress.get("n_t"), progress.get("n_c")) != (n_t, n_c):
+        return None
+    try:
+        level0 = processed_arrays(store).levels[0] / ".zarray"
+        shape = json.loads(level0.read_text())["shape"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if list(shape) != [n_t, n_c, *shape_zyx]:
+        return None
+    return {(int(t), int(c)) for t, c in progress.get("done", [])}
 
 
 def psf_cache_dir(
@@ -220,7 +239,12 @@ class ZarrLiveLane(LiveLane):
         z_step_um: float,
         channel_labels: list[str] | None = None,
         time_interval_s: float | None = None,
+        resume: bool = False,
     ) -> ZarrLiveSession:
+        """Open a session's stores and warm up for it. `resume`: the receiver
+        restarted mid-session. Its view and archive stores are picked up
+        where they are (see `_resumable_pairs`) instead of re-created, and
+        what they already hold is not processed again."""
         dest_leaf = Path(dest_leaf)
         try:
             dest_leaf.mkdir(parents=True, exist_ok=True)  # see live.py's docstring
@@ -260,8 +284,22 @@ class ZarrLiveLane(LiveLane):
             "time_interval_s": time_interval_s or None,
         }
         session.buffers_dir.mkdir(parents=True, exist_ok=True)
-        session.view_arrays = create_processed_store(session.view_store, **store_kw)
-        create_processed_store(session.archive_store, **store_kw)
+        grid = (num_timepoints, n_channels, shape)
+        viewed = _resumable_pairs(session.view_store, *grid) if resume else None
+        if viewed is None:
+            session.view_arrays = create_processed_store(session.view_store, **store_kw)
+        else:
+            session.view_arrays = processed_arrays(session.view_store)
+            session.viewed = viewed
+            session.buffered = set(viewed)
+        archived = _resumable_pairs(session.archive_store, *grid) if resume else None
+        if archived is None:
+            create_processed_store(session.archive_store, **store_kw)
+        else:
+            session.archived = archived
+            session.done = {
+                t for t, _ in archived if self._all_channels(session, archived, t)
+            }
         session.dsr_dir.mkdir(parents=True, exist_ok=True)
         session.psf_cache = psf_cache_dir(
             self.jobs, self.psf, z_step_um, raw_shape_zyx, deskew_decon_kwargs(self.psf)
@@ -270,12 +308,16 @@ class ZarrLiveLane(LiveLane):
         self._write_status(session, "running")
         self._write_latest(session)
         self._write_warmup(session, raw_shape_zyx, shape)
+        for tc in sorted(session.viewed - session.archived):
+            session.archiving[tc] = self._pool.submit(self._archive, session, *tc)
         logger.info(
-            "Live lane (zarr): session %s (%s) -> %s, archived to %s",
+            "Live lane (zarr): session %s (%s) %s -> %s, archived to %s%s",
             session_id,
             base_name,
+            "resumed" if resume else "started",
             session.view_store,
             session.archive_store,
+            f" ({len(session.viewed)} volume(s) already processed)" if resume else "",
         )
         return session
 
@@ -288,6 +330,8 @@ class ZarrLiveLane(LiveLane):
         if cidx in cs:
             return
         cs.add(cidx)
+        if (t, cidx) in session.viewed:
+            return  # processed before a receiver restart (resume)
         session.ready.append((t, cidx))
         if self.qc and raw is not None and not session.superseded:
             self._submit_qc(session, t, cidx, raw)
