@@ -8,9 +8,12 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
+# numpy's huge-page madvise is off, as in production's units (THP defrag
+# stalls); LB_NUMPY_HUGEPAGE=1 turns it back on to measure the difference.
+thp=--setenv=NUMPY_MADVISE_HUGEPAGE="${LB_NUMPY_HUGEPAGE:-0}"
 common=(--user --collect -p "WorkingDirectory=$WT"
   --setenv=PYTHONPATH="$WT/src" --setenv=PETAKIT_JOBS_DIR="$JOBS"
-  --setenv=PYTHONUNBUFFERED=1)
+  --setenv=PYTHONUNBUFFERED=1 "$thp")
 
 up() {
   if ss -ltn | grep -q "127.0.0.1:$PORT "; then
@@ -38,7 +41,7 @@ up() {
     "$PY" "$LB_DIR/receiver.py" --bind "tcp://127.0.0.1:$PORT"
   if [ -x "$HOME/projects/CORE/.venv/bin/celldet-live-qc" ]; then
     systemd-run --user --collect --unit=lv-qc -p WorkingDirectory="$HOME/projects/CORE" \
-      --setenv=CUDA_VISIBLE_DEVICES= --setenv=OMP_NUM_THREADS=4 --setenv=PYTHONUNBUFFERED=1 \
+      --setenv=CUDA_VISIBLE_DEVICES= --setenv=OMP_NUM_THREADS=4 --setenv=PYTHONUNBUFFERED=1 "$thp" \
       -p StandardOutput="append:$LV/logs/lv-qc.log" -p StandardError="append:$LV/logs/lv-qc.log" \
       "$HOME/projects/CORE/.venv/bin/celldet-live-qc" --jobs "$JOBS"
   fi
