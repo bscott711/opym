@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -821,8 +822,9 @@ def test_served_key_finds_the_array_behind_any_view():
 
 
 class _Texture:
-    def __init__(self):
+    def __init__(self, shape=(2, 3, 4)):
         self.deleted = False
+        self.shape = (*shape, 1)
 
     def delete(self):
         self.deleted = True
@@ -839,3 +841,140 @@ def test_the_texture_cache_evicts_unused_textures_to_its_budget():
     assert cache.get(("s", 0, 1, 0)) is b and cache.bytes == 200
     cache.drop_store(Path("s"), lambda t: False)
     assert b.deleted and c.deleted and cache.bytes == 0
+
+
+def test_a_full_texture_cache_hands_back_its_oldest_unused_texture():
+    cache = live_view.TextureCache(budget_bytes=2 * 100)
+    a, b, other = _Texture(), _Texture(), _Texture(shape=(9, 9, 9))
+    cache.in_use = lambda t: t is a  # a is on screen
+    cache.put(("s", 0, 0, 0), a, 100)
+    cache.put(("s", 0, 1, 0), b, 100)
+    assert not cache.fits(100)  # full: reuse, don't allocate
+    assert cache.take((9, 9, 9)) is None  # no texture of that shape
+    assert cache.take((2, 3, 4)) is b  # a is drawn, so b, not deleted
+    assert not b.deleted and cache.bytes == 100 and ("s", 0, 1, 0) not in cache
+    cache.put(("s", 0, 5, 0), b, 100)
+    assert cache.get(("s", 0, 5, 0)) is b and cache.bytes == 200
+    assert not other.deleted
+
+
+def test_the_texture_cache_keeps_the_gpus_reserve_free():
+    free = {"bytes": 450.0}
+    cache = live_view.TextureCache(budget_bytes=math.inf, reserve_bytes=200)
+    cache.free_vram = lambda: free["bytes"]
+    assert cache.capacity() == pytest.approx(250)
+    assert cache.fits(100) and cache.fits(100)  # 450 - 200 reserve
+    assert not cache.fits(100)  # counted until the next reading
+    cache.put(("s", 0, 0, 0), _Texture(), 100)
+    cache.put(("s", 0, 1, 0), _Texture(), 100)
+    # MATLAB grew: 120 free, under the 200 reserve -> give 100 back
+    free["bytes"] = 120.0
+    cache._free_at = float("-inf")
+    assert cache.trim() == 100 and cache.bytes == 100
+    free["bytes"] = 220.0  # what the delete gave back
+    assert cache.trim() == 0 and cache.bytes == 100
+
+
+def test_an_auto_texture_cache_without_a_free_reading_stays_small():
+    cache = live_view.TextureCache(budget_bytes=math.inf)
+    assert cache.capacity() == live_view.AUTO_VRAM_FALLBACK_GB * 1e9
+    assert cache.fits(10**9) and cache.trim() == 0
+
+
+def test_display_shift_keeps_enough_grey_levels_in_the_display_window():
+    rng = np.random.default_rng(0)
+    for top, shift in ((60, 0), (366, 1), (1000, 3)):
+        vol = rng.integers(1, top + 1, size=(40, 40, 40)).astype(np.uint16)
+        assert live_view.display_shift(vol) == shift
+        assert (top >> shift) >= live_view.DISPLAY_LEVELS or shift == 0
+    assert live_view.display_shift(np.zeros((8, 8, 8), np.uint16)) == 0
+
+
+def test_to_8bit_shifts_and_clips():
+    vol = np.array([0, 1, 511, 512, 1620], np.uint16).reshape(5, 1, 1)
+    out = live_view.to_8bit(vol, 1)
+    assert out.dtype == np.uint8
+    assert out.ravel().tolist() == [0, 0, 255, 255, 255]
+    assert live_view.to_8bit(vol[:3], 0).ravel().tolist() == [0, 1, 255]
+
+
+def test_an_8bit_viewer_shows_each_channel_scaled_by_a_fixed_shift(tmp_path):
+    """The stores stay 16-bit; the viewer holds and shows 8-bit volumes,
+    each channel scaled by one shift for the whole session."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    resize_dask_cache(0)
+    store = _store(tmp_path)
+    done: list = []
+    for t in (0, 1):
+        for c in range(2):
+            vol = np.full((8, 16, 12), (480, 60)[c] * (t + 1), dtype=np.uint16)
+            w.write_timepoint(store, t, c, vol)
+        done.extend([[t, 0], [t, 1]])
+    w.write_progress(store, n_t=3, n_c=2, done=done, state="running")
+    viewer = ViewerModel()
+    cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
+    follower = live_view.LiveFollower(viewer, store, cache=cache, follow=False)
+    gfp, msc = follower.layers
+    viewer.dims.set_current_step(0, 0)
+    shown = _shown_data(gfp)
+    assert shown.dtype == np.uint8 and int(shown.max()) == 480 >> 2
+    assert int(_shown_data(msc).max()) == 60  # dim channel: exact
+    assert follower.sources[0].shift == 2 and follower.sources[1].shift == 0
+    viewer.dims.set_current_step(0, 1)
+    assert int(_shown_data(gfp).max()) == 960 >> 2  # the same shift at t=1
+    assert int(_shown_data(msc).max()) == 120
+    assert 0 <= gfp.contrast_limits[0] < gfp.contrast_limits[1] <= 255
+    assert follower.sources[0]._levels[0].dtype == np.uint16  # the store
+
+
+def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_shift(tmp_path):
+    """The server writes 8-bit view buffers and publishes each channel's
+    shift: the viewer maps the buffer as it is (no copy, no conversion) and
+    scales what it reads from the store by that same shift. A 16-bit viewer
+    skips an 8-bit buffer rather than mix scales."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    from opym.stream.live_zarr import buffer_name
+
+    resize_dask_cache(0)
+    store = _store(tmp_path)
+    buffers = tmp_path / "view" / "buffers"
+    buffers.mkdir(parents=True)
+    (buffers / "display_C0.json").write_text(json.dumps({"shift": 3}))
+    (buffers / "display_C1.json").write_text(json.dumps({"shift": 0}))
+    for c in range(2):  # t=0 in the store, 16-bit, as the server wrote it
+        w.write_timepoint(store, 0, c, np.full((8, 16, 12), (800, 40)[c], np.uint16))
+    w.write_progress(store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running")
+    np.save(buffers / buffer_name(1, 0), np.full((8, 16, 12), 200, np.uint8))
+    np.save(buffers / buffer_name(1, 1), np.full((8, 16, 12), 45, np.uint8))
+
+    viewer = ViewerModel()
+    cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
+    follower = live_view.LiveFollower(
+        viewer,
+        store,
+        buffers_dir=buffers,
+        cache=cache,
+        follow=False,
+        prefetch_pool=_NoPrefetch(),
+    )
+    src = follower.sources[0]
+    src.update({0}, {1}, live=True)
+    buf = src.load(1, 0)
+    assert buf.dtype == np.uint8 and int(buf.max()) == 200
+    assert not buf.flags.owndata  # the mapped buffer itself
+    assert int(src.load(0, 0).max()) == 800 >> 3  # the store, by the server's shift
+    assert src.shift == 3
+
+    cache16 = live_view.ViewCache(full_gb=1, small_gb=1, bits=16)
+    src16 = live_view.ChannelSource(
+        store, follower.sources[0]._levels, 0, buffers, cache16
+    )
+    src16.update({0}, {1}, live=True)
+    assert src16.load(1, 0) is None  # an 8-bit buffer: wait for the store
+    assert int(src16.load(0, 0).max()) == 800

@@ -41,6 +41,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -93,6 +94,38 @@ PREFETCH_RADIUS = 12
 PRELOAD_IDLE_S = 0.3
 PRELOAD_TICK_S = 0.08
 PRELOAD_SLAB = 32
+# The VRAM texture cache shares its GPU with MATLAB's decon (the viewer
+# renders on GPU 0, where server 1 runs): it allocates only while
+# VRAM_RESERVE_GB stays free, and gives textures back when free memory
+# falls below that. Free memory is read from the driver at most every
+# FREE_VRAM_EVERY_S. The default budget ("auto") is whatever that leaves;
+# where the driver can't report free memory, AUTO_VRAM_FALLBACK_GB.
+VRAM_RESERVE_GB = 24.0
+# Draw each texture the cache fills once, off-screen, so it lands in VRAM
+# (LiveVolumeNode._make_resident); OPYM_VIEW_RESIDENT=0 turns it off.
+RESIDENT_TEXTURES = os.environ.get("OPYM_VIEW_RESIDENT", "1") != "0"
+FREE_VRAM_EVERY_S = 0.5
+AUTO_VRAM_FALLBACK_GB = 16.0
+GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049
+# A one-point draw into a 1x1 off-screen target that samples a texture:
+# enough for the driver to place the whole texture in VRAM (see
+# LiveVolumeNode._make_resident).
+_TOUCH_VERT = """
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+"""
+_TOUCH_FRAG = """
+uniform sampler3D u_tex;
+void main() { gl_FragColor = texture3D(u_tex, vec3(0.5, 0.5, 0.5)); }
+"""
+# Volumes are shown as 8-bit by default (`--bits`): half the bytes to upload
+# to the GPU, cache in RAM and keep as textures. Each channel is scaled by a
+# power of two fixed for the session (so its intensities compare across
+# time): the largest that keeps DISPLAY_LEVELS grey levels below the top of
+# its display window. Side by side on 2026-09-27, 121-138 levels looked the
+# same as 16-bit; the processed data spans only ~60-800 counts. The stores
+# stay 16-bit; only what the viewer holds and uploads changes.
+DISPLAY_LEVELS = 120
 _PREFETCH_READ_POOL = None
 
 
@@ -192,6 +225,38 @@ def read_volume(arr, t: int, c: int, *, background: bool = False):
     return out
 
 
+def display_shift(vol) -> int:
+    """The right shift that takes a channel's 16-bit data to 8 bits: the
+    largest that keeps DISPLAY_LEVELS grey levels below the 99.9th
+    percentile (the top of naparym-live's contrast), leaving 1-2x that as
+    headroom above it."""
+    import numpy as np
+
+    sub = np.asarray(vol[::4, ::4, ::4])
+    sub = sub[sub > 0]
+    if not sub.size:
+        return 0
+    hi = float(np.percentile(sub, 99.9))
+    return max(0, math.floor(math.log2(max(hi, 1.0) / DISPLAY_LEVELS)))
+
+
+def to_8bit(vol, shift: int, *, background: bool = False):
+    """`vol` shifted right by `shift` and clipped to 255, as uint8: a z-slab
+    per decode thread (1 GB in ~0.035 s on 48 threads)."""
+    import numpy as np
+
+    out = np.empty(vol.shape, np.uint8)
+    step = max(1, -(-vol.shape[0] // 32))
+
+    def one(z0: int) -> None:
+        tmp = np.right_shift(vol[z0 : z0 + step], shift)
+        np.minimum(tmp, 255, out=tmp)
+        out[z0 : z0 + step] = tmp
+
+    list(_read_pool(background).map(one, range(0, vol.shape[0], step)))
+    return out
+
+
 def map_buffer(path: Path):
     """A view buffer (.npy) mapped read-only with every page faulted in up
     front (MAP_POPULATE: 0.03 s for 1 GB), rather than one fault per 4 KB
@@ -275,11 +340,18 @@ class VolumeCache:
 class ViewCache:
     """The viewer's two caches: full-resolution volumes (level 0, the big
     ones, `full_gb`) and coarser levels (the layer thumbnails', `small_gb`),
-    so a long session's full resolution can't push the thumbnails out."""
+    so a long session's full resolution can't push the thumbnails out.
+    `bits`: what they hold, and so what the viewer shows -- 8 (each
+    channel's data scaled to 8 bits, see DISPLAY_LEVELS) or 16 (as stored)."""
 
-    def __init__(self, full_gb: float = 100.0, small_gb: float = 40.0) -> None:
+    def __init__(
+        self, full_gb: float = 100.0, small_gb: float = 40.0, bits: int = 16
+    ) -> None:
+        if bits not in (8, 16):
+            raise ValueError(f"bits must be 8 or 16, not {bits}")
         self.full = VolumeCache(full_gb * 1e9)
         self.small = VolumeCache(small_gb * 1e9)
+        self.bits = bits
 
     def of(self, level: int) -> VolumeCache:
         return self.full if level == 0 else self.small
@@ -306,6 +378,14 @@ class ChannelSource:
       mScarlet;
     - else zeros (the kernel's zero page).
 
+    With an 8-bit cache (`ViewCache.bits`), what is cached and shown is
+    8-bit: the server's 8-bit view buffers as they are (mapped, no copy),
+    and every volume read from the store scaled by the same shift, which
+    the server published in the buffer dir (display_C<c>.json); without it
+    (an older server, a finished session) the shift comes from the first
+    volume read, by the same rule (`display_shift`). A 16-bit viewer skips
+    8-bit buffers and waits for the store.
+
     Not dask: dask copies every result it computes, a fresh 1 GB allocation
     per channel per timepoint shown. `update` is called once per poll with
     what the lane has produced; `served` says which timepoint the last read
@@ -320,6 +400,8 @@ class ChannelSource:
         buffers_dir: Path | None,
         cache: ViewCache,
     ) -> None:
+        import numpy as np
+
         self.store = Path(store)
         self._levels = levels
         self.c = c
@@ -334,7 +416,10 @@ class ChannelSource:
         self.served: dict[int, int | None] = {}
         n_t = levels[0].shape[0]
         self.shapes = [(n_t, *arr.shape[2:]) for arr in levels]
-        self.dtype = levels[0].dtype
+        self.bits = cache.bits
+        self.dtype = np.dtype(np.uint8) if self.bits == 8 else levels[0].dtype
+        self.shift: int | None = None  # 8-bit: fixed by the first volume
+        self._shift_lock = threading.Lock()
 
     @property
     def has(self) -> set[int]:
@@ -370,6 +455,39 @@ class ChannelSource:
                 del self._maps[min(self._maps)]
         return mapped
 
+    def _published_shift(self) -> int | None:
+        """The shift the server scaled this channel's view buffers by."""
+        if self._dir is None:
+            return None
+        try:
+            rec = json.loads((self._dir / f"display_C{self.c}.json").read_text())
+            return int(rec["shift"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _shown(self, arr, background: bool = False):
+        """`arr` as the viewer holds it: itself at 16 bits or when it is
+        already 8-bit (a server's buffer), else scaled to 8 bits by this
+        channel's shift."""
+        import numpy as np
+
+        if self.bits == 16 or arr.dtype == np.uint8:
+            return arr
+        with self._shift_lock:
+            if self.shift is None:
+                published = self._published_shift()
+                self.shift = published if published is not None else display_shift(arr)
+        return to_8bit(arr, self.shift, background=background)
+
+    def _usable(self, buf):
+        """A mapped buffer this viewer can show: an 8-bit one only at 8 bits
+        (its scale isn't the store's)."""
+        import numpy as np
+
+        if buf is not None and buf.dtype == np.uint8 and self.bits == 16:
+            return None
+        return buf
+
     def _subsample(self, full, level: int):
         import numpy as np
 
@@ -380,25 +498,33 @@ class ChannelSource:
     def load(self, t: int, level: int, *, cache: bool = True, background=False):
         """(t, level) from the cache, the buffer or the store; None if this
         channel hasn't produced t yet."""
+        import numpy as np
+
         cached = self._cache.of(level).get(self._key(t, level))
         if cached is not None:
             return cached
         if level == 0:
-            buf = self._buffer(t)
+            buf = self._usable(self._buffer(t))
             if buf is not None:
-                return buf
+                if self.bits == 16 or buf.dtype == np.uint8:
+                    return buf  # mapped, no copy
+                arr = self._shown(buf, background)
+                if cache:
+                    self._cache.full.put(self._key(t, 0), arr)
+                return arr
         if t in self.stored:
             if background:
                 arr = read_volume(self._levels[level], t, self.c, background=True)
             else:
                 arr = read_volume(self._levels[level], t, self.c)
+            arr = self._shown(arr, background)
             if cache:
                 self._cache.of(level).put(self._key(t, level), arr)
             return arr
         if level > 0:
-            buf = self._buffer(t)
+            buf = self._usable(self._buffer(t))
             if buf is not None:
-                return self._subsample(buf, level)
+                return self._shown(self._subsample(buf, level), background)
         return None
 
     def volume(self, t: int, level: int):
@@ -426,8 +552,15 @@ class ChannelSource:
     def in_ram(self, t: int):
         """(t)'s full resolution if it is already in memory -- this viewer's
         cache or the lane's RAM-disk buffer -- else None: never decodes."""
+        import numpy as np
+
         cached = self._cache.full.peek(self._key(t, 0))
-        return cached if cached is not None else self._buffer(t)
+        if cached is not None:
+            return cached
+        buf = self._usable(self._buffer(t))
+        if buf is not None and self.bits == 8 and buf.dtype != np.uint8:
+            return None  # 16-bit: not what this viewer shows until scaled
+        return buf
 
     def prefetch(self, t: int, level: int) -> None:
         """Make (t, level) a cache hit; runs on the prefetch pool. A full-
@@ -439,9 +572,13 @@ class ChannelSource:
         if key in self._cache.of(level):
             return
         if level == 0:
-            buf = self._buffer(t)
+            buf = self._usable(self._buffer(t))
             if buf is not None:
-                self._cache.full.put(key, np.array(buf))
+                if self.bits == 16 or buf.dtype == np.uint8:
+                    arr = np.array(buf)
+                else:
+                    arr = self._shown(buf, True)
+                self._cache.full.put(key, arr)
                 return
         if t in self.stored:
             self.load(t, level, background=True)
@@ -480,18 +617,28 @@ def served_key(arr) -> tuple | None:
 
 
 class TextureCache:
-    """Volumes kept on the GPU as textures, least recently used out first,
-    up to `budget_bytes` of VRAM: moving back to a timepoint already shown
-    rebinds its texture instead of uploading 1 GB per channel again (0.1-
-    0.3 s each). One cache for the viewer's live layers, on the one GL
-    context they share."""
+    """Volumes kept on the GPU as textures, least recently used out first:
+    moving back to a timepoint already shown rebinds its texture instead of
+    uploading 1 GB per channel again (0.1-0.3 s each). One cache for the
+    viewer's live layers, on the one GL context they share.
 
-    def __init__(self, budget_bytes: float) -> None:
+    Its size is `budget_bytes` (math.inf: as much as the GPU has) and never
+    more than keeps `reserve_bytes` of the GPU free, read through
+    `free_vram` (set by the renderer; None where the driver can't tell).
+    Once full, a new volume goes into the least recently used texture (an
+    overwrite: no allocation, and no delete on the UI thread)."""
+
+    def __init__(self, budget_bytes: float, reserve_bytes: float = 0.0) -> None:
         from collections import OrderedDict
 
         self.budget = float(budget_bytes)
+        self.reserve = float(reserve_bytes)
         self.bytes = 0
         self._items: OrderedDict = OrderedDict()  # key -> (texture, nbytes)
+        self.free_vram = None  # () -> free bytes on the GPU, or None
+        self.in_use = lambda _texture: False  # set by the renderer
+        self._free_at = float("-inf")
+        self._free: float | None = None
 
     def get(self, key):
         item = self._items.get(key)
@@ -503,9 +650,49 @@ class TextureCache:
     def __contains__(self, key) -> bool:
         return key in self._items
 
-    def put(self, key, texture, nbytes: int, in_use) -> None:
+    def free_bytes(self) -> float | None:
+        """Free GPU memory, read at most every FREE_VRAM_EVERY_S (lowered
+        in between by what `fits` let callers allocate)."""
+        now = time.monotonic()
+        if self.free_vram is not None and now - self._free_at >= FREE_VRAM_EVERY_S:
+            self._free_at = now
+            self._free = self.free_vram()
+        return self._free
+
+    def capacity(self) -> float:
+        """How many bytes of textures the cache can hold right now."""
+        free = self.free_bytes()
+        budget = self.budget
+        if math.isinf(budget) and free is None:
+            budget = AUTO_VRAM_FALLBACK_GB * 1e9
+        if free is None:
+            return budget
+        return min(budget, self.bytes + max(0.0, free - self.reserve))
+
+    def fits(self, nbytes: int) -> bool:
+        """Whether a new texture of `nbytes` may be allocated now. A yes
+        counts it against the free memory until the next reading."""
+        if self.bytes + nbytes > self.capacity():
+            return False
+        if self._free is not None:
+            self._free -= nbytes
+        return True
+
+    def take(self, shape):
+        """The least recently used texture of `shape` that no layer is
+        drawing, out of the cache, to upload another volume into; None if
+        there is none."""
+        for key, (texture, nbytes) in self._items.items():
+            if tuple(texture.shape[:3]) == tuple(shape) and not self.in_use(texture):
+                del self._items[key]
+                self.bytes -= nbytes
+                return texture
+        return None
+
+    def put(self, key, texture, nbytes: int, in_use=None) -> None:
         """Keep `texture`; evict the least recently used ones that no layer
-        is drawing (`in_use(texture)`) until the budget holds."""
+        is drawing until the budget holds."""
+        in_use = in_use or self.in_use
         old = self._items.pop(key, None)
         if old is not None and old[0] is not texture:
             self._delete(old)
@@ -518,12 +705,32 @@ class TextureCache:
             if k != key and not in_use(tex):
                 self._delete(self._items.pop(k))
 
+    def trim(self) -> int:
+        """While the GPU has less than `reserve` free (MATLAB needs it),
+        delete the least recently used textures no layer is drawing.
+        Returns the bytes given back."""
+        free = self.free_bytes()
+        if free is None or free >= self.reserve:
+            return 0
+        freed = 0
+        for k in list(self._items):
+            if free + freed >= self.reserve:
+                break
+            texture, nbytes = self._items[k]
+            if not self.in_use(texture):
+                self._delete(self._items.pop(k))
+                freed += nbytes
+        if freed:
+            self._free_at = float("-inf")  # read it again
+        return freed
+
     def _delete(self, item) -> None:
         texture, nbytes = item
         self.bytes -= nbytes
         texture.delete()
 
-    def drop_store(self, store: Path, in_use) -> None:
+    def drop_store(self, store: Path, in_use=None) -> None:
+        in_use = in_use or self.in_use
         for k in [k for k in self._items if k[0] == str(store)]:
             if not in_use(self._items[k][0]):
                 self._delete(self._items.pop(k))
@@ -707,6 +914,7 @@ def _register_live_renderer(live_image) -> None:
             self._own_texture = self._texture
             self._filling = None  # [key, texture, next plane] being preloaded
             self._spare = None  # [texture, next plane]: pre-touched, for a new volume
+            self._toucher = None  # (program, framebuffer) for _make_resident
             self.freeze()
 
         def _bind(self, texture) -> None:
@@ -746,10 +954,11 @@ def _register_live_renderer(live_image) -> None:
                 return None
             # Not on the GPU yet. Into the spare texture (already allocated
             # and touched while idle: an upload into it costs what an
-            # overwrite does), which then joins the cache. Without a spare,
-            # through the node's own texture -- allocating a 1 GB texture on
-            # the spot costs ~0.3 s more per channel -- and the idle-time
-            # fill (`preload`) caches it later.
+            # overwrite does), which then joins the cache. With the cache
+            # full, into its least recently used texture instead (also an
+            # overwrite). Otherwise through the node's own texture --
+            # allocating a 1 GB texture on the spot costs ~0.3 s more per
+            # channel -- and the idle-time fill (`preload`) caches it later.
             spare = self._spare
             if (
                 spare is not None
@@ -761,6 +970,13 @@ def _register_live_renderer(live_image) -> None:
                 super().set_data(vol, clim=clim, copy=copy)
                 self._vram.put(key, spare[0], vol.nbytes, _in_use)
                 return None
+            if not self._vram.fits(vol.nbytes):
+                texture = self._vram.take(vol.shape)
+                if texture is not None:
+                    self._bind(texture)
+                    super().set_data(vol, clim=clim, copy=copy)
+                    self._vram.put(key, texture, vol.nbytes, _in_use)
+                    return None
             self._bind(self._own_texture)
             return super().set_data(vol, clim=clim, copy=copy)
 
@@ -778,6 +994,29 @@ def _register_live_renderer(live_image) -> None:
                 z += PRELOAD_SLAB
             return z
 
+        def _make_resident(self, texture) -> None:
+            """Draw once, off-screen, sampling `texture`, so the driver moves
+            it into VRAM now. NVIDIA's GL keeps a texture that has only been
+            uploaded to in system memory until a draw first uses it, and that
+            draw then waits while it is paged in (~0.1 s per GB; measured
+            2026-09-27: nvidia-smi stayed flat under 34 GB of textures that
+            had been filled but never drawn)."""
+            import numpy as np
+            from vispy import gloo
+
+            if self._toucher is None:
+                prog = gloo.Program(_TOUCH_VERT, _TOUCH_FRAG)
+                prog["a_pos"] = np.zeros((1, 2), np.float32)
+                fbo = gloo.FrameBuffer(color=gloo.RenderBuffer((1, 1)))
+                self._toucher = (prog, fbo)
+            prog, fbo = self._toucher
+            self.canvas.set_current()
+            prog["u_tex"] = texture
+            with fbo:
+                gloo.set_viewport(0, 0, 1, 1)
+                prog.draw("points")
+            self.canvas.context.flush_commands()
+
         def _new_texture(self, template):
             texture = self._create_texture(self._live_format, template[:1, :1, :1])
             texture.set_clim(self._texture.clim)
@@ -787,18 +1026,25 @@ def _register_live_renderer(live_image) -> None:
 
         def prepare_spare(self, shape, dtype, seconds: float) -> bool:
             """Have a spare texture of `shape` allocated and touched (zeros
-            uploaded) for the next new volume; True once it is ready."""
+            uploaded) for the next new volume; True once it is ready, or
+            when the cache is full (a new volume then reuses a cached
+            texture)."""
             if self._vram is None or self.canvas is None:
                 return True
             zeros = np.zeros(shape, dtype)  # the kernel's zero pages: free
             if self._spare is None or self._spare[0].shape[:3] != tuple(shape):
                 if self._spare is not None:
                     self._spare[0].delete()
+                    self._spare = None
+                if not self._vram.fits(zeros.nbytes):
+                    return True
                 self._spare = [self._new_texture(zeros), 0]
             if self._spare[1] < shape[0]:
                 self._spare[1] = self._upload_slabs(
                     self._spare[0], zeros, self._spare[1], seconds
                 )
+                if self._spare[1] >= shape[0] and RESIDENT_TEXTURES:
+                    self._make_resident(self._spare[0])
             return self._spare[1] >= shape[0]
 
         def preload(self, key, vol, seconds: float) -> bool:
@@ -813,11 +1059,20 @@ def _register_live_renderer(live_image) -> None:
             if fill is None or fill[0] != key:
                 if fill is not None:
                     fill[1].delete()  # a fill abandoned for a nearer one
-                fill = self._filling = [key, self._new_texture(vol), 0]
+                    self._filling = None
+                if self._vram.fits(vol.nbytes):
+                    texture = self._new_texture(vol)
+                else:
+                    texture = self._vram.take(vol.shape)
+                    if texture is None:
+                        return False
+                fill = self._filling = [key, texture, 0]
             fill[2] = self._upload_slabs(fill[1], vol, fill[2], seconds)
             if fill[2] < vol.shape[0]:
                 return False
             self._filling = None
+            if RESIDENT_TEXTURES:
+                self._make_resident(fill[1])
             self._vram.put(key, fill[1], vol.nbytes, _in_use)
             return True
 
@@ -825,9 +1080,35 @@ def _register_live_renderer(live_image) -> None:
 
     def _in_use(texture) -> bool:
         return any(
-            node._texture is texture or (node._spare and node._spare[0] is texture)
+            node._texture is texture
+            or (node._spare and node._spare[0] is texture)
+            or (node._filling and node._filling[1] is texture)
             for node in live_nodes
         )
+
+    def _free_vram() -> float | None:
+        """Free memory on the GPU the live layers draw on, from the driver
+        (GL_NVX_gpu_memory_info, on the canvas's own context); None where
+        the driver doesn't report it."""
+        from vispy.gloo import gl
+
+        for node in live_nodes:
+            if node.canvas is None:
+                continue
+            try:
+                node.canvas.set_current()
+                kb = gl.glGetParameter(GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX)
+                try:
+                    kb = int(kb)  # np.int32 under napari; () if unknown
+                except (TypeError, ValueError):
+                    kb = 0
+                if kb <= 0:
+                    gl.glGetError()  # clear GL_INVALID_ENUM from another driver
+                    return None
+            except Exception:  # noqa: BLE001 -- no such query on this driver
+                return None
+            return float(kb) * 1024
+        return None
 
     class LiveImageLayerNode(ImageLayerNode):
         def __init__(self, custom_node=None, texture_format=None, vram=None):
@@ -840,6 +1121,8 @@ def _register_live_renderer(live_image) -> None:
                     vram=vram,
                 )
                 live_nodes.append(self._volume_node)
+                vram.in_use = _in_use
+                vram.free_vram = _free_vram
 
     class LiveVispyImageLayer(VispyImageLayer):
         def __init__(self, layer, node=None, texture_format="auto", **_kwargs):
@@ -1272,11 +1555,12 @@ class LiveFollower:
         nodes = [getattr(layer, "live_node", None) for layer in self.layers]
         if self.vram is None or not any(nodes):
             return
+        self.vram.trim()  # MATLAB's decon needs the GPU's reserve back
         if time.monotonic() - self._active_at < PRELOAD_IDLE_S:
             return
         here = int(self.viewer.dims.current_step[0])
         per_t = sum(math.prod(src.shapes[0][1:]) for src in self.sources) * 2
-        radius = min(PREFETCH_RADIUS, int(self.vram.budget / per_t / 2))
+        radius = min(PREFETCH_RADIUS, int(self.vram.capacity() / per_t / 2))
         wanted = sorted(
             (
                 (abs(t - here), t, src, node)
@@ -1360,7 +1644,7 @@ class LiveFollower:
             visible=False,
             colormap=_COLORMAPS.get(color, "gray"),
             blending="additive",
-            contrast_limits=[0, 300],
+            contrast_limits=[0, 255 if src.bits == 8 else 300],
             vram=self.vram,
         )
         layer._slice_dims(self.viewer.dims)
@@ -1589,14 +1873,31 @@ def main(argv: list[str] | None = None) -> None:
         "layer thumbnails get another 40 GB)",
     )
     ap.add_argument(
+        "--bits",
+        type=int,
+        choices=(8, 16),
+        default=8,
+        help="show volumes as 8-bit (default: half the upload and memory; "
+        "looks the same) or 16-bit (as stored)",
+    )
+    ap.add_argument(
         "--vram-gb",
+        default="0",
+        help="GPU memory for timepoints kept as textures (1 GB per timepoint "
+        "at 2 channels, 8-bit): moving back to one of them rebinds it instead "
+        "of uploading. 'auto': all the GPU has free beyond --vram-reserve-gb. "
+        "Off by default (0): measured 2026-09-27, a hit still costs ~0.1 s and "
+        "misses get slower once dozens of textures are allocated",
+    )
+    ap.add_argument(
+        "--vram-reserve-gb",
         type=float,
-        default=0.0,
-        help="GPU memory for timepoints kept as textures (2 GB per timepoint "
-        "at 2 channels): moving back to one of them needs no upload. "
-        "Experimental, off by default (0)",
+        default=VRAM_RESERVE_GB,
+        help="GPU memory the texture cache always leaves free, for MATLAB's "
+        "decon on the same GPU",
     )
     args = ap.parse_args(argv)
+    vram_gb = math.inf if args.vram_gb == "auto" else float(args.vram_gb)
 
     no_hugepage_stalls()
     import napari
@@ -1615,8 +1916,12 @@ def main(argv: list[str] | None = None) -> None:
         follow=not args.no_follow,
         painter=painter,
         title=args.title,
-        cache=ViewCache(full_gb=args.cache_gb),
-        vram=TextureCache(args.vram_gb * 1e9) if args.vram_gb > 0 else None,
+        cache=ViewCache(full_gb=args.cache_gb, bits=args.bits),
+        vram=(
+            TextureCache(vram_gb * 1e9, reserve_bytes=args.vram_reserve_gb * 1e9)
+            if vram_gb > 0
+            else None
+        ),
     )
 
     @viewer.bind_key("f")
