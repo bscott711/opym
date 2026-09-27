@@ -11,7 +11,9 @@ Supervisor for the PetaKit job queue: one PetaKit5D MATLAB server
   2026-09-23 server 1 died at 13:29, server 2 hung at 15:47, and nothing ran
   for 43 hours.
 - A ticket held by a server that dies goes back in the queue
-  (`requeue_claim`), at most MAX_REQUEUES times, then to failed/.
+  (`requeue_claim`), at most MAX_REQUEUES times, then to failed/. For a
+  backfill ticket, the partial outputs the dead server left in its dataDir
+  are removed first (`sweep_partial_outputs`).
 - A claim whose dataDir has had no file written for `hang_after_s` is
   flagged; with `kill_hung`, its server is killed, which requeues the ticket
   and frees the GPU.
@@ -37,6 +39,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess  # nosec B404
 import time
@@ -171,6 +175,43 @@ def requeue_claim(
     active_path.unlink(missing_ok=True)
     os.replace(staging, queue_dir / name)
     return "requeued"
+
+
+# PetaKit5D writes each output as "<name>_<uuid>.tif" (or .zarr) and renames
+# it into place once complete, so a server killed mid-write leaves that file
+# behind -- and downstream globs ("*_C0_T*.tif") would read it as one more
+# frame. Seen after a preemption (R6, 2026-09-27) and in production output.
+_PARTIAL_OUTPUT = re.compile(
+    r"_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(tiff?|zarr)$"
+)
+PARTIAL_SWEEP_DEPTH = 4
+
+
+def sweep_partial_outputs(
+    data_dir: Path, depth: int = PARTIAL_SWEEP_DEPTH
+) -> list[Path]:
+    """Remove PetaKit5D's half-written outputs ("<name>_<uuid>.tif" files,
+    ".zarr" directories) under `data_dir`, down to `depth` levels (Decon/,
+    Decon/DSR_decon/, their MIPs/). Only for a ticket no server is running:
+    another server's output in progress looks the same. Returns what went."""
+    removed: list[Path] = []
+    top = len(data_dir.parts)
+    for dirpath, dirs, files in os.walk(data_dir):
+        here = Path(dirpath)
+        for name in [d for d in dirs if _PARTIAL_OUTPUT.search(d)]:
+            shutil.rmtree(here / name, ignore_errors=True)
+            removed.append(here / name)
+            dirs.remove(name)
+        if len(here.parts) - top >= depth:
+            dirs[:] = []
+        for name in files:
+            if _PARTIAL_OUTPUT.search(name):
+                try:
+                    (here / name).unlink()
+                except OSError:
+                    continue
+                removed.append(here / name)
+    return removed
 
 
 def newest_mtime(root: Path) -> float | None:
@@ -430,8 +471,27 @@ class ServerSupervisor:
             return
         active = claim.active_path(self.base_dir)
         if active.exists():
+            if claim.lane == lanes.BACKFILL_QUEUE_NAME:
+                self._sweep_partials(active)
             outcome = requeue_claim(active, reason, count=count)
             print(f"♻️  {claim.ticket}: {outcome} ({reason})", flush=True)
+
+    def _sweep_partials(self, active: Path) -> None:
+        """The backfill ticket's server is gone: its half-written outputs go
+        too. A backfill ticket has its dataDir to itself (live tickets of one
+        session share theirs, so they are never swept)."""
+        try:
+            data_dir = Path(json.loads(active.read_text())["dataDir"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        removed = sweep_partial_outputs(data_dir)
+        if removed:
+            print(
+                f"🧹 Removed {len(removed)} partial output(s) under {data_dir}: "
+                + ", ".join(p.name for p in removed[:3])
+                + (" ..." if len(removed) > 3 else ""),
+                flush=True,
+            )
 
     def _reclaim_unowned(self) -> None:
         """With no server process alive at all, nothing can legitimately hold

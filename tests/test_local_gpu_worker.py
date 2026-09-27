@@ -25,6 +25,7 @@ from opym.local_gpu_worker import (
     _next_backoff_sec,
     has_claimable_work,
     requeue_claim,
+    sweep_partial_outputs,
 )
 
 
@@ -577,3 +578,76 @@ def test_server_pids_only_match_their_own_jobs_dir(tmp_path):
         for proc in procs:
             proc.kill()
             proc.wait()
+
+
+UUID = "616f3077-82e9-4f57-afb2-47d770af67cc"
+
+
+def _dataset_with_partials(root: Path) -> Path:
+    """A backfill dataDir after its server was killed mid-DSR: finished
+    frames, plus PetaKit5D's half-written "<name>_<uuid>" outputs."""
+    data = root / "cell_1" / "processed_tiff_series_split"
+    dsr = data / "Decon" / "DSR_decon"
+    (dsr / "MIPs").mkdir(parents=True)
+    for d in (data, data / "Decon", dsr):
+        (d / "cell_C0_T000.tif").write_bytes(b"done")
+    (dsr / f"cell_C0_T001_{UUID}.tif").write_bytes(b"half")
+    (dsr / "MIPs" / f"cell_C0_T001_MIP_z_{UUID}.tif").write_bytes(b"half")
+    (data / "Decon" / f"cell_C0_T002_{UUID}.zarr").mkdir()
+    (data / "Decon" / f"cell_C0_T002_{UUID}.zarr" / ".zarray").write_text("{}")
+    return data
+
+
+def test_sweep_removes_only_petakits_half_written_outputs(tmp_path):
+    data = _dataset_with_partials(tmp_path)
+    removed = sweep_partial_outputs(data)
+    assert sorted(p.name for p in removed) == sorted(
+        [
+            f"cell_C0_T001_MIP_z_{UUID}.tif",
+            f"cell_C0_T001_{UUID}.tif",
+            f"cell_C0_T002_{UUID}.zarr",
+        ]
+    )
+    left = sorted(str(p.relative_to(data)) for p in data.rglob("*") if p.is_file())
+    assert left == [
+        "Decon/DSR_decon/cell_C0_T000.tif",
+        "Decon/cell_C0_T000.tif",
+        "cell_C0_T000.tif",
+    ]
+    assert sweep_partial_outputs(tmp_path / "missing") == []
+
+
+def test_a_preempted_backfill_ticket_leaves_no_partial_outputs(tmp_path):
+    """R6 (2026-09-27): a server preempted mid-DSR left
+    "..._T000_<uuid>.tif" beside the finished frames, which the viewer export
+    and the MIP glob would read as one more frame."""
+    data = _dataset_with_partials(tmp_path / "data")
+    lease = {"active": False}
+    sup, _, _, procs, killed = _busy_with_backfill_and_live_waiting(
+        tmp_path, waited_s=0, lease_active=lambda: lease["active"]
+    )
+    active = sup.queue_dir / ".active_bf_a.json"
+    active.write_text(json.dumps({"jobType": "deskew", "dataDir": str(data)}))
+    (sup.live_queue_dir / "LIVE_t000.json").unlink()
+    lease["active"] = True
+    sup.tick()  # preempts server 1 (bf_a)
+    sup.tick()  # its exit: sweep, then requeue
+    assert killed == ["1"]
+    assert (sup.queue_dir / "bf_a.json").exists()
+    assert not [p for p in data.rglob("*") if UUID in p.name]
+    assert (data / "Decon" / "DSR_decon" / "cell_C0_T000.tif").exists()
+
+
+def test_a_dead_servers_live_ticket_is_requeued_without_a_sweep(tmp_path):
+    """Live tickets of one session share its dataDir, and the other GPU may
+    be mid-write there: only backfill tickets are swept."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.live_queue_dir, "LIVE_t000.json", data_dir=data)
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "LIVE_t000.json", lane="queue_live")
+    procs["1"].exit(-9)
+    sup.tick()
+    assert (sup.live_queue_dir / "LIVE_t000.json").exists()
+    assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
