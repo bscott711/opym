@@ -383,3 +383,70 @@ def test_the_final_ack_confirms_session_end_and_a_repeat_is_confirmed_too(
     )
     assert _pump(recv, sock)["unknown_session"] is True
     sock.close()
+
+
+class _FakeDisk:
+    """shutil.disk_usage with a free figure the test sets (GB)."""
+
+    def __init__(self, free_gb):
+        self.free_gb = free_gb
+
+    def __call__(self, _path):
+        import collections
+
+        usage = collections.namedtuple("usage", "total used free")
+        return usage(252 * 10**9, 0, int(self.free_gb * 1e9))
+
+
+def test_below_the_ram_disk_floor_frames_wait_and_are_taken_once_space_is_back(
+    tmp_path, recv, monkeypatch
+):
+    """R5: below the floor the receiver holds frames back unACKed (the
+    client keeps and resends them) instead of filling tmpfs."""
+    import shutil
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
+    disk = _FakeDisk(free_gb=150)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    sock = _dealer(recv, "sess-floor")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-floor", _header(raw)))
+    assert _pump(recv, sock) is not None
+
+    disk.free_gb = 12
+    recv._check_stage_space()
+    header, payload = _frame(0, 0)
+    sock.send_multipart(pack_message(MSG_FRAME, "sess-floor", header, payload))
+    assert _pump(recv, sock, timeout=0.5) is None  # no ACK: held back
+    assert (0, 0) not in recv.sessions["sess-floor"].received_pairs
+
+    disk.free_gb = 150  # eviction (or anything else) freed space
+    sock.send_multipart(pack_message(MSG_FRAME, "sess-floor", header, payload))
+    assert _pump(recv, sock)["through_frame_index"] == 0
+    assert (0, 0) in recv.sessions["sess-floor"].received_pairs
+    sock.close()
+
+
+def test_a_session_start_frees_ram_disk_space_before_refusing(
+    tmp_path, recv, monkeypatch
+):
+    import shutil
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    disk = _FakeDisk(free_gb=0.0)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    asked = []
+
+    def free_up(nbytes):
+        asked.append(nbytes)
+        disk.free_gb = 150  # the oldest drained sessions went
+        return nbytes
+
+    monkeypatch.setattr(recv._drain_pool, "free_up", free_up)
+    sock = _dealer(recv, "sess-room")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-room", _header(raw)))
+    assert _pump(recv, sock) is not None
+    assert asked and "sess-room" in recv.sessions
+    sock.close()

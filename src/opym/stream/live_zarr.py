@@ -84,6 +84,39 @@ PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
 
 
+def evict_finished_views(jobs: Path, running: set[str] = frozenset()) -> int:
+    """For RAM-disk pressure: remove the view directory of every session not
+    in `running` whose stores are finished (the lane closed them, so their
+    GPFS archive is complete), even the newest one the lane otherwise keeps.
+    Never the one live_latest.json names: naparym-live may be showing it.
+    A store still "running" may belong to a session a restarted receiver
+    will resume, so it stays. Returns the bytes freed."""
+    root = view_root()
+    if not root.is_dir():
+        return 0
+    try:
+        latest_id = json.loads((jobs / LIVE_LATEST_NAME).read_text()).get("session_id")
+    except (OSError, ValueError, AttributeError):
+        latest_id = None
+    freed = 0
+    for d in root.iterdir():
+        if not d.is_dir() or d.name in running or d.name == latest_id:
+            continue
+        stores = [p for p in d.iterdir() if p.name.endswith(".ome.zarr")]
+        states = [(read_progress(st) or {}).get("state") for st in stores]
+        if not states or any(st not in ("complete", "failed") for st in states):
+            continue
+        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+        shutil.rmtree(d, ignore_errors=True)
+        logger.info(
+            "RAM disk short: removed finished view store %s (%.1f GB)",
+            d.name,
+            size / 1e9,
+        )
+        freed += size
+    return freed
+
+
 def _resumable_pairs(store: Path, n_t: int, n_c: int, shape_zyx) -> set | None:
     """The (t, c) pairs an existing processed store of exactly this grid
     already holds, per its progress file; None when there is no such store
@@ -658,6 +691,10 @@ class ZarrLiveLane(LiveLane):
         others.sort(key=lambda d: d.stat().st_mtime, reverse=True)
         for d in others[1:]:
             shutil.rmtree(d, ignore_errors=True)
+
+    def evict_finished_views(self) -> int:
+        """`evict_finished_views` for everything this lane isn't running."""
+        return evict_finished_views(self.jobs, running=set(self.sessions))
 
     def _write_latest(self, session: ZarrLiveSession) -> None:
         """Point naparym-live at the newest session: the RAM-disk store and

@@ -359,6 +359,32 @@ def test_resume_starts_fresh_when_the_old_stores_are_another_grid(tmp_path, psf)
     assert w.image_group(r.view_store)["0"].shape[0] == 3  # re-created
 
 
+def test_ram_disk_pressure_evicts_only_finished_view_stores(tmp_path, psf):
+    """R5: a finished session's RAM-disk view store goes (its GPFS archive
+    is complete); a running one, one a restarted receiver may resume, and
+    the one naparym-live follows stay."""
+    lane, jobs = _lane(tmp_path, psf)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    done = _session(lane, tmp_path, n_t=1, n_c=1, sid="done")
+    lane.frame_staged("done", 0, 0)
+    lane.pump()
+    for path, tk in _tickets(jobs):
+        _complete(jobs, path, tk, shape)
+    lane.end_session("done")
+    assert _pump_until(lane, lambda: "done" not in lane.sessions)
+    assert done.view_dir.exists()
+    assert live_zarr.evict_finished_views(jobs) == 0  # still the latest
+    running = _session(lane, tmp_path, n_t=1, n_c=1, sid="running")
+    assert done.view_dir.exists()  # the newest finished: kept until pressure
+    # Left "running" by a receiver that died: it may be resumed.
+    stale = live_zarr.view_root() / "stale" / "x_dsr.ome.zarr"
+    stale.mkdir(parents=True)
+    w.write_progress(stale, n_t=1, n_c=1, done=[], state="running")
+    assert lane.evict_finished_views() > 0
+    assert not done.view_dir.exists()
+    assert stale.exists() and running.view_dir.exists()
+
+
 def test_only_the_newest_timepoints_keep_uncompressed_buffers(tmp_path, psf):
     lane, jobs = _lane(tmp_path, psf)
     n_t = BUFFER_KEEP_T + 2

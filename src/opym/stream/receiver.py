@@ -87,6 +87,14 @@ the lane again, a half-received volume is finished from the planes already
 written, and the lane picks its view and archive stores up where they were.
 Otherwise it goes to the batch pipeline.
 
+RAM-disk floor: the staging root shares tmpfs with the live view stores,
+PetaKit5D's queue and every other session. Below twice the floor
+(`OPYM_STREAM_STAGE_FLOOR_GB`, default 20) free, drained sessions are evicted
+early (they are safe on GPFS), oldest first, then finished view stores. Below
+the floor itself, frames are held back unACKed: the client keeps them and
+resends, and if space never comes back its own buffer fills and it pauses
+(below), so tmpfs never fills mid-session.
+
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
 holds). The partial copy is kept on staging for the usual retention but
@@ -100,6 +108,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -215,6 +224,21 @@ def _holds_files(path: Path) -> bool:
     directory tree (e.g. a staging leaf whose files the live lane already
     removed) doesn't block reusing its name."""
     return path.is_dir() and any(p.is_file() for p in path.rglob("*"))
+
+
+_STAGE_FLOOR_ENV_VAR = "OPYM_STREAM_STAGE_FLOOR_GB"
+_DEFAULT_STAGE_FLOOR_GB = 20.0
+_SPACE_CHECK_EVERY_S = 5.0
+_SHORT_WARN_EVERY_S = 10.0
+
+
+def _stage_floor_bytes() -> int:
+    """Free space the staging RAM disk keeps; see the module docstring."""
+    try:
+        gb = float(os.environ.get(_STAGE_FLOOR_ENV_VAR, _DEFAULT_STAGE_FLOOR_GB))
+    except ValueError:
+        gb = _DEFAULT_STAGE_FLOOR_GB
+    return int(gb * 1e9)
 
 
 def _stage_root_from_env() -> Path | None:
@@ -404,6 +428,10 @@ class StreamReceiver:
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
+        self._last_space_check = float("-inf")
+        self._stage_short = False
+        self._last_short_warning = float("-inf")
+        self._freeing: threading.Thread | None = None
         # Created on the first live session (see _maybe_start_live), so the
         # env switches stay readable per session like the others here.
         self._live: LiveLane | None = None
@@ -509,6 +537,8 @@ class StreamReceiver:
                 self._handle_incoming(sock)
         self._flush_pending_acks()
         self._sweep_idle_sessions()
+        if time.monotonic() - self._last_space_check >= _SPACE_CHECK_EVERY_S:
+            self._check_stage_space()
         # Held while any session is open; refreshed every few seconds so it
         # goes stale (and frees the GPUs) within a minute if we crash.
         if self._live is not None:
@@ -517,6 +547,64 @@ class StreamReceiver:
         # The lease also covers live work still in flight after SESSION_END.
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
+
+    def _free_stage_space(self, stage_root: Path, want_free: int) -> int:
+        """Evict what is safe to evict until `want_free` bytes are free on
+        the staging RAM disk: drained sessions oldest first, then finished
+        view stores. Returns the bytes free afterwards."""
+        free = shutil.disk_usage(stage_root).free
+        if free >= want_free:
+            return free
+        self._drain_pool.free_up(want_free - free)
+        free = shutil.disk_usage(stage_root).free
+        if free < want_free:
+            running = set(self._live.sessions) if self._live is not None else set()
+            live_zarr.evict_finished_views(lanes.jobs_dir(), running=running)
+            free = shutil.disk_usage(stage_root).free
+        return free
+
+    def _check_stage_space(self) -> None:
+        """Every few seconds: flag the RAM disk short below the floor (frames
+        are then held back), and below twice the floor free space in the
+        background."""
+        self._last_space_check = time.monotonic()
+        stage_root = _stage_root_from_env()
+        if stage_root is None or not stage_root.exists():
+            self._stage_short = False
+            return
+        floor = _stage_floor_bytes()
+        free = shutil.disk_usage(stage_root).free
+        self._stage_short = free < floor
+        if free < 2 * floor and not (self._freeing and self._freeing.is_alive()):
+            self._freeing = threading.Thread(
+                target=self._free_stage_space,
+                args=(stage_root, 2 * floor),
+                name="stage-free-up",
+                daemon=True,
+            )
+            self._freeing.start()
+
+    def _held_back(self, session: SessionState) -> bool:
+        """True while this session's frames must wait: it stages on the RAM
+        disk and that is below the floor (see the module docstring)."""
+        if not self._stage_short or session.write_root == session.raw_root:
+            return False
+        stage_root = _stage_root_from_env()
+        free = shutil.disk_usage(stage_root).free if stage_root else 0
+        if free >= _stage_floor_bytes():
+            self._stage_short = False
+            return False
+        now = time.monotonic()
+        if now - self._last_short_warning >= _SHORT_WARN_EVERY_S:
+            self._last_short_warning = now
+            logger.warning(
+                "RAM disk below its floor (%.1f GB free < %.1f GB): holding "
+                "frames of session %s back; the client resends them",
+                free / 1e9,
+                _stage_floor_bytes() / 1e9,
+                session.session_id,
+            )
+        return True
 
     def _handle_incoming(self, sock: zmq.Socket) -> None:
         identity, *rest = sock.recv_multipart()
@@ -620,6 +708,8 @@ class StreamReceiver:
                 # staging session (and PetaKit5D's own /dev/shm usage), and
                 # a session that starts right at the edge would starve
                 # whichever one grows next. See module docstring.
+                if estimated_bytes * 2 > free_bytes:
+                    free_bytes = self._free_stage_space(stage_root, estimated_bytes * 2)
                 if estimated_bytes * 2 > free_bytes:
                     raise ValueError(
                         f"staging root {stage_root} has {free_bytes / 1e9:.1f} GB "
@@ -989,6 +1079,8 @@ class StreamReceiver:
             logger.warning(
                 "FRAME with no payload for session %s -- dropped", session_id
             )
+            return
+        if self._held_back(session):
             return
 
         recv_s = time.time()
