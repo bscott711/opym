@@ -255,6 +255,13 @@ continues in its old stores, and the batch pipeline (not the live lane)
 processes it. A `SESSION_START` for a session that is still open is just
 re-ACKed.
 
+`resend: true` means the receiver dropped frames it could not stage (its RAM
+disk was below `OPYM_STREAM_STAGE_FLOOR_GB`) and has room again: resend now
+everything still unACKed, in `frame_index` order, as after a `RESUME` reply.
+Without it a client only resends once it decides the link is stale, which
+for gigabytes held back takes minutes. A client that ignores the field
+still recovers, just later.
+
 `server_time_s` (the server's clock when it sent the ACK) is informational:
 clients use it only to estimate their clock offset for the trace fields.
 
