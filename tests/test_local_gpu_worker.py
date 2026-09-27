@@ -322,6 +322,51 @@ def test_live_claim_of_a_dead_server_is_requeued_into_the_live_lane(tmp_path):
     assert not (sup.queue_dir / "LIVE_t000.json").exists()
 
 
+def _held_live_claim(tmp_path, held_s, lane="queue_live", **kwargs):
+    """Server 1 holds a ticket claimed `held_s` ago (by the fake clock)."""
+    sup, launched, clock = _make_supervisor(tmp_path, **kwargs)
+    queue = sup.live_queue_dir if lane == "queue_live" else sup.queue_dir
+    _ticket(queue, "LIVE_t000.json")
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "LIVE_t000.json", lane=lane)
+    rec = sup.claims_dir / "S1.json"
+    os.utime(rec, (clock.t - held_s, clock.t - held_s))
+    killed = []
+
+    def fake_kill(slot, **kw):
+        killed.append((slot.server_id, kw.get("grace_s")))
+        procs[slot.server_id].exit(-9)
+
+    sup._kill = fake_kill
+    return sup, clock, killed
+
+
+def test_a_live_ticket_past_its_deadline_kills_its_server_and_is_requeued(tmp_path):
+    sup, clock, killed = _held_live_claim(tmp_path, held_s=29)
+    sup.tick()
+    assert killed == []  # a slow but legitimate ticket
+    clock.t += 2
+    sup.tick()
+    assert killed == [
+        ("1", local_gpu_worker.LIVE_KILL_GRACE_S)
+    ]  # SIGKILL soon, not in 20 s
+    sup.tick()  # reaped: the ticket goes back to the live lane for server 2
+    assert (sup.live_queue_dir / "LIVE_t000.json").exists()
+    clock.t += 60
+    sup.tick()
+    assert len(killed) == 1
+
+
+def test_the_live_deadline_ignores_backfill_and_can_be_turned_off(tmp_path):
+    sup, _, killed = _held_live_claim(tmp_path / "a", held_s=600, lane="queue")
+    sup.tick()
+    assert killed == []  # backfill tickets run for minutes
+    sup, _, killed = _held_live_claim(tmp_path / "b", held_s=600, live_deadline_s=0)
+    sup.tick()
+    assert killed == []
+
+
 def test_claim_record_without_a_queue_field_is_the_backfill_lane(tmp_path):
     """Records written by servers from before lanes existed."""
     sup, launched, _ = _make_supervisor(tmp_path)
