@@ -34,6 +34,11 @@ function stats = run_live_zarr(p, numCPUs)
 %                   uint16 .npy on the RAM disk (numpy memory-maps it: no
 %                   decode). It lands before the compressed store is written,
 %                   so the view never waits on encoding.
+%   view_bits       optional, 16 (default) or 8: an 8-bit view buffer holds
+%                   min(v >> shift, 255), what naparym-live shows. The shift
+%                   is fixed per channel for the session by its first volume
+%                   and shared through <view dir>/display_C<c>.json (see
+%                   displayShift below and naparym-live's DISPLAY_LEVELS).
 %   psf_path, decon_dir (the session's work dir), plus a 'live' ticket's
 %                   decon and DSR fields
 %   psf_cache_dir   optional: where the generated PSF and OMW back projector
@@ -135,7 +140,8 @@ if getp(p, 'warmup', false)
     clear dummy;
     d = deskewRotateFrame3D(d, ang, dz, xy, dsrArgs{:});
     if isfield(p, 'view_dir') && ~isempty(p.view_dir)
-        opymWriteLiveOutputs('prepare', char(p.view_dir), double(size(d, 1 : 3)));
+        opymWriteLiveOutputs('prepare', char(p.view_dir), double(size(d, 1 : 3)), ...
+            double(getp(p, 'view_bits', 16)));
     end
     stats.decon_s = toc(t0);
     return;
@@ -182,8 +188,12 @@ if isfield(p, 'view_npy') && ~isempty(p.view_npy)
 end
 % (Absolute times too, for opym-live-trace: the view buffer is what the
 % viewer shows, so its landing time is where the viewer's hops start.)
+outArgs = {dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]};
+if ~isempty(viewNpy) && getp(p, 'view_bits', 16) == 8
+    outArgs{end + 1} = displayShift(dsr, fileparts(viewNpy), c);
+end
 tCall = posixtime(datetime('now', 'TimeZone', 'UTC'));
-tt = opymWriteLiveOutputs(dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]);
+tt = opymWriteLiveOutputs(outArgs{:});
 stats.view_s = tt(1);
 stats.write_s = tt(2);
 stats.buffer_at = tCall + tt(1);
@@ -206,6 +216,48 @@ if ~isequal(key, k)
     key = k;
 end
 zeroIdx = idx;
+end
+
+
+function k = displayShift(dsr, viewDir, c)
+% The right shift that takes channel c's volumes to the viewer's 8 bits:
+% the largest that keeps 120 grey levels below the 99.9th percentile of
+% every 4th nonzero voxel (naparym-live's DISPLAY_LEVELS rule). Fixed for
+% the session by the channel's first volume, so its intensities compare
+% across time, and shared with the other server and the viewer through
+% <view dir>/display_C<c>.json: whoever publishes first wins.
+fn = fullfile(viewDir, sprintf('display_C%d.json', c));
+k = readShift(fn);
+if ~isempty(k), return; end
+sub = dsr(1 : 4 : end, 1 : 4 : end, 1 : 4 : end);
+sub = sub(sub > 0);
+k = 0;
+hi = 0;
+if ~isempty(sub)
+    % The 99.9th percentile as the smallest of the top 0.1%: maxk is linear.
+    hi = double(min(maxk(sub, max(1, ceil(numel(sub) / 1000)))));
+    k = max(0, floor(log2(max(hi, 1) / 120)));
+end
+tmp = sprintf('%s.%s.tmp', fn, get_uuid());
+fid = fopen(tmp, 'w');
+fprintf(fid, '{"shift": %d, "levels": 120, "p999": %g}\n', k, hi);
+fclose(fid);
+publishOnce(tmp, fn, false);
+k = readShift(fn);
+end
+
+
+function k = readShift(fn)
+% The published shift, or [] if there is none yet (or it can't be read).
+k = [];
+if exist(fn, 'file') == 2
+    try
+        s = jsondecode(fileread(fn));
+        k = double(s.shift);
+    catch
+        k = [];
+    end
+end
 end
 
 

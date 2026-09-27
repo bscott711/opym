@@ -1,4 +1,4 @@
-// t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex)
+// t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, shift])
 //
 // Everything the live job writes for one deskewed (t, c) volume, from a
 // single transpose. deskewRotateFrame3D returns (Y, X, Z) column-major and
@@ -13,6 +13,14 @@
 //     map of a temporary file, renamed into place before anything else
 //     happens, so the viewer never waits on encoding. With npyPath '' the
 //     transpose goes to memory and no view buffer is written.
+//
+//     With `shift`, the view buffer is uint8 instead: min(v >> shift, 255),
+//     what naparym-live shows (half the bytes to write, map and upload). The
+//     volume is transposed into a uint16 working buffer kept across calls
+//     (its pages already present; steps 2 and 3 read it), then scaled into
+//     the map row by contiguous row, and published. (Transposing straight
+//     into 8 bits, or into both at once, was slower inside MATLAB: 0.12-0.14 s
+//     to the published buffer against ~0.07 s.)
 //
 //     Mapping a fresh 1 GB file costs ~0.3-0.4 s in page faults on the RAM
 //     disk -- more than the transpose itself (~0.02 s). So after each call a
@@ -40,9 +48,10 @@
 // Returns t = [view_s, write_s]: seconds to the published view buffer, then
 // for all the zarr writes.
 //
-// opymWriteLiveOutputs('prepare', dir, [Y X Z]) only readies a view buffer
-// for a (Y, X, Z) volume in dir, in the background -- what a server's
-// warm-up does before a session's first volume arrives.
+// opymWriteLiveOutputs('prepare', dir, [Y X Z][, bits]) only readies a view
+// buffer (16- or 8-bit, default 16) for a (Y, X, Z) volume in dir, in the
+// background -- what a server's warm-up does before a session's first
+// volume arrives. For 8 bits it also readies the working buffer.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -193,10 +202,11 @@ std::string writeBlock(const Block &b, const uint16_t *vol)
     return err;
 }
 
-std::string npyHeader(uint64_t Z, uint64_t Y, uint64_t X)
+std::string npyHeader(uint64_t Z, uint64_t Y, uint64_t X, bool u8 = false)
 {
     // What writeNpyZYX wrote: the whole header a multiple of 64 bytes.
-    std::string dict = "{'descr': '<u2', 'fortran_order': False, 'shape': (" + std::to_string(Z) +
+    std::string dict = std::string("{'descr': '") + (u8 ? "|u1" : "<u2") +
+                       "', 'fortran_order': False, 'shape': (" + std::to_string(Z) +
                        ", " + std::to_string(Y) + ", " + std::to_string(X) + "), }";
     const size_t pad = (64 - ((10 + dict.size() + 1) % 64)) % 64;
     dict.append(pad, ' ');
@@ -231,6 +241,10 @@ struct Prepared {
 std::thread prepThread;
 Prepared prep;  // written only by prepThread; read after joining it
 bool locked = false;
+// The uint16 C-order volume when the view buffer is 8-bit (or absent): kept
+// across calls so its pages are faulted once, not per volume. Touched only
+// by mexFunction and by prepThread, never both at once (joinPrep first).
+std::vector<uint16_t> work;
 
 void joinPrep()
 {
@@ -252,15 +266,17 @@ void atExit()
 
 // Unmap the buffer just published (in the background too: tearing down a
 // 1 GB mapping isn't free), then ready the next one.
-void startPrep(const std::string &dir, uint64_t size, void *oldMap, uint64_t oldSize)
+void startPrep(const std::string &dir, uint64_t size, void *oldMap, uint64_t oldSize,
+               uint64_t workVox = 0)
 {
     if (!locked) {
         mexLock();  // a running thread must never outlive the code it runs
         mexAtExit(atExit);
         locked = true;
     }
-    prepThread = std::thread([dir, size, oldMap, oldSize]() {
+    prepThread = std::thread([dir, size, oldMap, oldSize, workVox]() {
         if (oldMap) munmap(oldMap, oldSize);
+        if (workVox && work.size() != workVox) work.assign(workVox, 0);
         Prepared p;
         p.path = dir + "/.opym_prep_" + std::to_string(getpid()) + ".npy.tmp";
         const int fd = open(p.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -283,6 +299,26 @@ void startPrep(const std::string &dir, uint64_t size, void *oldMap, uint64_t old
     });
 }
 
+// (Y, X, Z) col-major -> C-order (Z, Y, X), plane by plane, in cache-sized tiles.
+void transpose16(const uint16_t *dsr, uint16_t *vol, uint64_t Y, uint64_t X, uint64_t Z)
+{
+    const uint64_t T = 64;
+    const int64_t nTy = (int64_t)((Y + T - 1) / T);
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t z = 0; z < (int64_t)Z; z++) {
+        for (int64_t ty = 0; ty < nTy; ty++) {
+            const uint16_t *src = dsr + (uint64_t)z * Y * X;
+            uint16_t *dst = vol + (uint64_t)z * Y * X;
+            const uint64_t y0 = (uint64_t)ty * T, y1 = std::min(Y, y0 + T);
+            for (uint64_t x0 = 0; x0 < X; x0 += T) {
+                const uint64_t x1 = std::min(X, x0 + T);
+                for (uint64_t y = y0; y < y1; y++)
+                    for (uint64_t x = x0; x < x1; x++) dst[y * X + x] = src[y + x * Y];
+            }
+        }
+    }
+}
+
 std::string dirOf(const std::string &path)
 {
     const size_t k = path.find_last_of('/');
@@ -293,24 +329,30 @@ std::string dirOf(const std::string &path)
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
-    if (nrhs == 3 && mxIsChar(prhs[0])) {
-        if (str(prhs[0], "command") != "prepare")
-            mexErrMsgIdAndTxt("opymLive:input", "Usage: opymWriteLiveOutputs('prepare', dir, [Y X Z])");
+    if ((nrhs == 3 || nrhs == 4) && mxIsChar(prhs[0])) {
+        const char *usage = "Usage: opymWriteLiveOutputs('prepare', dir, [Y X Z][, bits])";
+        if (str(prhs[0], "command") != "prepare") mexErrMsgIdAndTxt("opymLive:input", usage);
         const std::string dir = str(prhs[1], "dir");
         if (dir.empty() || !mxIsDouble(prhs[2]) || mxGetNumberOfElements(prhs[2]) != 3)
-            mexErrMsgIdAndTxt("opymLive:input", "Usage: opymWriteLiveOutputs('prepare', dir, [Y X Z])");
+            mexErrMsgIdAndTxt("opymLive:input", usage);
+        const double bits = nrhs == 4 ? mxGetScalar(prhs[3]) : 16.0;
+        if (bits != 8.0 && bits != 16.0) mexErrMsgIdAndTxt("opymLive:input", usage);
+        const bool u8 = bits == 8.0;
         const double *sz = mxGetPr(prhs[2]);
         const uint64_t Y = (uint64_t)sz[0], X = (uint64_t)sz[1], Z = (uint64_t)sz[2];
-        const uint64_t size = npyHeader(Z, Y, X).size() + Z * Y * X * sizeof(uint16_t);
+        const uint64_t nVox = Z * Y * X;
+        const uint64_t size = npyHeader(Z, Y, X, u8).size() + nVox * (u8 ? 1 : sizeof(uint16_t));
         joinPrep();
-        if (prep.map && prep.dir == dir && prep.size == size) return;
+        if (prep.map && prep.dir == dir && prep.size == size && (!u8 || work.size() == nVox))
+            return;
         dropPrep();
-        startPrep(dir, size, nullptr, 0);
+        startPrep(dir, size, nullptr, 0, u8 ? nVox : 0);
         return;
     }
-    if (nrhs != 5)
-        mexErrMsgIdAndTxt("opymLive:input",
-                          "Usage: t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex)");
+    if (nrhs != 5 && nrhs != 6)
+        mexErrMsgIdAndTxt(
+            "opymLive:input",
+            "Usage: t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, shift])");
     if (mxGetClassID(prhs[0]) != mxUINT16_CLASS || mxGetNumberOfDimensions(prhs[0]) != 3)
         mexErrMsgIdAndTxt("opymLive:input", "dsr must be a 3-D uint16 array (Y, X, Z)");
     const std::string npyPath = str(prhs[1], "npyPath");
@@ -327,6 +369,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         const double v = mxGetPr(prhs[4])[k];
         if (v < 1) mexErrMsgIdAndTxt("opymLive:input", "leadingIndex values are 1-based");
         leading.push_back((uint64_t)v - 1);
+    }
+
+    int shift = -1;  // < 0: a uint16 view buffer
+    if (nrhs == 6) {
+        const double v = mxGetScalar(prhs[5]);
+        if (!(v >= 0 && v <= 15) || v != (double)(int)v)
+            mexErrMsgIdAndTxt("opymLive:input", "shift must be an integer in 0..15");
+        shift = (int)v;
     }
 
     const mwSize *d = mxGetDimensions(prhs[0]);
@@ -346,23 +396,23 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     const auto t0 = Clock::now();
 
     // 1. The view buffer: transpose (Y, X, Z) col-major -> C-order (Z, Y, X)
-    // plane by plane, in cache-sized tiles, into the memory map.
-    const std::string header = npyHeader(Z, Y, X);
-    const uint64_t nVox = Z * Y * X;
+    // plane by plane, in cache-sized tiles, into the memory map (a uint16
+    // buffer), or into the working buffer and, scaled, the map (uint8).
     const bool view = !npyPath.empty();
-    const uint64_t fileSize = header.size() + nVox * sizeof(uint16_t);
+    const bool u8 = view && shift >= 0;
+    const std::string header = npyHeader(Z, Y, X, u8);
+    const uint64_t nVox = Z * Y * X;
+    const uint64_t fileSize = header.size() + nVox * (u8 ? 1 : sizeof(uint16_t));
     std::string tmp = npyPath + ".tmp";
     const std::string dir = dirOf(npyPath);
     void *map = nullptr;
-    std::vector<uint16_t> mem;
     uint16_t *vol;
+    uint8_t *vol8 = nullptr;
     joinPrep();
     if (view && prep.map && prep.dir == dir && prep.size == fileSize) {
         map = prep.map;  // readied after the last call: every page present
         tmp = prep.path;
         prep = Prepared();
-        std::memcpy(map, header.data(), header.size());
-        vol = (uint16_t *)((uint8_t *)map + header.size());
     } else if (view) {
         dropPrep();
         const int fd = open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -374,24 +424,25 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         map = mmap(nullptr, fileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         if (map == MAP_FAILED) mexErrMsgIdAndTxt("opymLive:view", "Cannot map %s", tmp.c_str());
-        std::memcpy(map, header.data(), header.size());
+    }
+    if (view) std::memcpy(map, header.data(), header.size());
+    if (view && !u8) {
         vol = (uint16_t *)((uint8_t *)map + header.size());
     } else {
-        mem.resize(nVox);
-        vol = mem.data();
+        if (work.size() != nVox) work.assign(nVox, 0);
+        vol = work.data();
+        if (u8) vol8 = (uint8_t *)map + header.size();
     }
-    const uint64_t T = 64;
-    const int64_t nTy = (int64_t)((Y + T - 1) / T);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int64_t z = 0; z < (int64_t)Z; z++) {
-        for (int64_t ty = 0; ty < nTy; ty++) {
-            const uint16_t *src = dsr + (uint64_t)z * Y * X;
-            uint16_t *dst = vol + (uint64_t)z * Y * X;
-            const uint64_t y0 = (uint64_t)ty * T, y1 = std::min(Y, y0 + T);
-            for (uint64_t x0 = 0; x0 < X; x0 += T) {
-                const uint64_t x1 = std::min(X, x0 + T);
-                for (uint64_t y = y0; y < y1; y++)
-                    for (uint64_t x = x0; x < x1; x++) dst[y * X + x] = src[y + x * Y];
+    transpose16(dsr, vol, Y, X, Z);
+    if (u8) {
+        const unsigned sh = (unsigned)shift;
+        #pragma omp parallel for schedule(static)
+        for (int64_t z = 0; z < (int64_t)Z; z++) {
+            const uint16_t *__restrict src = vol + (uint64_t)z * Y * X;
+            uint8_t *__restrict dst = vol8 + (uint64_t)z * Y * X;
+            for (uint64_t i = 0; i < Y * X; i++) {
+                const unsigned v = (unsigned)src[i] >> sh;
+                dst[i] = (uint8_t)(v > 255u ? 255u : v);
             }
         }
     }
@@ -447,7 +498,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         err = writeBlock(mip, m.data());
     }
     const auto t2 = Clock::now();
-    if (view) startPrep(dir, fileSize, map, fileSize);
+    if (view) startPrep(dir, fileSize, map, fileSize, u8 ? nVox : 0);
     if (!err.empty()) mexErrMsgIdAndTxt("opymLive:write", "%s", err.c_str());
 
     plhs[0] = mxCreateDoubleMatrix(1, 2, mxREAL);

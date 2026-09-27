@@ -128,6 +128,7 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
         decon_dir=tmp_path / "zarr" / "Decon",
         z_step_um=DZ,
         psf_cache_dir=cache,
+        view_bits=8,
         **kw,
     )
     warm.update(
@@ -158,6 +159,7 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 queue_dir=tmp_path / "q",
                 view_npy=tmp_path / "view" / f"T{t}_C{c}.npy",
                 psf_cache_dir=cache,
+                view_bits=(16, 8)[c % 2],  # both kinds of view buffer
                 **kw,
             )
             _run(eng, ticket, "run_live_zarr")
@@ -175,10 +177,27 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 out["1/0"][t, c, 0],
                 tifffile.imread(dsr_dir / "MIPs" / f"{name}_MIP_z.tif"),
             )
-            # The live viewer's copy: the same volume, memory-mapped as is.
+            # The live viewer's copy: the same volume, memory-mapped as is,
+            # or at 8 bits (odd channels), scaled by the shift the channel's
+            # first volume fixed for the session.
             view = np.load(tmp_path / "view" / f"T{t}_C{c}.npy", mmap_mode="r")
-            assert view.flags.c_contiguous and view.dtype == np.uint16
-            np.testing.assert_array_equal(view, level0)
+            assert view.flags.c_contiguous
+            if c % 2 == 0:
+                assert view.dtype == np.uint16
+                np.testing.assert_array_equal(view, level0)
+                assert not (tmp_path / "view" / f"display_C{c}.json").exists()
+            else:
+                rec = json.loads((tmp_path / "view" / f"display_C{c}.json").read_text())
+                if t == 0:  # the rule: 120 levels below the 99.9th percentile
+                    sub = level0[::4, ::4, ::4]
+                    sub = np.sort(sub[sub > 0])
+                    p999 = int(sub[-int(np.ceil(sub.size / 1000))])
+                    assert rec["p999"] == p999
+                    assert rec["shift"] == max(0, int(np.floor(np.log2(p999 / 120))))
+                assert view.dtype == np.uint8
+                np.testing.assert_array_equal(
+                    view, np.minimum(level0 >> rec["shift"], 255).astype(np.uint8)
+                )
             level1 = downsample2(level0)
             np.testing.assert_array_equal(out["0/1"][t, c], level1)
             np.testing.assert_array_equal(out["0/2"][t, c], downsample2(level1))

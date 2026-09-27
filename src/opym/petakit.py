@@ -486,6 +486,7 @@ def live_zarr_parameters(
     dsr_dir_name: str = "DSR_decon",
     view_npy: str | Path | None = None,
     psf_cache_dir: str | Path | None = None,
+    view_bits: int = 16,
 ) -> dict:
     """The parameters of a 'live_zarr' ticket: one (t, c) volume from its raw
     OME-Zarr array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate
@@ -502,8 +503,11 @@ def live_zarr_parameters(
     `dsr_dir_name` is accepted (and ignored) so the same `deskew_decon_kwargs`
     feed both. `view_npy`: where the server puts the full-resolution volume
     for the live viewer (an uncompressed .npy on the RAM disk) before it
-    writes the compressed store.
+    writes the compressed store; `view_bits` 8 makes that buffer 8-bit, as
+    naparym-live shows it (the store stays 16-bit).
     """
+    if view_bits not in (8, 16):
+        raise ValueError(f"view_bits must be 8 or 16, not {view_bits}")
     rl_method = _normalize_rl_method(rl_method)
     params = {
         "raw_store": str(raw_store),
@@ -529,6 +533,8 @@ def live_zarr_parameters(
     }
     if view_npy is not None:
         params["view_npy"] = str(view_npy)
+    if view_bits != 16:
+        params["view_bits"] = int(view_bits)
     if psf_cache_dir is not None:
         params["psf_cache_dir"] = str(psf_cache_dir)
     if background is not None:

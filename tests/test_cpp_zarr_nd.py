@@ -197,3 +197,65 @@ def test_live_outputs_without_a_view_buffer(eng, tmp_path):
     out = zarr.open_group(str(arrs.mip.parents[1]), mode="r")
     np.testing.assert_array_equal(out["0/0"][1, 1], vol)
     np.testing.assert_array_equal(out["1/0"][1, 1, 0], vol.max(axis=0))
+
+
+def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
+    """With a shift, the view buffer is uint8 min(v >> shift, 255) -- what
+    naparym-live shows -- while every store level stays the exact 16-bit
+    volume. Calls alternate 16-bit and 8-bit into one directory (the readied
+    next buffer must not be reused at the wrong size), after an 8-bit
+    'prepare' as the warm-up does."""
+    import matlab
+
+    from opym.ome_zarr_writer import downsample2
+
+    shape = (40, 131, 97)
+    arrs = _processed(tmp_path, shape)
+    view_dir = tmp_path / "view"
+    view_dir.mkdir()
+    eng.opymWriteLiveOutputs(
+        "prepare",
+        str(view_dir),
+        matlab.double([shape[1], shape[2], shape[0]]),
+        8.0,
+        nargout=0,
+    )
+    rng = np.random.default_rng(3)
+    for t, c, shift in ((0, 0, 1.0), (1, 0, None), (1, 1, 3.0)):
+        vol = rng.integers(0, 700, shape, dtype=np.uint16)
+        npy = view_dir / f"T{t}_C{c}.npy"
+        args = [
+            matlab.uint16(np.ascontiguousarray(vol.transpose(1, 2, 0))),
+            str(npy),
+            [str(p) for p in arrs.levels],
+            str(arrs.mip),
+            matlab.double([t + 1, c + 1]),
+        ]
+        if shift is not None:
+            args.append(shift)
+        eng.opymWriteLiveOutputs(*args, nargout=1)
+        view = np.load(npy, mmap_mode="r")
+        assert view.flags.c_contiguous
+        if shift is None:
+            assert view.dtype == np.uint16
+            np.testing.assert_array_equal(view, vol)
+        else:
+            assert view.dtype == np.uint8
+            want = np.minimum(vol >> int(shift), 255).astype(np.uint8)
+            np.testing.assert_array_equal(view, want)
+        out = zarr.open_group(str(arrs.mip.parents[1]), mode="r")
+        ref = vol
+        for lvl in range(len(arrs.levels)):
+            np.testing.assert_array_equal(out[f"0/{lvl}"][t, c], ref)
+            ref = downsample2(ref)
+        np.testing.assert_array_equal(out["1/0"][t, c, 0], vol.max(axis=0))
+    with pytest.raises(Exception, match="shift"):
+        eng.opymWriteLiveOutputs(
+            matlab.uint16(np.zeros((shape[1], shape[2], shape[0]), np.uint16)),
+            str(view_dir / "bad.npy"),
+            [str(p) for p in arrs.levels],
+            str(arrs.mip),
+            matlab.double([1, 1]),
+            16.0,
+            nargout=1,
+        )

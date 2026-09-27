@@ -77,6 +77,21 @@ SHEET_ANGLE_DEG = 60.0
 # its next view buffer readied -- so the first timepoint costs what the
 # others do.
 WARMUP_NAME = "live_warmup.json"
+# The view buffers' bit depth (OPYM_LIVE_VIEW_BITS, 8 or 16): 8-bit buffers
+# are what naparym-live shows (see its DISPLAY_LEVELS), half the bytes for
+# the server to write and the viewer to map and upload. The stores stay
+# 16-bit either way.
+VIEW_BITS_ENV_VAR = "OPYM_LIVE_VIEW_BITS"
+
+
+def view_bits() -> int:
+    try:
+        bits = int(os.environ.get(VIEW_BITS_ENV_VAR, "8"))
+    except ValueError:
+        bits = 8
+    return bits if bits in (8, 16) else 8
+
+
 # A repeated PREPARE for the same plan only renews the warm lease, unless its
 # spec is this old: servers skip specs over 10 min old, so one started since
 # (idle timeout, crash) would otherwise never warm for it.
@@ -392,6 +407,7 @@ class ZarrLiveLane(LiveLane):
             "decon_dir": session.decon_dir,
             "z_step_um": session.z_step_um,
             "psf_cache_dir": session.psf_cache,
+            "view_bits": view_bits(),
             **deskew_decon_kwargs(self.psf),
         }
 
@@ -434,6 +450,7 @@ class ZarrLiveLane(LiveLane):
             psf_cache_dir=psf_cache_dir(
                 self.jobs, self.psf, z_step_um, raw_shape_zyx, kwargs
             ),
+            view_bits=view_bits(),
             **kwargs,
         )
         dsr = dsr_shape_zyx(raw_shape_zyx, z_step_um, XY_PIXEL_SIZE_UM, SHEET_ANGLE_DEG)
