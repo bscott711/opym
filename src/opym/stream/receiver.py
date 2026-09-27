@@ -93,7 +93,10 @@ PetaKit5D's queue and every other session. Below twice the floor
 early (they are safe on GPFS), oldest first, then finished view stores. Below
 the floor itself, frames are held back unACKed: the client keeps them and
 resends, and if space never comes back its own buffer fills and it pauses
-(below), so tmpfs never fills mid-session.
+(below), so tmpfs never fills mid-session. When space is back, each session
+that had frames held back gets an ACK with "resend": true, so its client
+resends them at once instead of waiting until it calls its link stale
+(~5 s plus 1 s per 20 MB unACKed: 1.5 minutes for 2 GB; R5, 2026-09-27).
 
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
@@ -329,6 +332,7 @@ class SessionState:
     received_pairs: set[tuple[int, int]] = field(default_factory=set)
     processed_frame_indices: set[int] = field(default_factory=set)
     ack_floor: int = -1
+    held_back: bool = False  # frames dropped below the RAM-disk floor
     frames_since_ack: int = 0
     last_ack_time: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
@@ -582,6 +586,8 @@ class StreamReceiver:
         floor = _stage_floor_bytes()
         free = shutil.disk_usage(stage_root).free
         self._stage_short = free < floor
+        if not self._stage_short:
+            self._ask_held_back_to_resend()
         if free < 2 * floor and not (self._freeing and self._freeing.is_alive()):
             self._freeing = threading.Thread(
                 target=self._free_stage_space,
@@ -590,6 +596,19 @@ class StreamReceiver:
                 daemon=True,
             )
             self._freeing.start()
+
+    def _ask_held_back_to_resend(self) -> None:
+        """Space is back: every session whose frames were held back gets an
+        ACK asking its client to resend them now."""
+        for session in self.sessions.values():
+            if session.held_back and not session.ended:
+                session.held_back = False
+                logger.info(
+                    "RAM disk back above its floor: asking session %s to "
+                    "resend the frames held back",
+                    session.session_id,
+                )
+                self._send_ack(session, resend=True)
 
     def _held_back(self, session: SessionState) -> bool:
         """True while this session's frames must wait: it stages on the RAM
@@ -600,7 +619,9 @@ class StreamReceiver:
         free = shutil.disk_usage(stage_root).free if stage_root else 0
         if free >= _stage_floor_bytes():
             self._stage_short = False
+            self._ask_held_back_to_resend()
             return False
+        session.held_back = True
         now = time.monotonic()
         if now - self._last_short_warning >= _SHORT_WARN_EVERY_S:
             self._last_short_warning = now
@@ -1344,7 +1365,9 @@ class StreamReceiver:
             processed.discard(session.ack_floor + 1)
             session.ack_floor += 1
 
-    def _send_ack(self, session: SessionState, ended: bool = False) -> None:
+    def _send_ack(
+        self, session: SessionState, ended: bool = False, resend: bool = False
+    ) -> None:
         header = {
             "through_frame_index": session.ack_floor,
             "server_time_s": time.time(),
@@ -1352,6 +1375,8 @@ class StreamReceiver:
         }
         if ended:
             header["ended"] = True
+        if resend:
+            header["resend"] = True
         session.sock.send_multipart(
             [session.identity, *pack_message(MSG_ACK, session.session_id, header)]
         )

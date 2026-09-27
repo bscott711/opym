@@ -423,9 +423,78 @@ def test_below_the_ram_disk_floor_frames_wait_and_are_taken_once_space_is_back(
 
     disk.free_gb = 150  # eviction (or anything else) freed space
     sock.send_multipart(pack_message(MSG_FRAME, "sess-floor", header, payload))
-    assert _pump(recv, sock)["through_frame_index"] == 0
+    ack = _pump(recv, sock)
+    assert ack.get("resend") is True  # first: send what was held back
+    if ack["through_frame_index"] != 0:
+        ack = _pump(recv, sock)
+    assert ack["through_frame_index"] == 0
     assert (0, 0) in recv.sessions["sess-floor"].received_pairs
     sock.close()
+
+
+def test_when_space_is_back_a_held_back_session_is_asked_to_resend(
+    tmp_path, recv, monkeypatch
+):
+    """R5 on the test stack (2026-09-27): held-back frames came back only
+    when the client called its link stale, minutes later. Now the receiver
+    asks as soon as the RAM disk is above its floor again, once."""
+    import shutil
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
+    disk = _FakeDisk(free_gb=150)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+    sock = _dealer(recv, "sess-resend")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-resend", _header(raw)))
+    assert _pump(recv, sock) is not None
+
+    disk.free_gb = 12
+    recv._check_stage_space()
+    header, payload = _frame(0, 0)
+    sock.send_multipart(pack_message(MSG_FRAME, "sess-resend", header, payload))
+    assert _pump(recv, sock, timeout=0.5) is None  # held back, no ACK
+    assert recv.sessions["sess-resend"].held_back
+
+    disk.free_gb = 150
+    recv._check_stage_space()
+    ack = _pump(recv, sock)
+    assert ack["resend"] is True and ack["through_frame_index"] == -1
+    assert not recv.sessions["sess-resend"].held_back
+    recv._check_stage_space()
+    assert _pump(recv, sock, timeout=0.3) is None  # asked once, not every check
+    sock.close()
+
+
+def test_the_argus_side_sender_resends_on_request(monkeypatch):
+    """opym's StreamSender (local replays, the watcher) honors "resend"."""
+    import opym.stream.client as client_mod
+    from opym.stream.protocol import MSG_ACK
+
+    sender = client_mod.StreamSender.__new__(client_mod.StreamSender)
+    sender.session_id = "s"
+    sender.features = set()
+    sender.through_frame_index = -1
+    sender._retry_buffer = {
+        3: ({"frame_index": 3}, b"c"),
+        1: ({"frame_index": 1}, b"a"),
+    }
+    sent = []
+    sender._send_frame_wire = lambda header, _payload: sent.append(
+        header["frame_index"]
+    )
+    sender._sock = type("Sock", (), {"recv_multipart": lambda self: []})()
+    acks = iter(
+        [
+            (MSG_ACK, "s", {"through_frame_index": 0}, None),
+            (MSG_ACK, "s", {"through_frame_index": 0, "resend": True}, None),
+        ]
+    )
+    monkeypatch.setattr(client_mod, "unpack_message", lambda _parts: next(acks))
+    sender._handle_one_ack()
+    assert sent == []
+    sender._handle_one_ack()
+    assert sent == [1, 3]
 
 
 def test_a_session_start_frees_ram_disk_space_before_refusing(

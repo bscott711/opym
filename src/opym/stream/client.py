@@ -234,6 +234,11 @@ class StreamSender:
         self.through_frame_index = header["through_frame_index"]
         self.features.update(header.get("features") or ())
         self._evict_acked()
+        if header.get("resend"):
+            # The receiver dropped frames it couldn't stage (its RAM disk was
+            # below its floor) and has room again: send them now.
+            for frame_index in sorted(self._retry_buffer):
+                self._send_frame_wire(*self._retry_buffer[frame_index])
 
     def _evict_acked(self) -> None:
         for frame_index in [
