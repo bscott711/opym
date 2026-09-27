@@ -548,17 +548,24 @@ class StreamReceiver:
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
 
-    def _free_stage_space(self, stage_root: Path, want_free: int) -> int:
+    def _running_live_sessions(self) -> set[str]:
+        return set(self._live.sessions) if self._live is not None else set()
+
+    def _free_stage_space(
+        self, stage_root: Path, want_free: int, running: set[str] | None = None
+    ) -> int:
         """Evict what is safe to evict until `want_free` bytes are free on
         the staging RAM disk: drained sessions oldest first, then finished
-        view stores. Returns the bytes free afterwards."""
+        view stores (not those in `running`, snapshotted by the caller on
+        the receiver's own thread). Returns the bytes free afterwards."""
+        if running is None:
+            running = self._running_live_sessions()
         free = shutil.disk_usage(stage_root).free
         if free >= want_free:
             return free
         self._drain_pool.free_up(want_free - free)
         free = shutil.disk_usage(stage_root).free
         if free < want_free:
-            running = set(self._live.sessions) if self._live is not None else set()
             live_zarr.evict_finished_views(lanes.jobs_dir(), running=running)
             free = shutil.disk_usage(stage_root).free
         return free
@@ -578,7 +585,7 @@ class StreamReceiver:
         if free < 2 * floor and not (self._freeing and self._freeing.is_alive()):
             self._freeing = threading.Thread(
                 target=self._free_stage_space,
-                args=(stage_root, 2 * floor),
+                args=(stage_root, 2 * floor, self._running_live_sessions()),
                 name="stage-free-up",
                 daemon=True,
             )
