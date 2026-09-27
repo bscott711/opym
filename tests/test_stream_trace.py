@@ -179,7 +179,7 @@ def _write(jobs, name, events):
     path.write_text("".join(json.dumps(e) + "\n" for e in events))
 
 
-def _synthetic(jobs, with_client=True, legacy_profiles=False):
+def _synthetic(jobs, with_client=True, legacy_profiles=False, per_channel_view=False):
     """Two timepoints of a 2-channel session, 10 s apart, with known hops.
     The channels are acquired one after the other (the 488 stack, then the
     561 stack), so each point of C1 comes 2 s after C0's; a timepoint's
@@ -189,7 +189,10 @@ def _synthetic(jobs, with_client=True, legacy_profiles=False):
         claimed 0.8, view buffer 1.5, store 1.7, completed 1.8, reaped 1.9
 
     then the viewer sees both at +3.6, shows at +4.0, paints at +4.5, and
-    the timepoint is archived at +4.2 (all relative to base)."""
+    the timepoint is archived at +4.2 (all relative to base).
+
+    `per_channel_view`: the viewer shows each channel as it lands, as
+    naparym-live does: C0 seen +1.6, shown +2.0, painted +2.3; C1 as above."""
     events, view, prof = [], [], []
     for t in (0, 1):
         base = 1000.0 + 10 * t
@@ -254,23 +257,30 @@ def _synthetic(jobs, with_client=True, legacy_profiles=False):
         events.append(
             {"ev": "archived", "at": base + 4.2, "session_id": "sess-abc", "t": t}
         )
-        view.append(
-            {
-                "ev": "shown",
-                "at": base + 4.0,
-                "session_id": "sess-abc",
-                "timepoints": [t],
-                "seen_s": base + 3.6,
-            }
-        )
-        view.append(
-            {
-                "ev": "painted",
-                "at": base + 4.5,
-                "session_id": "sess-abc",
-                "timepoints": [t],
-            }
-        )
+        shown = [(None, 3.6, 4.0, 4.5)]
+        if per_channel_view:
+            shown = [([0], 1.6, 2.0, 2.3), ([1], 3.6, 4.0, 4.5)]
+        for channels, seen, at, painted in shown:
+            extra = {} if channels is None else {"channels": channels}
+            view.append(
+                {
+                    "ev": "shown",
+                    "at": base + at,
+                    "session_id": "sess-abc",
+                    "timepoints": [t],
+                    "seen_s": base + seen,
+                    **extra,
+                }
+            )
+            view.append(
+                {
+                    "ev": "painted",
+                    "at": base + painted,
+                    "session_id": "sess-abc",
+                    "timepoints": [t],
+                    **extra,
+                }
+            )
     _write(jobs, trace.TRACE_NAME, events)
     _write(jobs, trace.VIEW_TRACE_NAME, view)
     _write(jobs, "S1.jsonl", [r for r in prof if r["server_id"] == "1"])
@@ -319,6 +329,38 @@ def test_report_breaks_each_timepoint_into_hops(tmp_path):
     gpu = summary["gpu_servers"]
     assert set(gpu) == {"1", "2"} and gpu["1"]["n"] == 2
     assert gpu["2"]["decon_s"] == pytest.approx(0.4)
+    # A viewer event without channels covers every channel of t.
+    ch = summary["channels"]
+    assert ch["0"]["headline"]["p50"] == pytest.approx(4.5)
+    assert ch["1"]["headline"]["p50"] == pytest.approx(2.5)
+    assert ch["0"]["ahead_s"]["p50"] == pytest.approx(0.0)
+
+
+def test_channels_shown_one_at_a_time_time_the_timepoint_by_its_last(tmp_path):
+    _synthetic(tmp_path, per_channel_view=True)
+    summary = _summary(tmp_path)
+    # t is on screen when its last channel is, not when GFP is (+2.3,
+    # before the 561 stack's last plane at +2).
+    assert summary["headline"]["p50"] == pytest.approx(2.5)
+    assert summary["hops"]["detect"]["p50"] == pytest.approx(0.1)
+    assert summary["hops"]["paint"]["p50"] == pytest.approx(0.5)
+    ch = summary["channels"]
+    assert ch["0"]["headline"]["p50"] == pytest.approx(2.3)  # base -> +2.3
+    assert ch["1"]["headline"]["p50"] == pytest.approx(2.5)  # +2 -> +4.5
+    assert ch["0"]["ahead_s"]["p50"] == pytest.approx(2.2)
+    assert ch["1"]["ahead_s"]["p50"] == pytest.approx(0.0)
+
+
+def test_a_timepoint_is_not_painted_until_every_channel_is(tmp_path):
+    _synthetic(tmp_path, per_channel_view=True)
+    view = trace.read(trace.VIEW_TRACE_NAME, jobs=tmp_path)
+    # the viewer moved on before C1 of t=1 was shown
+    view = [e for e in view if not (e["timepoints"] == [1] and e["channels"] == [1])]
+    events = trace.read(jobs=tmp_path)
+    rows = trace_report.timeline("sess-abc", events, view, {})
+    assert rows[1].get("shown") is None and rows[1].get("painted") is None
+    assert rows[1]["channels"][0]["painted"] == pytest.approx(1012.3)
+    assert rows[0]["painted"] == pytest.approx(1004.5)
 
 
 def test_old_profiles_place_the_view_buffer_from_stage_durations(tmp_path):

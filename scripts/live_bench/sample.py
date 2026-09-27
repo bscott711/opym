@@ -1,6 +1,7 @@
 """Once a second: GPU use per device, RAM disk and memory, huge-page
-compaction, and whether production is busy (a contaminated test window shows
-up here)."""
+compaction, the test stack's own lanes (live and backfill tickets waiting,
+and what each server holds), and whether production is busy (a contaminated
+test window shows up here)."""
 
 import argparse
 import json
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 PROD = Path("/dev/shm/petakit_jobs")
+JOBS = Path(os.environ.get("PETAKIT_JOBS_DIR") or "/dev/shm/opym_lv/jobs")
 
 
 def gpus() -> list[dict]:
@@ -57,6 +59,26 @@ def count(d: Path) -> int:
         return 0
 
 
+def lanes() -> dict:
+    """The test stack's queues, and each server's lane and ticket from the
+    supervisor's status file."""
+    out = {
+        "lv_queue_live": count(JOBS / "queue_live"),
+        "lv_queue": count(JOBS / "queue"),
+    }
+    try:
+        status = json.loads((JOBS / "supervisor_status.json").read_text())
+        out["lv_servers"] = {
+            s["server_id"]: {"lane": s.get("lane"), "ticket": s.get("ticket")}
+            for s in status.get("servers", [])
+        }
+        out["lv_live_lease"] = status.get("live_lease_active")
+        out["lv_warm_lease"] = status.get("warm_lease_active")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return out
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--every", type=float, default=1.0)
@@ -71,6 +93,7 @@ while True:
         "mem_available_gb": round(mem_available_gb(), 2),
         "load1": os.getloadavg()[0],
         **vmstat(),
+        **lanes(),
         "prod_claims": count(PROD / "claims"),
         "prod_queue": count(PROD / "queue"),
         "prod_queue_live": count(PROD / "queue_live"),
