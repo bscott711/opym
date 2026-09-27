@@ -30,6 +30,17 @@ def test_lease_is_active_only_while_fresh(tmp_path):
     assert not lanes.live_lease_active(tmp_path)
 
 
+def test_warm_lease_is_active_for_ten_minutes_after_a_prepare(tmp_path):
+    assert not lanes.warm_lease_active(tmp_path)
+    lanes.write_warm_lease({"prepare_id": "p"}, tmp_path)
+    assert lanes.warm_lease_active(tmp_path)
+    # An abandoned setup frees the backfill by itself.
+    stale = time.time() - lanes.WARM_LEASE_MAX_AGE_S - 1
+    os.utime(lanes.warm_lease_path(tmp_path), (stale, stale))
+    assert not lanes.warm_lease_active(tmp_path)
+    assert not lanes.live_lease_active(tmp_path)  # a separate lease
+
+
 def test_lease_keeper_refreshes_only_every_interval_and_releases(tmp_path):
     keeper = lanes.LeaseKeeper(tmp_path, refresh_s=10)
     path = lanes.lease_path(tmp_path)

@@ -75,6 +75,10 @@ SHEET_ANGLE_DEG = 60.0
 # its next view buffer readied -- so the first timepoint costs what the
 # others do.
 WARMUP_NAME = "live_warmup.json"
+# A repeated PREPARE for the same plan only renews the warm lease, unless its
+# spec is this old: servers skip specs over 10 min old, so one started since
+# (idle timeout, crash) would otherwise never warm for it.
+PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
 
 
@@ -199,6 +203,9 @@ class ZarrLiveLane(LiveLane):
     """The one-format lane; the receiver hooks match LiveLane's, except
     start_session, which takes the raw arrays instead of a frames dir."""
 
+    # (psf, raw shape, z step) of the last PREPARE spec written, and when.
+    _prepared: tuple | None = None
+
     def start_session(
         self,
         session_id: str,
@@ -311,6 +318,66 @@ class ZarrLiveLane(LiveLane):
             **deskew_decon_kwargs(self.psf),
         }
 
+    def prepare(
+        self, prepare_id: str, raw_shape_zyx, z_step_um: float, info: dict
+    ) -> None:
+        """An acquisition of this shape is being set up (the client sent
+        PREPARE): write the warm-up spec for it, with no session yet, and the
+        warm lease (opym.lanes), so a server comes up, builds the PSF cache
+        the session will share (keyed on PSF, settings and shape), compiles
+        and plans its FFTs before the run starts. The session's own warm-up
+        at SESSION_START then only readies its view buffer."""
+        raw_shape_zyx = tuple(int(n) for n in raw_shape_zyx)
+        lease = {"prepare_id": prepare_id, "raw_shape_zyx": list(raw_shape_zyx), **info}
+        try:
+            lanes.write_warm_lease(lease, self.jobs)
+        except OSError as exc:
+            logger.warning("Live lane (zarr): no warm lease written: %s", exc)
+        key = (str(self.psf), raw_shape_zyx, float(z_step_um))
+        last = self._prepared
+        if (
+            last is not None
+            and last[0] == key
+            and self._clock() - last[1] < PREPARE_RESPEC_S
+        ):
+            return
+        work = self.jobs / "prepare"
+        placeholder = work / "unused"  # never read by a warm-up
+        kwargs = deskew_decon_kwargs(self.psf)
+        params = live_zarr_parameters(
+            placeholder,
+            0,
+            0,
+            mask_store=placeholder,
+            levels=[placeholder],
+            mip=placeholder,
+            psf_path=self.psf,
+            decon_dir=work,
+            z_step_um=z_step_um,
+            psf_cache_dir=psf_cache_dir(
+                self.jobs, self.psf, z_step_um, raw_shape_zyx, kwargs
+            ),
+            **kwargs,
+        )
+        dsr = dsr_shape_zyx(raw_shape_zyx, z_step_um, XY_PIXEL_SIZE_UM, SHEET_ANGLE_DEG)
+        params.update(
+            warmup=True,
+            raw_shape_zyx=list(raw_shape_zyx),
+            dsr_shape_zyx=[int(n) for n in dsr],
+        )
+        try:
+            work.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._write_spec(f"prepare:{prepare_id}", params)
+        self._prepared = (key, self._clock())
+        logger.info(
+            "Live lane (zarr): PREPARE %s: warming for %s at dz %.3g",
+            prepare_id,
+            raw_shape_zyx,
+            z_step_um,
+        )
+
     def _write_warmup(
         self, session: ZarrLiveSession, raw_shape_zyx, dsr_shape_zyx
     ) -> None:
@@ -326,12 +393,14 @@ class ZarrLiveLane(LiveLane):
             dsr_shape_zyx=[int(n) for n in dsr_shape_zyx],
             view_dir=str(session.buffers_dir),
         )
+        self._write_spec(session.session_id, params)
+        self._prepared = None  # the file now holds this session's spec
+
+    def _write_spec(self, spec_id: str, params: dict) -> None:
         path = self.jobs / WARMUP_NAME
         tmp = path.with_name(f".{WARMUP_NAME}.tmp")
         try:
-            tmp.write_text(
-                json.dumps({"session_id": session.session_id, "parameters": params})
-            )
+            tmp.write_text(json.dumps({"session_id": spec_id, "parameters": params}))
             os.replace(tmp, path)
         except OSError as exc:
             logger.warning("Live lane (zarr): no warm-up spec written: %s", exc)

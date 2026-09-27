@@ -113,6 +113,7 @@ from opym.stream.live_zarr import ZarrLiveLane
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_PREPARE,
     MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
@@ -535,6 +536,9 @@ class StreamReceiver:
         if msg_type == MSG_SESSION_START:
             self._handle_session_start(sock, identity, session_id, header)
             return
+        if msg_type == MSG_PREPARE:
+            self._handle_prepare(session_id, header)
+            return
         session = self.sessions.get(session_id)
         if session is not None:
             # Answer on the link (and socket) heard from last: it just
@@ -818,6 +822,41 @@ class StreamReceiver:
             "features": SERVER_FEATURES,
         }
         sock.send_multipart([identity, *pack_message(MSG_ACK, session_id, header)])
+
+    def _handle_prepare(self, prepare_id: str, header: dict[str, Any]) -> None:
+        """An acquisition is being set up (see protocol.py's PREPARE): warm a
+        GPU server for its planned shape. Only the one-format live lane has
+        a warm-up; without it, or without a decon PSF, this does nothing.
+        Best effort: a PREPARE never breaks the receiver."""
+        try:
+            self._prepare(prepare_id, header)
+        except Exception:
+            logger.exception("PREPARE %s failed (no warm-up)", prepare_id)
+
+    def _prepare(self, prepare_id: str, header: dict[str, Any]) -> None:
+        if not (_live_lane_enabled() and live_zarr.live_format() == "zarr"):
+            return
+        psf = resolve_decon_psf()
+        if psf is None:
+            return
+        try:
+            shape = tuple(int(n) for n in header["shape_zyx"])
+            z_step_um = float(header["z_step_um"])
+            if len(shape) != 3 or min(shape) <= 0 or z_step_um <= 0:
+                raise ValueError(f"shape {shape}, z step {z_step_um}")
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Ignoring PREPARE %s: bad plan (%s)", prepare_id, exc)
+            return
+        if self._live is None:
+            self._live = ZarrLiveLane(psf)
+        if not isinstance(self._live, ZarrLiveLane):
+            return
+        info = {
+            k: header[k]
+            for k in ("num_timepoints", "channel_names", "dtype")
+            if k in header
+        }
+        self._live.prepare(prepare_id, shape, z_step_um, info)
 
     def _maybe_start_live(self, session: SessionState) -> None:
         """Hand a session to the live lane when it's enabled (OPYM_LIVE_LANE=1)

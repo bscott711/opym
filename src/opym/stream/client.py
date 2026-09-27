@@ -42,6 +42,7 @@ from opym.metadata import parse_zarr_z_step_from_store
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_PREPARE,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
@@ -59,6 +60,20 @@ def compress_payload(array: np.ndarray) -> bytes:
     """A FRAME payload with `codec: "blosc"` (see protocol.py): lz4 +
     bitshuffle, ~2.5x on camera frames at ~1.8 GB/s per thread."""
     return _blosc.compress(np.ascontiguousarray(array), b"lz4", 5, _blosc.BITSHUFFLE)
+
+
+def send_prepare(connect_addr: str, plan: dict[str, Any], linger_ms: int = 2000) -> str:
+    """Tell the receiver an acquisition with this plan is being set up (see
+    protocol.py's PREPARE), on a connection of its own. Nothing answers it.
+    Returns the id it went under."""
+    prepare_id = f"prepare-{uuid.uuid4()}"
+    sock = zmq.Context.instance().socket(zmq.DEALER)
+    sock.setsockopt(zmq.IDENTITY, prepare_id.encode("utf-8"))
+    sock.setsockopt(zmq.LINGER, linger_ms)  # lets close() still deliver it
+    sock.connect(connect_addr)
+    sock.send_multipart(pack_message(MSG_PREPARE, prepare_id, plan))
+    sock.close()
+    return prepare_id
 
 
 class StreamSender:

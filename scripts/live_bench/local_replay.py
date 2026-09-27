@@ -10,6 +10,10 @@ the first plane comes `--setup-s` after the run starts. Per plane 35.7 ms,
 0.83 s between the stacks, 0.88 s from the end of a timepoint to the next.
 
 usage: local_replay.py NAME [--timepoints N] [--source DIR --base NAME]
+                        [--prepare-s S]
+
+`--prepare-s S` sends PREPARE (the plan) S seconds before SESSION_START, as
+pymmcore-gui does when the MDA is set up, to measure a warmed first timepoint.
 
 Writes ~/NAME.replay.json (SHA-1 per (t, c) and the pacing), like the PC's
 replay, for verify.py.
@@ -28,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import zarr
 
-from opym.stream.client import StreamSender
+from opym.stream.client import StreamSender, send_prepare
 
 SOURCE = Path(
     "/mmfs1/scratch/jacks.local/microscopy/"
@@ -55,6 +59,7 @@ def main() -> None:
         "--raw-root", default="/mmfs2/scratch/SDSMT.LOCAL/bscott/opym_lv/raw"
     )
     ap.add_argument("--readahead", type=int, default=2)
+    ap.add_argument("--prepare-s", type=float, default=None)
     args = ap.parse_args()
 
     arrays = [
@@ -94,6 +99,21 @@ def main() -> None:
         "accepts": ["qc"],
     }
     stalls, late = [], []
+    prepared_s = None
+    if args.prepare_s is not None:
+        plan = {
+            k: header[k]
+            for k in (
+                "shape_zyx",
+                "z_step_um",
+                "dtype",
+                "num_timepoints",
+                "channel_names",
+            )
+        }
+        print("prepare", send_prepare(f"tcp://127.0.0.1:{args.port}", plan), flush=True)
+        prepared_s = args.prepare_s
+        time.sleep(args.prepare_s)
     with StreamSender(f"tcp://127.0.0.1:{args.port}", compress=True) as s:
         run_start = time.time()
         s.session_start(header)
@@ -138,6 +158,7 @@ def main() -> None:
         "base_name": args.name,
         "source": str(args.source / args.base),
         "links": 0,
+        "prepare_s": prepared_s,
         "timepoints": n_t,
         "channels": CHANNELS,
         "shape_zyx": [nz, ny, nx],

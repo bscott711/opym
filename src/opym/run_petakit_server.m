@@ -59,10 +59,12 @@ fail_dir  = fullfile(base_queue_dir, 'failed');
 if ~exist(queue_dir, 'dir'), mkdir(queue_dir); end
 % Priority lanes (see opym/lanes.py): live (streaming) tickets in queue_live
 % are always claimed first; backfill tickets in queue only while no live
-% acquisition holds a fresh LIVE_LEASE.json.
+% acquisition holds a fresh LIVE_LEASE.json and none being set up holds a
+% fresh WARM_LEASE.json (so a server warmed for it is still free at its start).
 live_queue_dir = fullfile(base_queue_dir, 'queue_live');
 if ~exist(live_queue_dir, 'dir'), mkdir(live_queue_dir); end
 leasePath = fullfile(base_queue_dir, 'LIVE_LEASE.json');
+warmLeasePath = fullfile(base_queue_dir, 'WARM_LEASE.json');
 if ~exist(done_dir, 'dir'),  mkdir(done_dir); end
 if ~exist(fail_dir, 'dir'),  mkdir(fail_dir); end
 
@@ -153,7 +155,7 @@ end
 idleTimer = 0;
 
 while true
-    [jobFiles, claim_dir, liveActive] = nextJobFiles(live_queue_dir, queue_dir, leasePath);
+    [jobFiles, claim_dir, liveActive] = nextJobFiles(live_queue_dir, queue_dir, leasePath, warmLeasePath);
 
     if isempty(jobFiles)
         % A new live session: warm up for it while there's nothing to do.
@@ -912,13 +914,13 @@ function [stamp, warmed] = maybeWarmup(path, stamp, numCPUs, profiling_dir, serv
     end
 end
 
-function [jobFiles, fromDir, liveActive] = nextJobFiles(liveDir, backfillDir, leasePath)
+function [jobFiles, fromDir, liveActive] = nextJobFiles(liveDir, backfillDir, leasePath, warmLeasePath)
     % Claimable tickets, oldest name first, from the live queue if it has
-    % any, else from the backfill queue unless a live lease is fresh.
+    % any, else from the backfill queue unless a live or warm lease is fresh.
     fromDir = liveDir;
     jobFiles = claimableIn(liveDir);
     liveActive = ~isempty(jobFiles) || liveLeaseActive(leasePath);
-    if liveActive
+    if liveActive || warmLeaseActive(warmLeasePath)
         return;
     end
     fromDir = backfillDir;
@@ -940,6 +942,13 @@ function tf = liveLeaseActive(leasePath)
     % crashed receiver can never park the backfill for longer than that.
     d = dir(leasePath);
     tf = ~isempty(d) && (now - d(1).datenum) * 86400 <= 60;
+end
+
+function tf = warmLeaseActive(warmLeasePath)
+    % Fresh = written within 600 s (opym.lanes.WARM_LEASE_MAX_AGE_S): an
+    % acquisition is being set up. Written once per PREPARE, never refreshed.
+    d = dir(warmLeasePath);
+    tf = ~isempty(d) && (now - d(1).datenum) * 86400 <= 600;
 end
 
 function writeClaim(claimPath, serverId, ticketName, lane)

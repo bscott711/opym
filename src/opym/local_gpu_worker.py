@@ -16,11 +16,13 @@ Supervisor for the PetaKit job queue: one PetaKit5D MATLAB server
   flagged; with `kill_hung`, its server is killed, which requeues the ticket
   and frees the GPU.
 - Live work goes first (see opym.lanes). Servers are started as soon as a
-  live lease appears, and if a live ticket has waited `preempt_after_s`
-  while a server works on a backfill ticket, that server is killed and its
+  live lease or a warm lease (an acquisition being set up) appears, and if
+  a live ticket has waited `preempt_after_s` while a server works on a
+  backfill ticket, that server is killed and its
   backfill ticket requeued (not counted against its requeue cap), so the
   GPU switches to live work. One server per cooldown, so a single queued
-  live ticket never takes down both.
+  live ticket never takes down both. A live or warm lease with every server
+  on backfill preempts one right away.
 
 Each server records the ticket it holds in claims/S<id>.json (written by
 run_petakit_server.m right after it claims one, removed when that ticket
@@ -249,8 +251,8 @@ class ServerSlot:
 class ServerSupervisor:
     """Drives the servers one `tick()` at a time; `process_queue` loops it.
 
-    `launch(slot) -> Popen`, `clock() -> float`, `any_server_alive()` and
-    `lease_active()` are injectable for tests.
+    `launch(slot) -> Popen`, `clock() -> float`, `any_server_alive()`,
+    `lease_active()` and `warm_active()` are injectable for tests.
     """
 
     def __init__(
@@ -266,6 +268,7 @@ class ServerSupervisor:
         preempt: bool = True,
         preempt_after_s: float = DEFAULT_PREEMPT_AFTER_S,
         lease_active: Callable[[], bool] | None = None,
+        warm_active: Callable[[], bool] | None = None,
     ) -> None:
         self.base_dir = Path(base_dir)
         self.queue_dir = lanes.backfill_queue_dir(self.base_dir)
@@ -275,6 +278,9 @@ class ServerSupervisor:
         self.preempt_after_s = preempt_after_s
         self._lease_active = lease_active or (
             lambda: lanes.live_lease_active(self.base_dir)
+        )
+        self._warm_active = warm_active or (
+            lambda: lanes.warm_lease_active(self.base_dir)
         )
         self._last_preempt = float("-inf")
         self.idle_timeout_sec = idle_timeout_sec
@@ -311,12 +317,13 @@ class ServerSupervisor:
                 self._clean_exit_pending_consolidation = False
                 self._run_consolidations()
 
-        # A fresh live lease starts servers even before its first ticket
-        # lands: Matlab plus its parpool take about a minute to come up.
+        # A fresh live or warm lease starts servers before the first ticket
+        # lands: Matlab takes ~16 s to come up, then warms for the shape.
         if (
             has_claimable_work(self.live_queue_dir)
             or has_claimable_work(self.queue_dir)
             or self._lease_active()
+            or self._warm_active()
         ):
             for slot in self.slots:
                 if slot.proc is None and now >= slot.next_launch_at:
@@ -465,8 +472,9 @@ class ServerSupervisor:
         """Kill one server that is working on a backfill ticket, so live work
         gets a GPU, when either
 
-        - there is live work (a live session's lease, or a live ticket) and
-          no server can take it -- every one is on backfill. Right away: a
+        - there is live work (a live session's lease, a live ticket, or a
+          warm lease for one being set up) and no server can take it --
+          every one is on backfill. Right away: a
           relaunch plus the session warm-up take ~20 s, about what the first
           volume takes to arrive, while backfill tickets run for minutes; or
         - a live ticket has waited `preempt_after_s` and more are waiting than
@@ -476,7 +484,7 @@ class ServerSupervisor:
         if now - self._last_preempt < self.preempt_after_s:
             return
         waited = oldest_claimable_age(self.live_queue_dir, now)
-        live_wanted = waited is not None or self._lease_active()
+        live_wanted = waited is not None or self._lease_active() or self._warm_active()
         if live_wanted and not self._live_capacity():
             reason = "Live work with every GPU on backfill"
         elif waited is not None and waited >= self.preempt_after_s:
@@ -601,6 +609,7 @@ class ServerSupervisor:
         status = {
             "updated_at": now,
             "live_lease_active": self._lease_active(),
+            "warm_lease_active": self._warm_active(),
             "live_queued": sum(
                 1
                 for p in self.live_queue_dir.glob("*.json")
