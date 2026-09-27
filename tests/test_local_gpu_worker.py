@@ -344,6 +344,16 @@ def test_live_lease_starts_servers_before_any_ticket(tmp_path):
     assert sorted(sid for sid, _ in launched) == ["1", "2"]
 
 
+def test_warm_lease_starts_servers_before_the_session(tmp_path):
+    warm = {"active": False}
+    sup, launched, _ = _make_supervisor(tmp_path, warm_active=lambda: warm["active"])
+    sup.tick()
+    assert launched == []
+    warm["active"] = True
+    sup.tick()
+    assert sorted(sid for sid, _ in launched) == ["1", "2"]
+
+
 def _busy_with_backfill_and_live_waiting(tmp_path, waited_s, **kwargs):
     sup, launched, clock = _make_supervisor(tmp_path, preempt_after_s=30, **kwargs)
     _ticket(sup.queue_dir, "bf_a.json")
@@ -392,6 +402,21 @@ def test_live_work_with_every_gpu_on_backfill_preempts_one_at_once(tmp_path):
     assert killed == ["1"]
     sup.tick()  # relaunched with no claim: it takes the live work
     clock.t += 60
+    sup.tick()
+    assert killed == ["1"]
+
+
+def test_a_warm_lease_frees_one_gpu_from_backfill(tmp_path):
+    """An acquisition being set up with both GPUs on backfill: one server is
+    freed right away, so it can warm up before the run starts."""
+    warm = {"active": False}
+    sup, _, _, _, killed = _busy_with_backfill_and_live_waiting(
+        tmp_path, waited_s=0, warm_active=lambda: warm["active"]
+    )
+    (sup.live_queue_dir / "LIVE_t000.json").unlink()
+    sup.tick()
+    assert killed == []
+    warm["active"] = True
     sup.tick()
     assert killed == ["1"]
 

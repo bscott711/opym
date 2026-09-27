@@ -45,9 +45,18 @@ MSG_SESSION_END = b"SESSION_END"
 MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
 MSG_QC = b"QC"
+MSG_PREPARE = b"PREPARE"
 
 _VALID_TYPES = frozenset(
-    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME, MSG_QC}
+    {
+        MSG_SESSION_START,
+        MSG_FRAME,
+        MSG_SESSION_END,
+        MSG_ACK,
+        MSG_RESUME,
+        MSG_QC,
+        MSG_PREPARE,
+    }
 )
 
 # --- SESSION_START header fields ---------------------------------------
@@ -242,6 +251,21 @@ _VALID_TYPES = frozenset(
 #   metrics          dict   -- per-channel numbers behind the verdict
 #
 # Clients must ignore fields they don't know; new ones may be added.
+
+# --- PREPARE header fields (client -> server, before a run) --------------
+#
+# An acquisition with this plan is being set up (e.g. the MDA was configured
+# with streaming on): the server warms a GPU server for its shape, so the
+# first timepoint costs what the others do. Sent on its own connection, with
+# a fresh id as `session_id` (and identity); it opens no session, and nothing
+# answers it. Send it again whenever the plan changes; the warm-up holds for
+# about 10 minutes after the last one (opym.lanes.WARM_LEASE_MAX_AGE_S).
+#
+#   shape_zyx        [int, int, int]  -- planned raw per-volume (Z, Y, X)
+#   z_step_um        float  -- planned z step
+#   dtype            str    -- optional, e.g. "uint16"
+#   num_timepoints   int    -- optional, for the log
+#   channel_names    [str]  -- optional, for the log
 
 
 def pack_message(

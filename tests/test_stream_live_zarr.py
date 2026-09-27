@@ -181,6 +181,62 @@ def test_session_start_writes_the_warm_up_spec(tmp_path, psf):
     )
 
 
+def test_prepare_warms_for_the_plan_the_session_will_share(tmp_path, psf):
+    """PREPARE (an acquisition being set up) writes a warm-up spec with no
+    session: the same PSF cache and decon settings the session will use, no
+    view buffer, plus the warm lease."""
+    from opym import lanes
+
+    lane, jobs = _lane(tmp_path, psf)
+    lane.prepare("prep-1", RAW_ZYX, 0.5, {"num_timepoints": 3})
+    spec = json.loads((jobs / live_zarr.WARMUP_NAME).read_text())
+    assert spec["session_id"] == "prepare:prep-1"
+    p = spec["parameters"]
+    assert p["warmup"] is True
+    assert "view_dir" not in p
+    assert p["raw_shape_zyx"] == list(RAW_ZYX)
+    assert p["dsr_shape_zyx"] == list(dsr_shape_zyx(RAW_ZYX, 0.5))
+    assert lanes.warm_lease_active(jobs)
+    lease = json.loads(lanes.warm_lease_path(jobs).read_text())
+    assert (lease["prepare_id"], lease["num_timepoints"]) == ("prep-1", 3)
+
+    s = _session(lane, tmp_path)
+    real = json.loads((jobs / live_zarr.WARMUP_NAME).read_text())["parameters"]
+    assert p["psf_cache_dir"] == real["psf_cache_dir"] == str(s.psf_cache)
+    placeholders = {"raw_store", "mask_store", "levels", "mip", "decon_dir", "view_dir"}
+    for k in set(real) - placeholders:
+        assert p[k] == real[k], k
+
+
+def test_a_repeated_prepare_only_renews_the_lease(tmp_path, psf):
+    """The GUI sends PREPARE on every plan edit: the servers re-warm only for
+    a new shape or z step, or once the spec is old enough that a server
+    started since would skip it."""
+    from opym import lanes
+
+    clock = {"t": 1000.0}
+    lane = ZarrLiveLane(psf, jobs=tmp_path / "jobs", qc=False, clock=lambda: clock["t"])
+    spec_path = tmp_path / "jobs" / live_zarr.WARMUP_NAME
+
+    def spec_id():
+        return json.loads(spec_path.read_text())["session_id"]
+
+    lane.prepare("a", RAW_ZYX, 0.5, {})
+    lease = lanes.warm_lease_path(tmp_path / "jobs")
+    os.utime(lease, (1, 1))
+    lane.prepare("b", RAW_ZYX, 0.5, {})
+    assert spec_id() == "prepare:a"  # same plan: spec untouched...
+    assert lanes.warm_lease_active(tmp_path / "jobs")  # ...lease renewed
+    lane.prepare("c", RAW_ZYX, 0.3, {})
+    assert spec_id() == "prepare:c"  # new z step
+    clock["t"] += live_zarr.PREPARE_RESPEC_S
+    lane.prepare("d", RAW_ZYX, 0.3, {})
+    assert spec_id() == "prepare:d"  # old enough to write again
+    _session(lane, tmp_path)
+    lane.prepare("e", RAW_ZYX, 0.3, {})
+    assert spec_id() == "prepare:e"  # the file held the session's spec
+
+
 def test_the_psf_cache_is_shared_only_by_what_matches(tmp_path, psf):
     kw = {"wiener_alpha": 0.2, "hann_win_bounds": [0.4, 1.0]}
     jobs = tmp_path / "jobs"

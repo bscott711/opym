@@ -9,6 +9,12 @@ ahead of backfill.
   lease is fresh, servers claim no backfill ticket and the backfill starts no
   pass. Freshness is the file's mtime, so a receiver that crashes releases
   the GPUs by itself within LEASE_MAX_AGE_S.
+- When an acquisition is being set up (the client sent PREPARE), the
+  receiver writes `<jobs>/WARM_LEASE.json` once, along with a warm-up spec
+  for the planned shape. While it is fresh (WARM_LEASE_MAX_AGE_S, not
+  refreshed), the supervisor starts the servers and frees one from backfill,
+  and servers claim no new backfill ticket, so a warmed server is still free
+  when the run starts. Backfill passes go on queuing tickets; they wait.
 - `backfill_inflight()` lets the backfill cap how many of its tickets are
   queued or running at once. Tickets are then built shortly before they run,
   with current parameters, instead of days ahead (on 2026-09-24, 36 queued
@@ -36,6 +42,10 @@ LEASE_NAME = "LIVE_LEASE.json"
 # run_petakit_server.m hard-codes the same 60 s staleness limit.
 LEASE_MAX_AGE_S = 60.0
 LEASE_REFRESH_S = 10.0
+WARM_LEASE_NAME = "WARM_LEASE.json"
+# run_petakit_server.m hard-codes the same limit. Long enough to set up and
+# start an MDA, short enough that an abandoned setup frees backfill soon.
+WARM_LEASE_MAX_AGE_S = 600.0
 
 
 def jobs_dir() -> Path:
@@ -84,6 +94,33 @@ def live_lease_active(
     """True while a live acquisition holds a fresh lease."""
     try:
         mtime = lease_path(jobs).stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - mtime <= max_age_s
+
+
+def warm_lease_path(jobs: Path | None = None) -> Path:
+    return (jobs or jobs_dir()) / WARM_LEASE_NAME
+
+
+def write_warm_lease(info: dict, jobs: Path | None = None) -> None:
+    """Create or renew the warm lease (see the module docstring). Like the
+    live lease, only its mtime is load-bearing; `info` is for people."""
+    path = warm_lease_path(jobs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{WARM_LEASE_NAME}.tmp")
+    tmp.write_text(json.dumps({**info, "pid": os.getpid(), "updated_at": time.time()}))
+    os.replace(tmp, path)
+
+
+def warm_lease_active(
+    jobs: Path | None = None,
+    max_age_s: float = WARM_LEASE_MAX_AGE_S,
+    now: float | None = None,
+) -> bool:
+    """True while an acquisition being set up holds a fresh warm lease."""
+    try:
+        mtime = warm_lease_path(jobs).stat().st_mtime
     except OSError:
         return False
     return (time.time() if now is None else now) - mtime <= max_age_s

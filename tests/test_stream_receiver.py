@@ -21,6 +21,7 @@ import zmq
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_PREPARE,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
@@ -685,6 +686,73 @@ def test_no_live_lease_unless_the_live_lane_is_enabled(tmp_path, receiver, clien
     sock = client("sess-nolease")
     _start_session(sock, "sess-nolease", receiver, _session_header(tmp_path / "raw"))
     assert not lanes.lease_path().exists()
+
+
+def _prepare(client, receiver, plan, prepare_id="prepare-1"):
+    sock = client(prepare_id)
+    sock.send_multipart(pack_message(MSG_PREPARE, prepare_id, plan))
+    _drive(receiver, 3)  # nothing answers a PREPARE; each pass polls for it
+    return sock
+
+
+@pytest.fixture
+def psf_file(tmp_path):
+    p = tmp_path / "psf.tif"
+    p.write_bytes(b"psf")
+    return p
+
+
+def test_prepare_writes_a_warm_up_spec_and_the_warm_lease(
+    receiver, client, monkeypatch, psf_file
+):
+    import json
+
+    from opym import lanes
+    from opym.stream import live_zarr
+
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    monkeypatch.setenv("OPYM_LIVE_FORMAT", "zarr")
+    monkeypatch.setenv("OPYM_DECON_PSF", str(psf_file))
+    _prepare(client, receiver, {"shape_zyx": [161, 64, 128], "z_step_um": 0.5})
+    assert lanes.warm_lease_active()
+    assert not lanes.live_lease_active()  # no session was opened
+    assert receiver.sessions == {}
+    spec = json.loads((lanes.jobs_dir() / live_zarr.WARMUP_NAME).read_text())
+    assert spec["session_id"] == "prepare:prepare-1"
+    assert spec["parameters"]["raw_shape_zyx"] == [161, 64, 128]
+
+
+@pytest.mark.parametrize(
+    "env, plan",
+    [
+        ({"OPYM_LIVE_FORMAT": "tiff"}, {"shape_zyx": [161, 64, 128], "z_step_um": 0.5}),
+        ({"OPYM_DECON_PSF": ""}, {"shape_zyx": [161, 64, 128], "z_step_um": 0.5}),
+        (
+            {"OPYM_DECON_PSF": "/fake/psf.tif"},
+            {"shape_zyx": [161, 64, 128], "z_step_um": 0.5},
+        ),
+        ({}, {"shape_zyx": [161, 64], "z_step_um": 0.5}),
+        ({}, {"shape_zyx": [161, 64, 128]}),
+    ],
+    ids=["tiff-lane", "no-psf", "missing-psf", "bad-shape", "no-z-step"],
+)
+def test_prepare_does_nothing_it_cannot_warm_for(
+    tmp_path, receiver, client, monkeypatch, psf_file, env, plan
+):
+    """...and never breaks the receiver: it still takes a session after."""
+    from opym import lanes
+
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    monkeypatch.setenv("OPYM_LIVE_FORMAT", "zarr")
+    monkeypatch.setenv("OPYM_DECON_PSF", str(psf_file))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    _prepare(client, receiver, plan)
+    assert not lanes.warm_lease_path().exists()
+    monkeypatch.setenv("OPYM_DECON_PSF", "")
+    sock = client("sess-after")
+    _start_session(sock, "sess-after", receiver, _session_header(tmp_path / "raw"))
+    assert "sess-after" in receiver.sessions
 
 
 # --- receiver behavior: same-named sessions never share storage ------------
