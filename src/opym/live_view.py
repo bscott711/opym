@@ -1848,7 +1848,7 @@ class SessionWatcher:
             self.follower.poll()
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="naparym-live", description=__doc__.splitlines()[0]
     )
@@ -1896,7 +1896,14 @@ def main(argv: list[str] | None = None) -> None:
         help="GPU memory the texture cache always leaves free, for MATLAB's "
         "decon on the same GPU",
     )
-    args = ap.parse_args(argv)
+    return ap
+
+
+def open_viewer(args: argparse.Namespace):
+    """The napari window following the live sessions, per `build_parser()`'s
+    arguments: returns `(viewer, watcher, timer)`, keep them referenced and
+    call `napari.run()`. naparym-live-host (the shared viewer) opens it the
+    same way and then locks its window down."""
     vram_gb = math.inf if args.vram_gb == "auto" else float(args.vram_gb)
 
     no_hugepage_stalls()
@@ -1937,6 +1944,14 @@ def main(argv: list[str] | None = None) -> None:
     # before napari.run() the window can't paint, so it stays black while
     # that session loads.
     timer.start(int(args.poll * 1000))
+    return viewer, watcher, timer
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    import napari
+
+    _viewer, _watcher, _timer = open_viewer(args)
     napari.run()
 
 
