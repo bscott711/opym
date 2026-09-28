@@ -28,7 +28,7 @@ from opym.stream.protocol import (
     pack_message,
     unpack_message,
 )
-from opym.stream.receiver import StreamReceiver
+from opym.stream.receiver import StreamReceiver, _stage_namespace
 from opym.utils import orient_zyx_for_decon_tiff
 
 SHAPE_ZYX = (3, 5, 7)
@@ -530,7 +530,7 @@ def test_staging_writes_to_stage_root_then_drains_to_raw_root(
     _start_session(
         sock, session_id, receiver, _session_header(raw_root, num_timepoints=1)
     )
-    assert receiver.sessions[session_id].write_root == stage_root
+    assert receiver.sessions[session_id].write_root == stage_root / _stage_namespace(raw_root)
 
     header, vol = _frame(t=0, c=0, frame_index=0)
     sock.send_multipart(pack_message(MSG_FRAME, session_id, header, vol.tobytes()))
@@ -539,7 +539,10 @@ def test_staging_writes_to_stage_root_then_drains_to_raw_root(
 
     # Immediately visible under the STAGE root, not raw_root yet.
     np.testing.assert_array_equal(
-        _read_raw_timepoint(stage_root, "sample", "C0", t=0), vol
+        _read_raw_timepoint(
+            stage_root / _stage_namespace(raw_root), "sample", "C0", t=0
+        ),
+        vol
     )
     assert not (raw_root / "sample_C0.ome.zarr").exists()
 
@@ -780,10 +783,10 @@ def _stream_all(sock, session_id, receiver, num_timepoints, channels=(0, 1)):
     return _recv_ack(sock)
 
 
-def test_reused_name_gets_a_suffix_instead_of_the_old_store(tmp_path, receiver, client):
-    """The 2026-09-24 Cell_001 loss: a 1-timepoint test, then the real
-    time series under the same name. The second session must land in its
-    own `_001` stores with every frame staged, and leave the first alone."""
+def test_reused_name_moves_the_earlier_run_aside(tmp_path, receiver, client):
+    """The microscope reused a name (the 2026-09-24 1-timepoint test, then
+    the real Cell_001): the new run keeps the name, gets its own stores
+    with every frame, and the earlier run is moved aside, not touched."""
     raw_root = tmp_path / "raw"
     test_sock = client("sess-test")
     _start_session(
@@ -795,15 +798,81 @@ def test_reused_name_gets_a_suffix_instead_of_the_old_store(tmp_path, receiver, 
     _start_session(
         real_sock, "sess-real", receiver, _session_header(raw_root, num_timepoints=3)
     )
-    assert receiver.sessions["sess-real"].base_name == "sample_001"
+    assert receiver.sessions["sess-real"].base_name == "sample"
     _, ack = _stream_all(real_sock, "sess-real", receiver, num_timepoints=3)
     assert ack["through_frame_index"] == 5  # all 3T x 2C acked
 
     for t in range(3):
-        got = _read_raw_timepoint(raw_root, "sample_001", "C1", t=t)
+        got = _read_raw_timepoint(raw_root, "sample", "C1", t=t)
         np.testing.assert_array_equal(got, _frame(t=t, c=1, frame_index=0)[1])
-    first = zarr.open(str(_raw_store_path(raw_root, "sample", "C0") / "p0"), mode="r")
+    (aside,) = (raw_root / ".superseded").iterdir()
+    assert aside.name.startswith("sample-")
+    first = zarr.open(str(aside / "sample_C0.ome.zarr" / "p0"), mode="r")
     assert first.shape[0] == 1
+
+
+def test_reused_name_of_an_open_session_is_still_suffixed(tmp_path, receiver, client):
+    """An earlier session still open under the name is never moved."""
+    raw_root = tmp_path / "raw"
+    sock_a = client("sess-a")
+    _start_session(sock_a, "sess-a", receiver, _session_header(raw_root, num_timepoints=2))
+    frame_header, vol = _frame(t=0, c=0, frame_index=0)
+    sock_a.send_multipart(pack_message(MSG_FRAME, "sess-a", frame_header, vol.tobytes()))
+    _drive(receiver)
+    _recv_ack(sock_a)
+
+    sock_b = client("sess-b")
+    _start_session(sock_b, "sess-b", receiver, _session_header(raw_root, num_timepoints=1))
+    assert receiver.sessions["sess-b"].base_name == "sample_001"
+    assert not (raw_root / ".superseded").exists()
+
+
+def _registry_with(path, key, status):
+    import sqlite3
+
+    from opym.registry import StatusRegistry
+
+    StatusRegistry(path).close()  # creates the schema
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO datasets (dataset_key, root, leaf_dir, master_file, "
+            "discovered_at) VALUES (?, '', '', '', '')",
+            (key,),
+        )
+        conn.execute(
+            "INSERT INTO stage_status (dataset_key, stage, status) "
+            "VALUES (?, 'mip_encode', ?)",
+            (key, status),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_name"), [("done", "sample"), ("running", "sample_001")]
+)
+def test_moving_aside_forgets_the_run_in_the_backfill_registry(
+    tmp_path, receiver, client, monkeypatch, status, expected_name
+):
+    """A reused name must not count as already processed -- and a run the
+    backfill is processing right now is never moved."""
+    import sqlite3
+
+    raw_root = tmp_path / "raw"
+    registry = tmp_path / "registry.sqlite3"
+    monkeypatch.setenv("OPYM_BACKFILL_REGISTRY_PATH", str(registry))
+    sock = client("sess-old")
+    _start_session(sock, "sess-old", receiver, _session_header(raw_root, num_timepoints=1))
+    _stream_all(sock, "sess-old", receiver, num_timepoints=1)
+    key = str(raw_root / "sample")
+    _registry_with(registry, key, status)
+
+    sock = client("sess-new")
+    _start_session(sock, "sess-new", receiver, _session_header(raw_root, num_timepoints=1))
+    assert receiver.sessions["sess-new"].base_name == expected_name
+    with sqlite3.connect(registry) as conn:
+        rows = conn.execute(
+            "SELECT count(*) FROM stage_status WHERE dataset_key=?", (key,)
+        ).fetchone()[0]
+    assert rows == (0 if status == "done" else 1)
 
 
 def test_resent_session_start_keeps_its_resolved_name(tmp_path, receiver, client):
@@ -826,19 +895,21 @@ def test_resent_session_start_keeps_its_resolved_name(tmp_path, receiver, client
 
     # Resent while the session is still known ...
     _start_session(sock_b, "sess-b", receiver, header)
-    assert receiver.sessions["sess-b"].base_name == "sample_001"
-    # ... and after a receiver restart forgot it: its stores are tagged.
+    assert receiver.sessions["sess-b"].base_name == "sample"
+    # ... and after a receiver restart forgot it: its stores are tagged, so
+    # it keeps them rather than moving its own run aside.
     del receiver.sessions["sess-b"]
     _start_session(sock_b, "sess-b", receiver, header)
-    assert receiver.sessions["sess-b"].base_name == "sample_001"
+    assert receiver.sessions["sess-b"].base_name == "sample"
+    assert len(list((raw_root / ".superseded").iterdir())) == 1  # sess-a only
 
 
-def test_drained_staging_copy_is_released_for_a_different_destination(
+def test_staging_is_namespaced_per_destination(
     tmp_path, receiver, client, monkeypatch
 ):
-    """The staging root is flat across experiment folders: a retained copy
-    of an earlier `sample` drained elsewhere must not force a rename when
-    this session's destination has no `sample` at all."""
+    """2026-09-28: a Cell_001 left in the flat staging root by another
+    experiment (2026-09-24) renamed every later Cell_001. Each destination
+    now stages in its own namespace, so the names don't meet."""
     stage_root = tmp_path / "stage"
     monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage_root))
 
@@ -847,10 +918,13 @@ def test_drained_staging_copy_is_released_for_a_different_destination(
     _start_session(
         sock, "sess-exp1", receiver, _session_header(first_dest, num_timepoints=1)
     )
+    first_write_root = receiver.sessions["sess-exp1"].write_root
+    assert first_write_root.parent == stage_root
     _stream_all(sock, "sess-exp1", receiver, num_timepoints=1)
     assert _wait_until(lambda: (first_dest / "sample_C0.ome.zarr").exists())
-    assert _wait_until(lambda: "sess-exp1" in receiver._drain_pool._drained)
-    assert (stage_root / "sample_C0.ome.zarr").exists()  # retained after drain
+    # A leftover the drain doesn't know about, like the 2026-09-24 one.
+    (first_write_root / "sample" / "decon_stage").mkdir(parents=True, exist_ok=True)
+    (first_write_root / "sample" / "decon_stage" / "x.tif").write_bytes(b"x")
 
     sock = client("sess-exp2")
     _start_session(
@@ -860,13 +934,7 @@ def test_drained_staging_copy_is_released_for_a_different_destination(
         _session_header(tmp_path / "exp2", num_timepoints=1),
     )
     assert receiver.sessions["sess-exp2"].base_name == "sample"
-
-    # Back into the first folder, where `sample` really exists: renamed.
-    sock = client("sess-exp1-again")
-    _start_session(
-        sock, "sess-exp1-again", receiver, _session_header(first_dest, num_timepoints=1)
-    )
-    assert receiver.sessions["sess-exp1-again"].base_name == "sample_001"
+    assert receiver.sessions["sess-exp2"].write_root != first_write_root
 
 
 def test_create_channel_store_refuses_another_sessions_shape(tmp_path):

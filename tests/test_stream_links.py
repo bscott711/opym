@@ -20,7 +20,7 @@ from opym.stream.protocol import (
     pack_message,
     unpack_message,
 )
-from opym.stream.receiver import StreamReceiver, _identity_belongs
+from opym.stream.receiver import StreamReceiver, _identity_belongs, _stage_namespace
 
 SHAPE_ZYX = (6, 4, 5)
 
@@ -329,7 +329,7 @@ def test_resume_after_the_drain_writes_into_the_kept_staging_copy(
     assert "sess-stage" in recv._drain_pool._drained
 
     write_root = _stream_and_drain(recv, raw, stage, [(1, 1)], resume=0)
-    assert write_root == stage
+    assert write_root.parent == stage  # this raw_root's staging namespace
     assert _wait_until(
         lambda: "sess-stage" in recv._drain_pool._drained and _store(raw).exists()
     )
@@ -344,8 +344,10 @@ def test_resume_after_the_staging_copy_is_gone_writes_straight_to_raw_root(
     monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
     _stream_and_drain(recv, raw, stage, [(0, 0)], reason="idle_timeout")
     assert _wait_until(lambda: "sess-stage" in recv._drain_pool._drained)
-    recv._drain_pool.release([_store(stage)])  # retention expired
-    assert not _store(stage).exists()
+    recv._drain_pool.release(
+        [_store(stage / _stage_namespace(raw))]
+    )  # retention expired
+    assert not _store(stage / _stage_namespace(raw)).exists()
 
     write_root = _stream_and_drain(recv, raw, stage, [(1, 1)], resume=0)
     assert write_root == raw
@@ -361,8 +363,11 @@ def test_a_paused_run_is_never_copied_to_raw_root(tmp_path, recv, monkeypatch):
     time.sleep(0.3)
     assert not _store(raw).exists()
     # Kept on staging for the usual retention, then evicted.
-    assert _store(stage).exists()
-    assert _store(stage) in recv._drain_pool._drained["sess-stage"].stage_dirs
+    assert _store(stage / _stage_namespace(raw)).exists()
+    assert (
+        _store(stage / _stage_namespace(raw))
+        in recv._drain_pool._drained["sess-stage"].stage_dirs
+    )
 
 
 def test_the_final_ack_confirms_session_end_and_a_repeat_is_confirmed_too(
