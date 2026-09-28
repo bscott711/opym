@@ -519,3 +519,35 @@ def test_a_session_start_frees_ram_disk_space_before_refusing(
     assert _pump(recv, sock) is not None
     assert asked and "sess-room" in recv.sessions
     sock.close()
+
+
+def test_a_session_is_taken_with_room_for_itself_plus_the_floor(
+    tmp_path, recv, monkeypatch
+):
+    """2026-09-28: a 64.7 GB movie was turned down with 114.8 GB free (the
+    old rule wanted 2x); room for the session plus the floor is enough.
+    Without it the answer says why, so the client can retry."""
+    import shutil
+
+    import opym.stream.receiver as receiver_mod
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
+    monkeypatch.setattr(receiver_mod, "_estimate_session_bytes", lambda _h: 64.7e9)
+    disk = _FakeDisk(free_gb=80)
+    monkeypatch.setattr(shutil, "disk_usage", disk)
+
+    sock = _dealer(recv, "sess-short")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-short", _header(raw)))
+    ack = _pump(recv, sock)
+    assert ack["unknown_session"] is True
+    assert "need 84.7 GB" in ack["rejected"]
+    assert "sess-short" not in recv.sessions
+
+    disk.free_gb = 114.8  # the drain ended; the client's retry is taken
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-short", _header(raw)))
+    ack = _pump(recv, sock)
+    assert not ack.get("unknown_session")
+    assert "sess-short" in recv.sessions
+    sock.close()

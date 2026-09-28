@@ -218,6 +218,10 @@ _VALID_TYPES = frozenset(
 #                               -1 and means nothing here. A SESSION_END for
 #                               a session already closed is answered this
 #                               way too (it confirms the SESSION_END).
+#   rejected         str    -- OPTIONAL, with unknown_session: the server
+#                               turned this SESSION_START down (e.g. its RAM
+#                               disk has no room for the session yet), and
+#                               why. The client retries with backoff.
 #   ended            bool   -- OPTIONAL, true on the final ACK, sent once
 #                               the server has closed the session: it
 #                               confirms SESSION_END. A client that got no

@@ -581,8 +581,11 @@ def test_staging_rejects_session_when_insufficient_free_space(
         )
     )
     _drive(receiver)
+    _sid, ack = _recv_ack(sock)
 
     assert session_id not in receiver.sessions
+    assert ack["unknown_session"] is True
+    assert "need" in ack["rejected"]
 
 
 def test_decon_stage_cidx_matches_sorted_store_order_not_channel_index(

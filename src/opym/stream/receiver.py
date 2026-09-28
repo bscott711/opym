@@ -97,6 +97,10 @@ resends, and if space never comes back its own buffer fills and it pauses
 that had frames held back gets an ACK with "resend": true, so its client
 resends them at once instead of waiting until it calls its link stale
 (~5 s plus 1 s per 20 MB unACKed: 1.5 minutes for 2 GB; R5, 2026-09-27).
+A SESSION_START is taken if, after that eviction, the RAM disk has room for
+the whole session plus the floor; otherwise it is answered with
+"unknown_session" and "rejected" (the reason), and the client retries. A
+malformed or disallowed SESSION_START is still dropped unanswered.
 
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
@@ -264,6 +268,12 @@ def _requested_output_format(header: dict[str, Any], session_id: str) -> str | N
         rawmirror.OUTPUT_FORMATS,
     )
     return None
+
+
+class _StageShort(ValueError):
+    """The RAM disk has no room for a session yet: a SESSION_START turned
+    down for this is answered (with "rejected"), since a retry can succeed
+    once a drain frees space. Other rejections stay silent."""
 
 
 def _estimate_session_bytes(header: dict[str, Any]) -> int:
@@ -731,20 +741,19 @@ class StreamReceiver:
                 stage_root.mkdir(parents=True, exist_ok=True)
                 estimated_bytes = _estimate_session_bytes(header)
                 free_bytes = shutil.disk_usage(stage_root).free
-                # Require 2x headroom, not just enough to fit exactly -- the
-                # staging root is shared with every other concurrently
-                # staging session (and PetaKit5D's own /dev/shm usage), and
-                # a session that starts right at the edge would starve
-                # whichever one grows next. See module docstring.
-                if estimated_bytes * 2 > free_bytes:
-                    free_bytes = self._free_stage_space(stage_root, estimated_bytes * 2)
-                if estimated_bytes * 2 > free_bytes:
-                    raise ValueError(
-                        f"staging root {stage_root} has {free_bytes / 1e9:.1f} GB "
-                        f"free, need >= {estimated_bytes * 2 / 1e9:.1f} GB "
-                        f"(2x this session's estimated {estimated_bytes / 1e9:.1f} "
-                        "GB) -- rejecting rather than risking a mid-session "
-                        "tmpfs overflow"
+                # Room for the whole session plus the floor. Not 2x: the
+                # floor's hold-back already keeps tmpfs from filling
+                # mid-session, and 2x turned a back-to-back movie down
+                # while the previous one was still draining (2026-09-28:
+                # 114.8 GB free for a 64.7 GB session). See module docstring.
+                need_bytes = estimated_bytes + _stage_floor_bytes()
+                if need_bytes > free_bytes:
+                    free_bytes = self._free_stage_space(stage_root, need_bytes)
+                if need_bytes > free_bytes:
+                    raise _StageShort(
+                        f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
+                        f"free, need {need_bytes / 1e9:.1f} GB (this session's "
+                        f"estimated {estimated_bytes / 1e9:.1f} GB + the floor)"
                     )
 
             base_name = self._resolve_base_name(
@@ -789,6 +798,11 @@ class StreamReceiver:
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
+            if isinstance(exc, _StageShort):
+                # Answer, so the client knows why and retries (space may
+                # come back once a drain ends) instead of waiting on a
+                # silent socket.
+                self._send_unknown(sock, identity, session_id, rejected=str(exc))
             return
 
         self.sessions[session_id] = session
@@ -942,13 +956,17 @@ class StreamReceiver:
         self._send_unknown(sock, identity, session_id)
 
     @staticmethod
-    def _send_unknown(sock: zmq.Socket, identity: bytes, session_id: str) -> None:
-        header = {
+    def _send_unknown(
+        sock: zmq.Socket, identity: bytes, session_id: str, rejected: str = ""
+    ) -> None:
+        header: dict[str, Any] = {
             "through_frame_index": -1,
             "unknown_session": True,
             "server_time_s": time.time(),
             "features": SERVER_FEATURES,
         }
+        if rejected:
+            header["rejected"] = rejected
         sock.send_multipart([identity, *pack_message(MSG_ACK, session_id, header)])
 
     def _handle_prepare(self, prepare_id: str, header: dict[str, Any]) -> None:

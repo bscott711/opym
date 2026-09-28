@@ -255,6 +255,12 @@ continues in its old stores, and the batch pipeline (not the live lane)
 processes it. A `SESSION_START` for a session that is still open is just
 re-ACKed.
 
+A `SESSION_START` the receiver turns down (its RAM disk has no room for the
+session plus `OPYM_STREAM_STAGE_FLOOR_GB` yet) is
+answered with `unknown_session: true` and `rejected`, the reason. The client
+keeps retrying with backoff: space usually comes back once the previous
+session's drain to GPFS ends.
+
 `resend: true` means the receiver dropped frames it could not stage (its RAM
 disk was below `OPYM_STREAM_STAGE_FLOOR_GB`) and has room again: resend now
 everything still unACKed, in `frame_index` order, as after a `RESUME` reply.
