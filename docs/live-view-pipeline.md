@@ -55,7 +55,7 @@ Argus (micro001)                                          v
      read (cpp-zarr N-D mex) -> OMW decon, 2 iterations (GPU) -> linear deskew/rotate
      -> opymWriteLiveOutputs: view buffer .npy FIRST, then the processed store
      │
-     ├──> buffers/T<t>_C<c>.npy on /dev/shm (uncompressed 8-bit, 419 × 1458 × 833, 0.51 GB;
+     ├──> buffers/T<tttt>_C<c>.npy on /dev/shm (uncompressed 8-bit, 419 × 1458 × 833, 0.51 GB;
      │        each channel's shift in buffers/display_C<c>.json)
      │        └──> naparym-live (mmap, full resolution, 3D, 8-bit) ──> DCV ──> your screen
      └──> processed OME-Zarr on /dev/shm (bioformats2raw layout 3: 3 levels + Z-MIP)
@@ -176,7 +176,7 @@ Known gaps:
 
 ## Measuring it
 
-`opym-live-trace [--session ID] [--jobs DIR]` joins the receiver's and
+`opym-live-trace [--session ID | --base NAME] [--jobs DIR] [--out DIR]` joins the receiver's and
 lane's trace (`profiling/live_trace.jsonl`), the GPU servers' profiles
 (`profiling/S<id>.jsonl`) and naparym-live's events
 (`profiling/live_view.jsonl`) into p50/p95 per hop.

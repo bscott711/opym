@@ -32,13 +32,23 @@ dataset on its own next pass and submits its one deskew/decon ticket exactly
 as it would for a Globus-landed dataset — nothing downstream of this protocol
 changes or needs to know the data arrived over the network instead.
 
+Two opt-in receiver modes sit on top of that. With `OPYM_STREAM_STAGE_ROOT`
+set, the receiver writes to a RAM disk instead and copies each finished
+session to `raw_root` in the background (verified byte for byte) after
+`SESSION_END`. With `OPYM_LIVE_LANE=1`, it also hands each completed volume to
+the live lane, which deconvolves and deskews it while the acquisition is
+still running (see [live-view-pipeline.md](live-view-pipeline.md)). Neither
+changes a message format. Staging adds the `rejected` and `resend` replies
+described under `ACK` below.
+
 When decon is enabled on Argus (the `OPYM_DECON_PSF` env var the batch
 backfill driver already reads), the receiver *also* pre-stages each frame as
 a decon-ready TIFF, so that step is a no-op by the time the batch pass gets
-to it. This is a latency optimization only — decon parameters themselves
-(PSF, wiener_alpha, edge_erosion) are resolved entirely server-side by the
-batch driver's own fixed configuration, not by anything this protocol's
-client declares.
+to it. (The one-format live lane, `OPYM_LIVE_FORMAT=zarr`, reads the raw
+store directly and writes no TIFFs.) This is a latency optimization only —
+decon parameters themselves (PSF, wiener_alpha, edge_erosion) are resolved
+entirely server-side by the batch driver's own fixed configuration, not by
+anything this protocol's client declares.
 
 ## Transport
 
@@ -127,9 +137,10 @@ Globus-landed acquisition.
 These are the only fields the receiver's raw-mirror write path actually
 needs. Decon config (PSF, `wiener_alpha`, `edge_erosion`, `rl_method`) is
 **not** part of this handshake — see "Why this exists" above. A client may
-still send `sheet_angle_deg`, `xy_pixel_size`, `t_interval_s`, `psf_paths`,
-etc. for its own logging/provenance; the receiver ignores anything it
-doesn't need.
+still send `sheet_angle_deg`, `xy_pixel_size`, `psf_paths`, etc. for its own
+logging/provenance; the receiver ignores anything it doesn't need. The one
+exception is `t_interval_s` (seconds between timepoints), which the live lane
+uses as the time scale of the processed store.
 
 **If you do send `sheet_angle_deg`, it is not a free parameter — use
 `60.0`.** That's the validated production value for this OPM, used as the
@@ -157,6 +168,20 @@ flat list further. There's nothing to add to the protocol for this —
 `SessionState.channels` in `receiver.py` is already an arbitrary-length
 list with no hardcoded channel-count assumption anywhere in the receiver.
 
+Optional `SESSION_START` fields: `output_format` (`"tiff"`, `"ome-zarr"` or
+`"both"`: the format the processed result is kept in, recorded on each raw
+store; an unknown value is ignored), `accepts` (`["qc"]`, see `QC` below) and
+`resume_through` (see `ACK` below).
+
+**Names.** The receiver tries to keep `base_name` as sent. If an earlier
+acquisition already used that name under `raw_root`, the earlier run is moved
+(not deleted) to `<raw_root>/.superseded/<name>-<time>/`, which the backfill
+never processes, and the new run keeps the name. Only while the earlier run
+may still be in use (an open session of that name, a staged copy not yet
+drained, or a backfill stage running on it) is the new run written as
+`<name>_001`, `<name>_002`, and so on. A `SESSION_START` resent for a session
+already registered keeps its name.
+
 The server replies with an `ACK` (`through_frame_index: -1`) once the
 session is registered.
 
@@ -183,6 +208,12 @@ reconnect) is a safe no-op, not a duplicate ticket. `camera_id` is carried
 along for logging/debugging only — see the multi-camera note above:
 `c` (matched against `SESSION_START`'s `channels`) is what actually
 identifies which camera+excitation this volume belongs to.
+
+Optional `codec`: once an `ACK` has listed `"blosc"` in its `features`, a
+client may send a `FRAME`'s payload as one blosc frame (lz4 with bitshuffle,
+about 2.5x smaller on camera data) with `"codec": "blosc"` in the header.
+`shape_zyx` and `dtype` still describe the decoded volume. Absent or `"raw"`
+means the raw bytes.
 
 Optional latency-trace fields, all epoch seconds on the client's own clock:
 `acq_first_s` / `acq_last_s` (first / last plane of the volume acquired),
@@ -225,6 +256,11 @@ reach Argus for longer than its RAM buffer holds. The partial copy is kept on
 the staging root for the usual retention but **not** copied to `raw_root`, so
 the run's full local save can be sent there by Globus instead.
 
+The receiver confirms the end with one last `ACK` carrying `"ended": true`
+(and the final `through_frame_index`), so a client can wait for it instead of
+guessing. If that `ACK` is lost, resend `SESSION_END`: for a session already
+closed the receiver answers `unknown_session: true`, which confirms it.
+
 Just marks the session finished on the receiver and logs how many `(t, c)`
 pairs arrived — there is nothing to stitch or consolidate (see "Why this
 exists" above): each channel's frames were already written straight into
@@ -251,9 +287,11 @@ after an ACK has advertised it.
 `RESUME` this way, and a `FRAME` at most every 2 s. A client that saw
 `"resume"` then re-sends `SESSION_START` with `resume_through` (its highest
 ACKed `frame_index`), and then everything still unACKed. The session
-continues in its old stores, and the batch pipeline (not the live lane)
-processes it. A `SESSION_START` for a session that is still open is just
-re-ACKed.
+continues in its old stores. With the one-format live lane it stays live:
+volumes already complete on disk are handed to the lane again and a
+half-received one is finished from the planes already written. Otherwise the
+batch pipeline processes it. A `SESSION_START` for a session that is still
+open is just re-ACKed.
 
 A `SESSION_START` the receiver turns down (its RAM disk has no room for the
 session plus `OPYM_STREAM_STAGE_FLOOR_GB` yet) is
@@ -273,7 +311,8 @@ clients use it only to estimate their clock offset for the trace fields.
 
 Sent periodically (every ~10 frames or ~2s, whichever first) once frames up
 to `through_frame_index` are durably written into their channel's raw mirror
-store on GPFS. `-1` means nothing processed yet. **This is your resumability
+store (on GPFS, or on the staging RAM disk when `OPYM_STREAM_STAGE_ROOT` is
+set). `-1` means nothing processed yet. **This is your resumability
 signal**: keep a bounded local ring buffer of sent-but-unacked frames, and
 drop entries once their `frame_index <= through_frame_index`.
 
@@ -285,10 +324,10 @@ header = {}
 
 Send this immediately after a fresh `connect()` on the same `session_id`
 identity. The server replies with an `ACK` reflecting whatever it actually
-has for that session (`-1` if it doesn't recognize the session at all — e.g.
-the receiver process itself restarted; session state isn't persisted to
-disk in v1). Resend everything in your local buffer with
-`frame_index > through_frame_index`, in order.
+has for that session. If it doesn't recognize the session at all (e.g. the
+receiver process restarted), the reply has `unknown_session: true`: see
+`ACK` above for how to re-open it. Otherwise resend everything in your local
+buffer with `frame_index > through_frame_index`, in order.
 
 ### 6. `QC` — server -> client, only if the client asked for it
 
@@ -319,6 +358,26 @@ every raw frame to `<leaf>/qc/rawproj/<base>_C<c>_T<ttt>.npz`
 (`opym.stream.qcproj`). The QC service reads those and writes
 `<leaf>/qc/live_qc.jsonl` (every verdict) and `<leaf>/qc/qc_latest.json` (the
 newest). The receiver forwards the newest one.
+
+### 7. `PREPARE` — client -> server, before a run
+
+```python
+header = {"shape_zyx": [161, 490, 1458], "z_step_um": 0.5,
+          "dtype": "uint16", "num_timepoints": 100,
+          "channel_names": ["GFP_488", "mScarlet_561"]}
+```
+
+Send it while the acquisition is being set up (for example when the MDA is
+configured with streaming on), so the receiver can warm a GPU server for that
+shape and the first timepoint costs what the others do. It goes on a
+connection of its own, with a fresh id as both the `session_id` and the
+`DEALER` identity (`opym.stream.client.send_prepare` does this). It opens no
+session and nothing answers it. Only `shape_zyx` and `z_step_um` are required;
+`dtype`, `num_timepoints` and `channel_names` are for the log. Send it again
+whenever the plan changes: the warm-up holds for about 10 minutes after the
+last one. It has an effect only when the receiver runs the one-format live
+lane (`OPYM_LIVE_LANE=1`, `OPYM_LIVE_FORMAT=zarr`) with a decon PSF;
+otherwise it is ignored.
 
 ## Worked example (client-side pseudocode)
 
@@ -354,7 +413,8 @@ send `RESUME`, wait for the `ACK`, then resend everything left in
 `opym.stream.receiver`'s module docstring for the full rationale.)
 
 1. On a channel's first frame, creates
-   `<raw_root>/<base_name>_<channel_names[i]>.ome.zarr` — zarr v2, one
+   `<raw_root>/<base_name>_<channel_names[i]>.ome.zarr` (under
+   `OPYM_STREAM_STAGE_ROOT` instead, when set) — zarr v2, one
    z-plane per chunk, plus a `z` coordinate array derived from `z_step_um`
    (`opym.stream.rawmirror.create_channel_store`) — the same layout
    `opym.discovery` and `opym.metadata.parse_zarr_z_step_from_store` already
@@ -368,10 +428,13 @@ send `RESUME`, wait for the `ACK`, then resend everything left in
    `<raw_root>/<base_name>/decon_stage/`, named to exactly match what
    `bioimaging.backfill.pipeline.build_decon_staging_dir` would independently
    produce, so that step's skip-if-exists check treats it as already done.
-4. Submits no ticket and stages nothing under `/dev/shm/` — `opym-backfill
-   --watch` finds the dataset through its normal GPFS walk once
-   `SESSION_END` (or the idle timeout) finalizes it, and submits the one
-   deskew/decon ticket for the whole thing, unmodified.
+4. Without the live lane it submits no ticket — `opym-backfill --watch` finds
+   the dataset through its normal GPFS walk once `SESSION_END` (or the idle
+   timeout) finalizes it (and, with staging on, once the drain has copied it
+   to `raw_root`), and submits the one deskew/decon ticket for the whole
+   thing, unmodified. With the live lane (`OPYM_LIVE_LANE=1`) it also queues
+   a ticket per completed volume as it lands, and the backfill skips a
+   dataset the live lane finished.
 
 ## Links (several connections per session)
 
@@ -388,6 +451,10 @@ same receiver port. Any message may go on any link, and messages on
 different links arrive in any order: the receiver keys everything by the
 header's `session_id`, dedupes resends by `frame_index` / `(t, c)` / `z0`,
 and sends ACKs and QC back on the link it heard from last.
+
+Measured later on the production path (2026-09-26), one tunnel carried about
+63 MB/s and 4 tunnels, each its own `ssh` process, about 255 MB/s; see
+[live-view-pipeline.md](live-view-pipeline.md).
 
 Measure what the links carry from the acquisition PC with
 `python -m pymmcore_gui._argus_stream.linkbench`, against
