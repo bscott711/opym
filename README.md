@@ -198,8 +198,8 @@ What the receiver does:
   volume to the **live lane**, which queues a ticket for the GPU servers ahead of
   any backfill work. While an acquisition is open the receiver holds a lease that
   keeps the backfill off the GPUs, and a backfill server is preempted if live work
-  has none. A `PREPARE` message sent while the acquisition is being set up warms a
-  GPU server in advance.
+  has none. With the one-format lane, a `PREPARE` message sent while the acquisition
+  is being set up warms a GPU server in advance.
 * Keeps the microscope's session name. If an earlier run in the same folder used
   it, that run is moved (not deleted) to `.superseded/` in that folder, which the
   backfill ignores. Only while that earlier run may still be in use does the new
