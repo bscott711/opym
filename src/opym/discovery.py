@@ -38,6 +38,9 @@ _OUTPUT_DIR_NAMES = frozenset(
         # Other convenience output written beside the crop/deskew stages.
         "viewer",
         "decon_qc",
+        # Earlier acquisitions a new one reused the name of
+        # (opym.stream.receiver._supersede): kept, never processed.
+        ".superseded",
     }
 )
 

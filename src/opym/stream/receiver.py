@@ -28,7 +28,8 @@ arrive, not into small per-(t,c) outputs that need stitching afterward.
 
 RAM-disk staging (opt-in, `OPYM_STREAM_STAGE_ROOT`): when set, every write
 this module makes (raw mirror stores AND decon-stage TIFFs) goes to
-`<stage_root>/<base_name>/...` instead of `<raw_root>/<base_name>/...` --
+`<stage_root>/<namespace>/<base_name>/...` (one namespace per raw_root, see
+`_stage_namespace`) instead of `<raw_root>/<base_name>/...` --
 intended to be a tmpfs mount (e.g. `/dev/shm`), so PetaKit5D's local GPU
 pipeline (itself already tmpfs-native -- see `local_gpu_worker.py`,
 `run_petakit_server.m`) reads its input with zero GPFS read latency. `Session
@@ -111,10 +112,12 @@ Globus instead.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -125,7 +128,7 @@ import numpy as np
 import zmq
 from numcodecs import blosc as _blosc
 
-from opym import lanes
+from opym import discovery, lanes
 from opym.decon_config import resolve_decon_psf
 from opym.stream import drain, live, live_zarr, rawmirror, trace
 from opym.stream.live import LiveLane
@@ -177,6 +180,12 @@ _DECON_PSF_ENV_VAR = "OPYM_DECON_PSF"
 # own per-session-read pattern -- both are toggled per-test via monkeypatch,
 # and neither is expected to change mid-process in production.
 _STAGE_ROOT_ENV_VAR = "OPYM_STREAM_STAGE_ROOT"
+# The backfill's status registry (opym.registry): a run moved aside by
+# _supersede is forgotten there, or its reused name would count as done.
+_REGISTRY_ENV_VAR = "OPYM_BACKFILL_REGISTRY_PATH"
+# Where an earlier acquisition goes when a new one reuses its name; pruned
+# by opym.discovery, so the backfill never processes it.
+SUPERSEDED_DIR_NAME = ".superseded"
 
 
 # Holding the live lease (opym.lanes) makes the GPU servers and the backfill
@@ -246,6 +255,22 @@ def _stage_floor_bytes() -> int:
     except ValueError:
         gb = _DEFAULT_STAGE_FLOOR_GB
     return int(gb * 1e9)
+
+
+def _stage_namespace(raw_root: Path) -> str:
+    """The staging subdirectory for one `raw_root`: its last component plus
+    a short hash of the full path. The staging root used to be flat across
+    every experiment folder, so a leftover `Cell_001/` from one experiment
+    (2026-09-24) made every later experiment's `Cell_001` land as
+    `Cell_001_001`, `_002`, ... (2026-09-28). Names now only collide within
+    the one folder they share on GPFS, exactly as on the microscope."""
+    digest = hashlib.sha1(str(raw_root).encode()).hexdigest()[:8]
+    return f"{raw_root.name}-{digest}"
+
+
+def _registry_path_from_env() -> Path | None:
+    val = os.environ.get(_REGISTRY_ENV_VAR, "").strip()
+    return Path(val) if val else None
 
 
 def _stage_root_from_env() -> Path | None:
@@ -733,12 +758,16 @@ class StreamReceiver:
                 )
 
             stage_root = _stage_root_from_env()
-            write_root = stage_root if stage_root is not None else raw_root
+            write_root = (
+                stage_root / _stage_namespace(raw_root)
+                if stage_root is not None
+                else raw_root
+            )
             if stage_root is not None:
                 # mkdir first -- disk_usage needs an existing path, and this
                 # root is otherwise only created lazily on a channel store's
                 # first write (rawmirror.create_channel_store).
-                stage_root.mkdir(parents=True, exist_ok=True)
+                write_root.mkdir(parents=True, exist_ok=True)
                 estimated_bytes = _estimate_session_bytes(header)
                 free_bytes = shutil.disk_usage(stage_root).free
                 # Room for the whole session plus the floor. Not 2x: the
@@ -857,10 +886,11 @@ class StreamReceiver:
 
         A name is taken if one of its channel stores or its leaf directory
         exists under `raw_root` (an earlier acquisition landed there), or is
-        still occupied under the staging root. Staging copies of already-
-        drained sessions are released first (`DrainPool.release`), since the
-        staging root is flat across every `raw_root` and a retained copy from
-        another experiment folder would otherwise force a needless rename.
+        still occupied in this `raw_root`'s staging namespace. Staging copies
+        of already-drained sessions are released first (`DrainPool.release`).
+        When only an earlier, finished acquisition on GPFS holds the name
+        (the microscope reused it), that one is moved aside instead
+        (`_supersede`) and this session keeps the name.
         Stores tagged with this `session_id` -- staged or already drained --
         are this session's own (a SESSION_START resent after a receiver
         restart or idle timeout), and keep their name.
@@ -885,12 +915,19 @@ class StreamReceiver:
             ):
                 return name
             taken = any(p.exists() for p in dest_stores) or (raw_root / name).exists()
-            if staging and not taken:
+            stage_busy = False
+            if staging:
                 stage_leaf = write_root / name
                 self._drain_pool.release([*stage_stores, stage_leaf / "decon_stage"])
-                taken = any(p.exists() for p in stage_stores) or _holds_files(
+                stage_busy = any(p.exists() for p in stage_stores) or _holds_files(
                     stage_leaf
                 )
+            if n == 0 and taken and not stage_busy:
+                # The microscope reused the name (the earlier run there was
+                # deleted or overwritten): keep the name, move the earlier
+                # run aside -- unless it may still be in use.
+                taken = not self._supersede(name, raw_root, dest_stores)
+            taken = taken or stage_busy
             if not taken:
                 if n:
                     logger.warning(
@@ -906,6 +943,72 @@ class StreamReceiver:
             f"base_name {requested!r} and all of its _001.._{_MAX_NAME_SUFFIX:03d} "
             f"variants are already used under {raw_root}"
         )
+
+    def _supersede(self, name: str, raw_root: Path, dest_stores: list[Path]) -> bool:
+        """Move an earlier acquisition named `name` out of the way, into
+        `<raw_root>/.superseded/<name>-<time>/` (its channel stores and its
+        leaf directory with every output), and forget it in the backfill
+        registry, so a new run can take the name the microscope gave it.
+        Nothing is deleted. Refuses (returns False, and the new run gets
+        `name_001` instead) while the earlier run may still be in use: an
+        open session of that name here, or a backfill stage running on it.
+        """
+        for other in self.sessions.values():
+            if (
+                not other.ended
+                and other.base_name == name
+                and (other.raw_root == raw_root)
+            ):
+                return False
+        key = str(raw_root / name)
+        registry = _registry_path_from_env()
+        try:
+            if registry is not None and registry.exists():
+                with sqlite3.connect(registry, timeout=10) as conn:
+                    running = conn.execute(
+                        "SELECT 1 FROM stage_status WHERE dataset_key=? "
+                        "AND status='running' LIMIT 1",
+                        (key,),
+                    ).fetchone()
+                if running:
+                    logger.warning(
+                        "Not moving %s aside: the backfill is processing it", key
+                    )
+                    return False
+            # Its stores: as the backfill groups them, plus the exact paths
+            # this session would write (a channel name outside the
+            # _<Channel>_<wavelength> convention isn't grouped).
+            leaf = raw_root / name
+            items = sorted(
+                {
+                    *discovery.group_channel_zarr_stores(raw_root).get(name, []),
+                    *(p for p in dest_stores if p.exists()),
+                    *([leaf] if leaf.exists() else []),
+                }
+            )
+            if not items:
+                return False
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            aside = raw_root / SUPERSEDED_DIR_NAME / f"{name}-{stamp}"
+            aside.mkdir(parents=True, exist_ok=False)
+            for item in items:
+                os.rename(item, aside / item.name)
+            if registry is not None and registry.exists():
+                with sqlite3.connect(registry, timeout=10) as conn:
+                    conn.execute("DELETE FROM stage_status WHERE dataset_key=?", (key,))
+                    conn.execute("DELETE FROM datasets WHERE dataset_key=?", (key,))
+        except (OSError, sqlite3.Error):
+            logger.exception("Could not move %s aside; renaming the new run", key)
+            return False
+        logger.warning(
+            "base_name %r was used by an earlier acquisition under %s: moved "
+            "it (%d item(s)) to %s so this run keeps the microscope's name",
+            name,
+            raw_root,
+            len(items),
+            aside,
+        )
+        return True
 
     def _resume_write_root(
         self,
