@@ -55,6 +55,51 @@ from opym.consolidate import run_pending_consolidations
 # Dynamically locate the opym installation directory
 OPYM_DIR = Path(__file__).parent.resolve()
 
+# Matlab is reached through Lmod (`module load`). A non-interactive `bash -c`
+# only has the `module` function if BASH_ENV points at Lmod's init, and
+# BASH_ENV comes from a login shell. After the 2026-10-01 reboot the systemd
+# user manager started without it, so every launch died with
+# "module: command not found" (rc 127, 32 failed starts) until opym-serve
+# was restarted from a login session on 10-06. The launch command now
+# sources the first readable init script itself when `module` or MODULEPATH
+# is missing. The profile.d script comes first: it also sets MODULEPATH,
+# which Lmod's bare init/bash does not (without it matlab/R2024b is "unknown").
+MATLAB_MODULE = "matlab/R2024b"
+LMOD_INIT_SCRIPTS: tuple[str, ...] = (
+    "/etc/profile.d/modules.sh",
+    "/usr/share/lmod/lmod/init/bash",
+)
+# bash's "command not found": the launch environment, not Matlab, is broken.
+LAUNCH_ENV_BROKEN_RC = 127
+
+
+def matlab_launch_command(
+    opym_dir: Path = OPYM_DIR,
+    *,
+    module: str = MATLAB_MODULE,
+    init_scripts: tuple[str, ...] = LMOD_INIT_SCRIPTS,
+    matlab_cmd: str | None = None,
+) -> str:
+    """The bash script that starts one PetaKit5D server: make sure Lmod's
+    `module` and MODULEPATH exist (sourcing an init script if the
+    environment didn't provide them), load
+    Matlab, run the server. Exits 127 with a clear message if `module`
+    can't be had at all."""
+    if matlab_cmd is None:
+        matlab_cmd = f"matlab -nodisplay -sd {opym_dir} -batch run_petakit_server"
+    inits = " ".join(f"'{p}'" for p in init_scripts)
+    return (
+        'if ! type module >/dev/null 2>&1 || [ -z "${MODULEPATH:-}" ]; then '
+        f"for f in {inits}; do "
+        '[ -r "$f" ] && . "$f" && type module >/dev/null 2>&1 && break; '
+        "done; fi; "
+        "if ! type module >/dev/null 2>&1; then "
+        "echo 'opym-serve: Lmod `module` command unavailable (no BASH_ENV and "
+        f"no readable init script); cannot load {module}' >&2; "
+        f"exit {LAUNCH_ENV_BROKEN_RC}; fi; "
+        f"module load {module} && {matlab_cmd}"
+    )
+
 # PETAKIT_JOBS_DIR matches run_petakit_server.m's override, for test servers.
 BASE_DIR = lanes.jobs_dir()
 QUEUE_DIR = BASE_DIR / "queue"
@@ -296,6 +341,7 @@ class ServerSlot:
     idle_s: float | None = None
     hang_flagged_ticket: str | None = None
     preempting: bool = False
+    last_exit_code: int | None = None
 
 
 class ServerSupervisor:
@@ -407,6 +453,7 @@ class ServerSupervisor:
     def _on_exit(self, slot: ServerSlot, now: float) -> None:
         rc = slot.proc.returncode
         slot.proc = None
+        slot.last_exit_code = rc
         slot.idle_s = None
         slot.hang_flagged_ticket = None
         if slot.preempting:
@@ -439,6 +486,15 @@ class ServerSupervisor:
         slot.consecutive_failures += 1
         backoff = _next_backoff_sec(slot.consecutive_failures)
         slot.next_launch_at = now + backoff
+        if rc == LAUNCH_ENV_BROKEN_RC:
+            print(
+                f"🚨 Server {slot.server_id} could not start: rc=127 means bash "
+                "could not find `module` or `matlab`. The launch environment is "
+                "broken (Lmod not initialised?), so no GPU work will run until "
+                "it is fixed. Check BASH_ENV/MODULEPATH for opym-serve and "
+                f"`module load {MATLAB_MODULE}` in a plain `bash -c`.",
+                flush=True,
+            )
         print(
             f"❌ Server {slot.server_id} exited with rc={rc}. Relaunching it alone in "
             f"{backoff:.0f}s (consecutive failures: {slot.consecutive_failures}); "
@@ -660,11 +716,9 @@ class ServerSupervisor:
         env["PETAKIT_GPU_ID"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = slot.cuda_device
         env["PETAKIT_CPUS"] = "10"  # Limit workers to prevent GPU OOM
-        # Use bash to load the matlab module so licensing works correctly
-        cmd_str = (
-            "module load matlab/R2024b && "
-            f"matlab -nodisplay -sd {OPYM_DIR} -batch run_petakit_server"
-        )
+        # Load Matlab through Lmod so licensing works; see matlab_launch_command
+        # for why the command initialises Lmod itself.
+        cmd_str = matlab_launch_command()
         return subprocess.Popen(["bash", "-c", cmd_str], env=env)  # nosec B603
 
     def _run_consolidations(self) -> None:
@@ -697,6 +751,8 @@ class ServerSupervisor:
                     "claimed_at": claim.claimed_at if claim else None,
                     "idle_s": slot.idle_s,
                     "suspected_hang": slot.hang_flagged_ticket is not None,
+                    "last_exit_code": slot.last_exit_code,
+                    "launch_env_broken": slot.last_exit_code == LAUNCH_ENV_BROKEN_RC,
                 }
             )
         tmp = self.base_dir / ".supervisor_status.json.tmp"
