@@ -7,6 +7,20 @@ change behaviour).
 
 ## [Unreleased]
 
+### Fixed
+- `opym-serve` survives a reboot: the Matlab launch sources Lmod
+  (`/etc/profile.d/modules.sh`) itself when `module` or `MODULEPATH` is
+  missing. After the 2026-10-01 reboot every launch failed with
+  "module: command not found" (rc 127) until a manual restart. rc 127 is
+  now logged loudly and reported as `last_exit_code` / `launch_env_broken`
+  in `supervisor_status.json`.
+
+### Added
+- `StatusRegistry` counts consecutive failures per stage
+  (`stage_status.consecutive_failures`, migrated in place), with
+  `gave_up_datasets()` and `clear_gave_up()`, so the backfill can stop
+  retrying stages that fail every time.
+
 ## [0.4.0] - 2026-09-30
 
 The headline of this release is the **live lane**: a streamed acquisition is now
