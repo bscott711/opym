@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS stage_status (
     output_path   TEXT,
     ticket_path   TEXT,
     error_message TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (dataset_key, stage)
 );
 """
@@ -113,11 +114,39 @@ _NEW_DATASET_COLUMNS = {
 }
 
 
+# Same, for stage_status. `consecutive_failures` counts back-to-back
+# `failed` finishes of one stage; any `done` or `reset_stage` zeroes it.
+# --watch retries every failed stage on every pass, so a stage that fails
+# the same way forever (an unsupported axis order, a test acquisition with
+# no MIPs) used to be retried every 2 minutes for weeks, flooding the log.
+# After MAX_STAGE_FAILURES in a row the backfill gives up on that dataset
+# (see `gave_up_datasets`) until someone clears it (`clear_gave_up`).
+_NEW_STAGE_COLUMNS = {
+    "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+}
+
+MAX_STAGE_FAILURES = 3
+
+
+def _add_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+    except sqlite3.OperationalError as e:
+        # Another process (the backfill's own pool workers open the
+        # registry too) added it between our PRAGMA and this ALTER.
+        if "duplicate column" not in str(e):
+            raise
+
+
 def _migrate_schema(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(datasets)")}
-    for col, col_type in _NEW_DATASET_COLUMNS.items():
-        if col not in existing:
-            conn.execute(f"ALTER TABLE datasets ADD COLUMN {col} {col_type}")
+    for table, columns in (
+        ("datasets", _NEW_DATASET_COLUMNS),
+        ("stage_status", _NEW_STAGE_COLUMNS),
+    ):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for col, col_type in columns.items():
+            if col not in existing:
+                _add_column(conn, table, col, col_type)
 
 
 def _now() -> str:
@@ -351,14 +380,20 @@ class StatusRegistry:
             cur.execute(
                 """INSERT INTO stage_status
                        (dataset_key, stage, status, started_at, finished_at,
-                        output_path, ticket_path, error_message)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        output_path, ticket_path, error_message, consecutive_failures)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(dataset_key, stage) DO UPDATE SET
                        status=excluded.status, finished_at=excluded.finished_at,
                        output_path=COALESCE(excluded.output_path, stage_status.output_path),
                        ticket_path=COALESCE(excluded.ticket_path, stage_status.ticket_path),
-                       error_message=excluded.error_message""",
-                (dataset_key, stage, status, _now(), _now(), output_path, ticket_path, error),
+                       error_message=excluded.error_message,
+                       consecutive_failures=CASE excluded.status
+                           WHEN 'failed' THEN stage_status.consecutive_failures + 1
+                           ELSE 0 END""",
+                (
+                    dataset_key, stage, status, _now(), _now(), output_path,
+                    ticket_path, error, 1 if status == "failed" else 0,
+                ),
             )
 
     def reset_stage(self, dataset_key: str, stage: str) -> None:
@@ -376,7 +411,8 @@ class StatusRegistry:
         with self._cursor() as cur:
             cur.execute(
                 """UPDATE stage_status
-                   SET status='pending', finished_at=NULL, error_message=NULL
+                   SET status='pending', finished_at=NULL, error_message=NULL,
+                       consecutive_failures=0
                    WHERE dataset_key=? AND stage=?""",
                 (dataset_key, stage),
             )
@@ -408,6 +444,34 @@ class StatusRegistry:
             )
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def gave_up_datasets(self, max_failures: int = MAX_STAGE_FAILURES) -> dict[str, list[str]]:
+        """{dataset_key: [stage, ...]} for every stage that is `failed` and
+        has failed `max_failures` times in a row: the backfill stops
+        retrying those datasets. The rows stay `failed` (the dashboard
+        still lists them as failures); nothing is deleted."""
+        with self._cursor() as cur:
+            cur.execute(
+                """SELECT dataset_key, stage FROM stage_status
+                   WHERE status='failed' AND consecutive_failures >= ?
+                   ORDER BY dataset_key, stage""",
+                (max_failures,),
+            )
+            out: dict[str, list[str]] = {}
+            for key, stage in cur.fetchall():
+                out.setdefault(key, []).append(stage)
+            return out
+
+    def clear_gave_up(self, max_failures: int = MAX_STAGE_FAILURES) -> int:
+        """Lets the backfill try every given-up stage again (it stays
+        `failed` until the retry finishes). Returns how many were cleared."""
+        with self._cursor() as cur:
+            cur.execute(
+                """UPDATE stage_status SET consecutive_failures=0
+                   WHERE status='failed' AND consecutive_failures >= ?""",
+                (max_failures,),
+            )
+            return cur.rowcount
 
     def all_datasets(self) -> list[dict]:
         with self._cursor() as cur:

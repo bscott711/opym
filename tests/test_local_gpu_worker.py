@@ -651,3 +651,68 @@ def test_a_dead_servers_live_ticket_is_requeued_without_a_sweep(tmp_path):
     sup.tick()
     assert (sup.live_queue_dir / "LIVE_t000.json").exists()
     assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
+
+
+# --- Matlab launch environment (2026-10-06: rc 127 after a reboot) -----------
+
+
+def _run_launch(cmd, tmp_path):
+    import subprocess
+
+    # What a fresh systemd user manager gives us: no BASH_ENV and no
+    # exported `module` function (BASH_FUNC_module%%) from a login shell.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("BASH_ENV", "ENV", "MODULEPATH")
+        and not k.startswith("BASH_FUNC_")
+    }
+    env["PATH"] = "/usr/bin:/bin"
+    return subprocess.run(
+        ["bash", "--norc", "--noprofile", "-c", cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+
+
+def test_launch_initialises_lmod_itself_when_bash_env_is_missing(tmp_path):
+    """The systemd user manager can come up without BASH_ENV; the launch
+    must source an init script instead of dying with 'module: not found'."""
+    fake_init = tmp_path / "lmod_init.sh"
+    fake_init.write_text('module() { echo "loaded $*"; }\n')
+    cmd = local_gpu_worker.matlab_launch_command(
+        init_scripts=(str(tmp_path / "missing.sh"), str(fake_init)),
+        matlab_cmd="echo MATLAB_RAN",
+    )
+    out = _run_launch(cmd, tmp_path)
+    assert out.returncode == 0, out.stderr
+    assert "loaded load matlab/R2024b" in out.stdout
+    assert "MATLAB_RAN" in out.stdout
+
+
+def test_launch_without_any_lmod_exits_127_with_a_clear_message(tmp_path):
+    cmd = local_gpu_worker.matlab_launch_command(
+        init_scripts=(str(tmp_path / "missing.sh"),),
+        matlab_cmd="echo MATLAB_RAN",
+    )
+    out = _run_launch(cmd, tmp_path)
+    assert out.returncode == local_gpu_worker.LAUNCH_ENV_BROKEN_RC
+    assert "Lmod `module` command unavailable" in out.stderr
+    assert "MATLAB_RAN" not in out.stdout
+
+
+def test_rc_127_is_reported_loudly_and_in_the_status(tmp_path, capsys):
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "job.json")
+    sup.tick()
+    dict(launched)["1"].exit(local_gpu_worker.LAUNCH_ENV_BROKEN_RC)
+    sup.tick()
+    assert "launch environment is broken" in capsys.readouterr().out
+    status = json.loads((sup.base_dir / "supervisor_status.json").read_text())
+    s1 = next(s for s in status["servers"] if s["server_id"] == "1")
+    assert s1["last_exit_code"] == 127
+    assert s1["launch_env_broken"] is True
+    s2 = next(s for s in status["servers"] if s["server_id"] == "2")
+    assert s2["launch_env_broken"] is False
