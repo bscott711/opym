@@ -16,6 +16,9 @@ change behaviour).
   in `supervisor_status.json`.
 
 ### Added
+- `decon_sweep_driver.m` (out-of-band decon trials) takes per-variant `psf_paths` (one PSF per channel), `stage_dir`,
+  `edge_erosion`, `interp_method` and `pad_z`. `pad_z` mirror-pads the scan axis before decon and crops back before DSR, so the
+  FFT does not wrap the slab faces and the DSR input shape equals production's. The production services do not use it.
 - `StatusRegistry` counts consecutive failures per stage
   (`stage_status.consecutive_failures`, migrated in place), with
   `gave_up_datasets()` and `clear_gave_up()`, so the backfill can stop

@@ -16,6 +16,16 @@ function decon_sweep_driver(variantsJsonPath)
 %   dz_psf, skew_angle_deg, edge_erosion, variants[]
 % Each variants[] entry: name, decon (bool), rl_method, iters, alpha,
 %   otf_thresh, hann ([lo,hi] or null), background, damp.
+% Optional per-variant overrides (decon v2 trials; absent = the top-level value):
+%   psf_paths   cell, one PSF per channel pattern (else psf_path is broadcast)
+%   stage_dir   a different staged input (e.g. a denoised copy of the TIFFs)
+%   edge_erosion  integer
+%   interp_method 'linear' | 'cubic' (top-level interp_method, default 'cubic')
+%   pad_z       integer P: mirror-pad the scan axis (dim 3) by P planes before
+%               decon and crop back to the original planes before DSR, so the
+%               axial faces are not wrapped by the FFT and the DSR input shape
+%               equals production's. edge_erosion then applies to the padded
+%               faces, which are cropped away.
 %
 % Output, per variant, under stage_dir/../:
 %   Decon_<name>/                 (skewed decon output, psfgen/ QC figs)
@@ -48,6 +58,10 @@ dzPSF = cfg.dz_psf;
 skewAngle = cfg.skew_angle_deg;
 edgeErosion = cfg.edge_erosion;
 psfPath = cfg.psf_path;
+interpDefault = 'cubic';
+if isfield(cfg, 'interp_method') && ~isempty(cfg.interp_method)
+    interpDefault = cfg.interp_method;
+end
 
 variants = cfg.variants;
 if isstruct(variants) && numel(variants) == 1
@@ -81,7 +95,31 @@ for vi = 1:nV
     % (stageDir here), not under an arbitrary output root -- confirmed by
     % running it: 'Decon_prod' landed at stageDir/Decon_prod, not
     % sweepRoot/Decon_prod. Match that so step B looks in the right place.
-    variantDir = fullfile(stageDir, ['Decon_' name]);
+    vStage = stageDir;
+    if isfield(v, 'stage_dir') && ~isempty(v.stage_dir)
+        vStage = v.stage_dir;
+    end
+    variantDir = fullfile(vStage, ['Decon_' name]);
+    vErosion = edgeErosion;
+    if isfield(v, 'edge_erosion') && ~isempty(v.edge_erosion)
+        vErosion = v.edge_erosion;
+    end
+    vInterp = interpDefault;
+    if isfield(v, 'interp_method') && ~isempty(v.interp_method)
+        vInterp = v.interp_method;
+    end
+    vPsf = psfPathsBroadcast;
+    if isfield(v, 'psf_paths') && ~isempty(v.psf_paths)
+        vPsf = cellstr(v.psf_paths);
+        if numel(vPsf) ~= nChans
+            error('decon_sweep_driver:badPsfPaths', ...
+                'variant %s: %d psf_paths for %d channels', name, numel(vPsf), nChans);
+        end
+    end
+    padZ = 0;
+    if isfield(v, 'pad_z') && ~isempty(v.pad_z)
+        padZ = v.pad_z;
+    end
 
     try
 
@@ -117,10 +155,17 @@ for vi = 1:nV
         fprintf('[Sweep] Decon: method=%s iter=%d alpha=%g otfThresh=%g hann=[%g,%g] bg=%s damp=%g\n', ...
             val_method, val_iter, val_wAlpha, val_otfCT, val_hann(1), val_hann(2), mat2str(val_bg), val_damp);
 
+        decon_in = vStage;
+        if padZ > 0
+            decon_in = fullfile(sweepRootFor(vStage), ['pad' num2str(padZ) '_' name]);
+            padStageTiffs(vStage, decon_in, chanPatterns, padZ);
+            variantDir = fullfile(decon_in, ['Decon_' name]);
+        end
+
         XR_decon_data_wrapper( ...
-            {stageDir}, ...
+            {decon_in}, ...
             'channelPatterns', chanPatterns, ...
-            'psfFullpaths', psfPathsBroadcast, ...
+            'psfFullpaths', vPsf, ...
             'deconIter', val_iter, ...
             'xyPixelSize', xyPixelSize, ...
             'dz', dz, ...
@@ -128,7 +173,7 @@ for vi = 1:nV
             'skewAngle', skewAngle, ...
             'skewed', true, ...
             'background', val_bg, ...
-            'edgeErosion', edgeErosion, ...
+            'edgeErosion', vErosion, ...
             'GPUJob', true, ...
             'RLMethod', val_method, ...
             'wienerAlpha', val_wAlpha, ...
@@ -145,11 +190,14 @@ for vi = 1:nV
             'overwrite', false ...
         );
 
+        if padZ > 0
+            cropDeconTiffs(variantDir, chanPatterns, padZ);
+        end
         deskewInputDir = variantDir;
     else
         fprintf('[Sweep] No-decon arm: DSR runs straight on staged TIFFs.\n');
-        deskewInputDir = stageDir;
-        variantDir = stageDir;
+        deskewInputDir = vStage;
+        variantDir = vStage;
     end
 
     % ---- STEP B: deskew/rotate (identical for every arm) ----
@@ -164,7 +212,7 @@ for vi = 1:nV
         'xyPixelSize', xyPixelSize, ...
         'dz', dz, ...
         'skewAngle', skewAngle, ...
-        'interpMethod', 'cubic', ...
+        'interpMethod', vInterp, ...
         'inputAxisOrder', 'yxz', ...
         'outputAxisOrder', 'yxz', ...
         'objectiveScan', false, ...
@@ -217,5 +265,42 @@ valid = {'original', 'simplified', 'omw', 'cudagen'};
 if ~ismember(method, valid)
     error('decon_sweep_driver:badRLMethod', ...
         'Unrecognized RLMethod "%s"; must be one of: %s', method, strjoin(valid, ', '));
+end
+end
+
+function d = sweepRootFor(stageDir)
+% Padded copies live beside the stage dir, never inside the dataset.
+d = fileparts(stageDir);
+end
+
+function padStageTiffs(srcDir, dstDir, chanPatterns, P)
+% Mirror-pad dim 3 (scan Z of the (ny,nx,nz) staging layout) by P planes.
+if ~exist(dstDir, 'dir'), mkdir(dstDir); end
+for ci = 1:numel(chanPatterns)
+    files = dir(fullfile(srcDir, ['*' chanPatterns{ci} '*.tif']));
+    for fi = 1:numel(files)
+        out = fullfile(dstDir, files(fi).name);
+        if exist(out, 'file'), continue; end
+        vol = readtiff(fullfile(srcDir, files(fi).name));
+        vol = padarray(vol, [0 0 P], 'symmetric');
+        writetiff(vol, out);
+    end
+end
+end
+
+function cropDeconTiffs(deconDir, chanPatterns, P)
+% Undo padStageTiffs on the decon output, in place, so DSR sees production's
+% input shape. Idempotent via a sidecar marker (decon output is re-run safe).
+for ci = 1:numel(chanPatterns)
+    files = dir(fullfile(deconDir, ['*' chanPatterns{ci} '*.tif']));
+    for fi = 1:numel(files)
+        f = fullfile(deconDir, files(fi).name);
+        marker = [f '.cropped'];
+        if exist(marker, 'file'), continue; end
+        vol = readtiff(f);
+        vol = vol(:, :, P+1:end-P);
+        writetiff(vol, f);
+        fclose(fopen(marker, 'w'));
+    end
 end
 end
