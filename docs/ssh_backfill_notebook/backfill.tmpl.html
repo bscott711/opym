@@ -23,7 +23,7 @@ ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 6px; max-width: 72
 </nav>
 
 <section class="panel" id="p-state">
-  <div class="status"><b>Status.</b> Built, merged and verified end to end on Argus over a loopback connection against real stores. <b>Not yet deployed</b>: the service is installed disabled, and the sender has not been run from the Windows PC through an SSH tunnel.</div>
+  <div class="status"><b>Status.</b> The Argus side is deployed: <span class="mono">opym-receive-backfill</span> has been running on 127.0.0.1:5556 since 2026-10-15 21:01 and was smoke-tested (a dry run reports what it would send; a destination outside the allowlist is refused; nothing was written). The sender has <b>not yet been run from the Windows PC</b> through an SSH tunnel, so Windows paths and a real tunnel are still untested.</div>
   <div class="sub"><div class="seg" role="group" aria-label="View"><button id="vb" aria-pressed="false">Before</button><button id="vn" aria-pressed="true">Now</button></div></div>
   <div id="state-body" class="sub" style="gap:28px"></div>
 </section>
@@ -124,7 +124,6 @@ $("#evidence").innerHTML = `
     ${D.mutations.map(m => `<tr><td><b>${esc(m.guard)}</b></td><td>${esc(m.prevents)}</td><td class="path">${esc(m.test)}</td></tr>`).join("")}
    </tbody></table></div></div>
   <div class="sub"><h2>Not done yet</h2><ul class="plain">
-    <li>Enable <span class="mono">opym-receive-backfill</span> on Argus (the unit is in bioimaging/deploy and is not enabled).</li>
     <li>Install and run <span class="mono">opym-backfill-send</span> on the Windows PC through an SSH tunnel; the Windows path handling and a real tunnel are untested.</li>
     <li>OME-TIFF acquisitions still use their current route.</li></ul></div>`;
 
@@ -133,6 +132,7 @@ const TL = [
   ["2026-10-14", "Globus is still copying the Cell_001..Cell_011 zarr stores when the backfill stages them; decon writes zeros.", "registry, raw store mtimes"],
   ["2026-10-15", "You choose: replay through the stream, pause while live runs, auto-detect on the PC.", "this conversation"],
   ["2026-10-15", "Receiver and sender built, tested on real stores over loopback, merged (opym #" + D.pr.opym + "); readiness and service unit merged (bioimaging #" + D.pr.bioimaging + ").", "GitHub"],
+  ["2026-10-15", "Argus service enabled on 127.0.0.1:5556 and smoke-tested; the dashboard restarted with the storage badges. The backfill service is restarted once idle so it loads the completion-marker check.", "systemd, dashboard /mip"],
 ];
 $("#tl").innerHTML = TL.map(([d, t, s], i) => `<li${i === TL.length - 1 ? ' class="now"' : ""}><time>${d}</time><span>${esc(t)}</span><span class="src">${esc(s)}</span></li>`).join("");
 
