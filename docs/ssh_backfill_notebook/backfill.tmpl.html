@@ -1,0 +1,145 @@
+<title>SSH Backfill Notebook</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+/*CSS*/
+<style>
+.flow { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: stretch; }
+.flow .node { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: grid; gap: 4px; align-content: start; min-width: 0; }
+.flow .node b { font-family: var(--font-display); }
+.flow .node small { color: var(--ink2); font-size: 12.5px; }
+.flow .arrow { align-self: center; font: 500 12px var(--font-mono); color: var(--ink3); text-align: center; max-width: 14ch; }
+.status { border: 1px solid var(--line); background: var(--surface); border-left: 4px solid var(--rev); padding: 10px 14px; border-radius: 6px; color: var(--ink2); }
+ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 6px; max-width: 72ch; }
+@media (max-width: 720px) { .flow { grid-template-columns: 1fr; } .flow .arrow { max-width: none; } }
+</style>
+<div class="wrap">
+<header class="top">
+  <div class="eyebrow" id="stamp"></div>
+  <h1>SSH Backfill Notebook</h1>
+  <p class="lede">Moving finished acquisitions from the microscope PC to Argus over SSH, without touching the live stream, and knowing when a store is truly complete.</p>
+</header>
+<nav class="tabs" aria-label="Sections">
+  <a href="#state">Before and now</a><a href="#choices">Key choices</a><a href="#evidence">Evidence</a><a href="#timeline">Timeline</a>
+</nav>
+
+<section class="panel" id="p-state">
+  <div class="status"><b>Status.</b> Built, merged and verified end to end on Argus over a loopback connection against real stores. <b>Not yet deployed</b>: the service is installed disabled, and the sender has not been run from the Windows PC through an SSH tunnel.</div>
+  <div class="sub"><div class="seg" role="group" aria-label="View"><button id="vb" aria-pressed="false">Before</button><button id="vn" aria-pressed="true">Now</button></div></div>
+  <div id="state-body" class="sub" style="gap:28px"></div>
+</section>
+<section class="panel" id="p-choices"><div class="sub"><h2>Key architectural and information choices</h2><p class="muted">Each choice lists its evidence and where you steered it.</p></div><div id="choice-list" class="sub"></div></section>
+<section class="panel" id="p-evidence"><div id="evidence" class="sub" style="gap:28px"></div></section>
+<section class="panel" id="p-timeline"><div class="sub"><h2>Timeline</h2></div><ol class="tl" id="tl"></ol></section>
+</div>
+<div id="tip" role="tooltip"></div>
+<script>
+const D = /*DATA*/null;
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const R = D.real_run, G = D.globus, I = D.incident;
+$("#stamp").textContent = "Generated " + D.generated + " · opym #" + D.pr.opym + " and bioimaging #" + D.pr.bioimaging + " merged";
+
+function renderState(now) {
+  $("#vb").setAttribute("aria-pressed", String(!now)); $("#vn").setAttribute("aria-pressed", String(now));
+  const body = $("#state-body");
+  if (!now) {
+    body.innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="n">${G.rate_mb_s} MB/s</div><div class="l">Globus landing rate, limited by per-file overhead</div></div>
+      <div class="stat"><div class="n">~${n0(2 * G.files_per_channel_store)}</div><div class="l">small chunk files per two-channel cell (${n0(G.files_per_channel_store)} per channel store)</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">signals that a copied store is complete</div></div>
+      <div class="stat"><div class="n">${I.datasets}</div><div class="l">datasets whose decon output was all zeros after staging mid-copy</div></div>
+    </div>
+    <div class="sub"><h2>How a finished acquisition reached Argus</h2>
+      <ul class="plain">
+        <li>A Globus web transfer copied the whole folder after the run, one small file at a time.</li>
+        <li>Chunks landed in no useful order, so a store could look present long before it was whole.</li>
+        <li>The batch pipeline checked only that the metadata and the array folder existed, then read whatever had landed. Unlanded chunks read back as zeros.</li>
+        <li>On 2026-10-14 that staged <b>${I.datasets}</b> stores at ${I.staged_at} while their chunks were still arriving (${I.chunks_landed}); decon wrote zeros and every stage recorded done.</li>
+      </ul></div>`;
+    return;
+  }
+  body.innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="n">${R.volumes_verified}/${R.volumes_verified}</div><div class="l">volumes verified by reading them back from disk (real stores)</div></div>
+      <div class="stat"><div class="n">identical</div><div class="l">every file byte-for-byte equal to the source, apart from the completion marker</div></div>
+      <div class="stat"><div class="n">${(R.volume_gb / R.wire_gb).toFixed(1)}×</div><div class="l">smaller on the wire with blosc (${R.volume_gb} GB of volumes sent as ${R.wire_gb.toFixed(2)} GB)</div></div>
+      <div class="stat"><div class="n">${D.tests}</div><div class="l">tests over real ZMQ sockets and real zarr stores</div></div>
+    </div>
+    <div class="sub"><h2>The path</h2>
+      <div class="flow">
+        <div class="node"><b>Acquisition PC</b><small>opym-backfill-send scans for finished stores, skips any written to recently, asks what Argus holds, sends only what is missing.</small></div>
+        <div class="arrow">SSH tunnel<br>127.0.0.1:5556</div>
+        <div class="node"><b>opym-receive-backfill</b><small>Own process, port and service. Writes into the same layout Globus produced, reads every volume back, then marks the store complete.</small></div>
+      </div></div>
+    <div class="sub"><h2>What it guarantees</h2>
+      <ul class="plain">
+        <li><b>Complete means verified.</b> The root <code>.zattrs</code> and <code>.opym_complete.json</code> are written last, after a readback match. Until then the store does not look ready.</li>
+        <li><b>Nothing existing is replaced.</b> A different pixel array is a conflict; a store another writer touched recently is left alone.</li>
+        <li><b>Live comes first.</b> Writes are held while a live acquisition (or its warm-up) holds the lease, enforced on the server.</li>
+        <li><b>Resumable.</b> A rerun sends only missing timepoints; a store that grew after it was marked is topped up.</li>
+        <li><b>Faithful to short runs.</b> A store declaring 150 timepoints that wrote 6 is copied as 150-declared and 6-written.</li>
+      </ul></div>`;
+}
+const n0 = x => Number(x).toLocaleString("en-US");
+$("#vb").onclick = () => renderState(false); $("#vn").onclick = () => renderState(true);
+
+const CHOICES = [
+ { t: "A separate receiver, not a mode of the live one", why: "The live receiver interleaves staging, the live lane, QC and the drain in about 1,800 lines. A backfill mode inside it could not be shown safe for a running acquisition, so the backfill is its own process, port and service that reuses only the message framing and the raw-store layout.",
+   user: "“not touching the live transfer that works perfectly if internet is a solid”",
+   ev: [[`The change adds ${D.pr.files_added} files (${n0(D.pr.insertions)} lines, ${D.pr.deletions} deletions) and leaves receiver.py, protocol.py, client.py and live.py untouched.`, "git show --stat 211c06e (opym #" + D.pr.opym + ")"],
+        ["The existing receiver (41), transport (11) and client (8) tests, 60 in all, still pass alongside the new ones.", "pytest tests/test_stream_receiver.py test_stream_transport.py test_stream_client.py"]] },
+ { t: "Replay through the stream's framing; small files verbatim, volumes as slabs", why: "You chose replaying finished stores through the stream rather than a new file-level protocol. Metadata (.zarray, coordinate arrays, .zattrs) is copied as bytes so nothing is reconstructed; pixel volumes move as blosc slabs with a SHA-256 each.",
+   user: "Replay via the stream protocol (recommended option).",
+   ev: [[`Real run: ${R.volume_gb} GB of volumes crossed as ${R.wire_gb.toFixed(2)} GB, ${(R.volume_gb / R.wire_gb).toFixed(1)}× smaller.`, R.command],
+        [`The copies are byte-identical to the source: ${n0(R.files.GFP_488)} and ${n0(R.files.mScarlet_561)} files, and the only difference is the marker. A backfilled store therefore also matches a Globus copy in the storage-triage duplicate proof.`, R.diff]] },
+ { t: "Complete means read back and matched, not “the last message arrived”", why: "On 2026-10-14 the pipeline trusted stores that were still landing. The backfill ends a store only after the server reads every volume back from disk and matches the sender's SHA-256, then writes the root .zattrs and an explicit marker. The batch backfill skips its idle wait for a marked store.",
+   ev: [[`${I.datasets} datasets got all-zero decon output because unlanded chunks read as fill_value 0 (staged at ${I.staged_at}; chunks landed ${I.chunks_landed}).`, I.source],
+        ["Disabling the readback comparison fails test_readback_mismatch_blocks_the_completion_marker: a volume changed on disk after it was acknowledged is caught and no marker is written.", "mutation check, opym #" + D.pr.opym]] },
+ { t: "It never supersedes, overwrites or writes into something in use", why: "The live receiver moves an earlier run of the same name to .superseded/. A backfill replaying old sessions must never do that to data that already exists. A different pixel array is a conflict; a store modified recently by something else, or locked by another sender, is busy.",
+   ev: [["Disabling the busy check or the shape check each fails its test; a conflicting or busy store is verified byte-for-byte untouched.", "tests/test_stream_backfill.py"],
+        ["Destinations must lie under an allowlist; path traversal and bad store names are refused.", "test_destination_outside_the_allowlist_is_refused, test_path_traversal_in_metadata_is_refused"]] },
+ { t: "Live priority: pause while live runs, enforced on the server", why: "A live session owns Argus's disk and the PC's uplink. The server holds every volume write and commit while the live lease (or the warm-up lease) is fresh, and tells the sender so it pauses; a sender that ignores the flag still cannot write.",
+   user: "Pause while a live session is running (recommended option).",
+   ev: [["Disabling the server-side hold fails test_the_server_itself_refuses_volume_writes_during_a_live_session.", "mutation check"],
+        ["Argus already treats the lease as the live signal: the backfill pass itself pauses on it, and it goes stale after 60 s if the holder dies.", "opym.lanes.live_lease_active"]] },
+ { t: "Auto-detect on the PC, not a manual command per session", why: "The sender scans the acquisition folder, asks Argus what it holds, and sends only what is missing or incomplete, newest first. A run that already streamed live shows up as already complete (marked) or partial and is skipped or topped up.",
+   user: "Auto-detect on the PC (recommended option).",
+   ev: [["A second run sends nothing; a store that grew after it was marked sends only the new timepoints.", "test_second_run_sends_nothing, test_a_store_that_grew_since_it_was_marked_is_topped_up"]] },
+ { t: "Copy short acquisitions as they are", why: "Acquisitions that stopped early are common, so a store is copied as declared-N, written-M, and planes whose chunks are absent on the PC stay absent. The marker records which timepoints exist.",
+   ev: [[`${D.short_stores.incomplete} of ${D.short_stores.analysed} raw zarr stores analysed end before their planned timepoint count, and ${D.short_stores.partial_last_timepoint} have a partly written last timepoint. Live-lane counts match the raw stores, so these are aborted runs, not transfer loss.`, D.short_stores.source]] },
+];
+$("#choice-list").innerHTML = CHOICES.map((c, i) => `<details class="card"${i === 0 ? " open" : ""}><summary><h3>${c.t}</h3></summary><div class="body"><p>${c.why}</p>
+  ${c.user ? `<div class="decided"><b>You decided:</b> ${c.user}</div>` : ""}
+  <ul class="evidence">${c.ev.map(([t, s]) => `<li>${t}<span class="src">${esc(s)}</span></li>`).join("")}</ul></div></details>`).join("");
+
+$("#evidence").innerHTML = `
+  <div class="sub"><h2>Real data</h2><p class="muted">Two real raw stores replayed through a loopback receiver into a scratch root, then compared with plain <span class="mono">diff -rq</span>. The scratch copy was removed afterwards.</p>
+   <div class="tbl"><table><thead><tr><th>Store</th><th>Files</th><th>Timepoints</th><th>Result</th></tr></thead><tbody>
+    ${R.source_stores.map((s, i) => { const k = i ? "mScarlet_561" : "GFP_488"; return `<tr><td class="path">${esc(s)}</td><td class="num">${n0(R.files[k])}</td><td class="num">${R.timepoints[k]}</td><td>byte-identical; verified by readback</td></tr>`; }).join("")}
+   </tbody></table></div>
+   <p class="muted">${R.volume_gb} GB of volumes in ${R.seconds} s through the loopback, ${R.volumes_verified} volumes verified. This measures the code, not the PC's uplink; the tunnel will set the real rate (one SSH tunnel carried about 33 to 63 MB/s in earlier measurements).</p></div>
+  <div class="sub"><h2>Each guard, shown to matter</h2><p class="muted">With the guard switched off, its test fails. ${D.tests} tests in all.</p>
+   <div class="tbl"><table><thead><tr><th>Guard</th><th>What it prevents</th><th>Test that fails without it</th></tr></thead><tbody>
+    ${D.mutations.map(m => `<tr><td><b>${esc(m.guard)}</b></td><td>${esc(m.prevents)}</td><td class="path">${esc(m.test)}</td></tr>`).join("")}
+   </tbody></table></div></div>
+  <div class="sub"><h2>Not done yet</h2><ul class="plain">
+    <li>Enable <span class="mono">opym-receive-backfill</span> on Argus (the unit is in bioimaging/deploy and is not enabled).</li>
+    <li>Install and run <span class="mono">opym-backfill-send</span> on the Windows PC through an SSH tunnel; the Windows path handling and a real tunnel are untested.</li>
+    <li>OME-TIFF acquisitions still use their current route.</li></ul></div>`;
+
+const TL = [
+  ["2026-09-20", "Globus landing measured at about 12 MB/s on a real session; the bottleneck is per-file overhead.", "CORE/docs/DATA_INGRESS.md"],
+  ["2026-10-14", "Globus is still copying the Cell_001..Cell_011 zarr stores when the backfill stages them; decon writes zeros.", "registry, raw store mtimes"],
+  ["2026-10-15", "You choose: replay through the stream, pause while live runs, auto-detect on the PC.", "this conversation"],
+  ["2026-10-15", "Receiver and sender built, tested on real stores over loopback, merged (opym #" + D.pr.opym + "); readiness and service unit merged (bioimaging #" + D.pr.bioimaging + ").", "GitHub"],
+];
+$("#tl").innerHTML = TL.map(([d, t, s], i) => `<li${i === TL.length - 1 ? ' class="now"' : ""}><time>${d}</time><span>${esc(t)}</span><span class="src">${esc(s)}</span></li>`).join("");
+
+function route() {
+  const h = (location.hash || "#state").slice(1), name = ["state", "choices", "evidence", "timeline"].includes(h) ? h : "state";
+  document.querySelectorAll("section.panel").forEach(p => p.classList.toggle("on", p.id === "p-" + name));
+  document.querySelectorAll("nav.tabs a").forEach(a => { if (a.getAttribute("href") === "#" + name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
+}
+addEventListener("hashchange", route); route(); renderState(true);
+</script>

@@ -1,0 +1,23 @@
+{
+  "generated": "2026-10-15",
+  "globus": {"rate_mb_s": 12, "files_per_channel_store": 8119, "source": "CORE/docs/DATA_INGRESS.md (measured 2026-09-20, session 20260917-SVO-...)"},
+  "incident": {"datasets": 11, "staged_at": "13:01", "chunks_landed": "12:59 to 13:47", "source": "registry stage_status, raw store mtimes, Decon/Masks (this session)"},
+  "real_run": {
+    "date": "2026-10-15",
+    "source_stores": ["20260928-SVO-memNG-mScar2xFYVE-FLM-Macropinocytosis/Cell_005_GFP_488.ome.zarr", "20260928-SVO-memNG-mScar2xFYVE-FLM-Macropinocytosis/Cell_005_mScarlet_561.ome.zarr"],
+    "files": {"GFP_488": 1104, "mScarlet_561": 972},
+    "timepoints": {"GFP_488": 7, "mScarlet_561": 6},
+    "volume_gb": 2.95, "wire_gb": 1.128, "seconds": 32.5, "volumes_verified": 13,
+    "diff": "diff -rq source copy: only difference is .opym_complete.json in each store",
+    "command": "loopback receiver + opym-backfill-send against a scratch root on /mmfs2 (removed afterwards)"
+  },
+  "mutations": [
+    {"guard": "Readback before marking complete", "prevents": "marking a store complete when what is on disk differs from what was sent", "test": "test_readback_mismatch_blocks_the_completion_marker"},
+    {"guard": "Hold writes while a live acquisition holds the lease", "prevents": "backfill competing with a live session, even from a sender that ignores the flag", "test": "test_the_server_itself_refuses_volume_writes_during_a_live_session"},
+    {"guard": "Different pixel array means conflict", "prevents": "filling a store that belongs to a different acquisition", "test": "test_a_store_that_differs_only_in_declared_length_is_a_conflict"},
+    {"guard": "Leave stores something else is writing", "prevents": "writing into a Globus copy or live stream still in progress", "test": "test_a_store_something_else_is_writing_is_busy_and_untouched"},
+    {"guard": "Destination allowlist", "prevents": "writing outside the allowed raw roots", "test": "test_destination_outside_the_allowlist_is_refused"}
+  ],
+  "short_stores": {"analysed": 125, "incomplete": 62, "partial_last_timepoint": 21, "source": "per-store chunk-directory analysis, this session"},
+  "pr": {"opym": 46, "bioimaging": 24, "files_added": 6, "insertions": 1545, "deletions": 0}
+}
