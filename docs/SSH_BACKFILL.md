@@ -1,5 +1,7 @@
 # SSH backfill: finished acquisitions from the acquisition PC to Argus
 
+Lab notebook (before/now, choices with evidence): https://claude.ai/artifact/3KrSf6jB3zKo8Kedk1HTPv
+
 Replaces the post-acquisition Globus web transfer for OME-Zarr acquisitions. The live stream
 (`opym-receive`, port 5555, the live lane) is **not touched**: the backfill is a separate receiver process on its
 own port and service, and it pauses while a live acquisition is running.
