@@ -7,6 +7,13 @@ change behaviour).
 
 ## [Unreleased]
 
+### Added
+- SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
+  receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with
+  per-volume SHA-256 verified by readback before a store is marked complete (`.opym_complete.json`). Never
+  supersedes existing data, never writes into a store something else is writing, and holds writes while a live
+  acquisition holds the lease. The live receiver is unchanged.
+
 ### Fixed
 - `opym-serve` survives a reboot: the Matlab launch sources Lmod
   (`/etc/profile.d/modules.sh`) itself when `module` or `MODULEPATH` is
