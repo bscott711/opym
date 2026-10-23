@@ -556,3 +556,79 @@ def test_a_session_is_taken_with_room_for_itself_plus_the_floor(
     assert not ack.get("unknown_session")
     assert "sess-short" in recv.sessions
     sock.close()
+
+
+def _idle_receiver(idle_s):
+    return StreamReceiver(
+        bind_addr="tcp://127.0.0.1:0",
+        ack_every_n_frames=1,
+        ack_every_sec=9999,
+        idle_timeout_sec=idle_s,
+    )
+
+
+def _stuck_run(tmp_path, sid):
+    """Rig 2026-10-23: a run stopped mid-volume. Its last volume never
+    completes, so its slab is never ACKed, and the client resends it."""
+    recv = _idle_receiver(0.5)
+    sock = _dealer(recv, sid)
+    raw = tmp_path / "raw"
+    sock.send_multipart(pack_message(MSG_SESSION_START, sid, _header(raw)))
+    assert _pump(recv, sock) is not None
+    for h, p in [_slab(0, 0, 3, 0), _slab(0, 3, 3, 1), _slab(1, 0, 3, 2)]:
+        sock.send_multipart(pack_message(MSG_FRAME, sid, h, p))
+    _drive(recv, 0.2)
+    return recv, sock, raw
+
+
+def test_resent_slabs_of_an_unfinished_volume_do_not_keep_a_session_alive(tmp_path):
+    """Before: every duplicate reset the idle clock, so the session -- and the
+    live lease that pauses the backfill -- stayed open all afternoon."""
+    recv, sock, _raw = _stuck_run(tmp_path, "sess-stuck")
+    try:
+        deadline = time.monotonic() + 3
+        while "sess-stuck" in recv.sessions and time.monotonic() < deadline:
+            h, p = _slab(1, 0, 3, 2)  # the client's resend of what isn't ACKed
+            sock.send_multipart(pack_message(MSG_FRAME, "sess-stuck", h, p))
+            _drive(recv, 0.1)
+        assert "sess-stuck" not in recv.sessions
+    finally:
+        sock.close()
+        recv.close()
+
+
+def test_new_slabs_do_keep_a_session_alive(tmp_path):
+    recv, sock, _raw = _stuck_run(tmp_path, "sess-slow")
+    try:
+        # A slow acquisition: a new slab arrives every 0.3 s, past the 0.5 s
+        # idle timeout in total but never 0.5 s apart.
+        for fi, z0 in enumerate([3, 0, 3], start=3):
+            h, p = _slab(1 + (fi > 3), z0, 3, fi)
+            sock.send_multipart(pack_message(MSG_FRAME, "sess-slow", h, p))
+            _drive(recv, 0.3)
+        assert "sess-slow" in recv.sessions
+    finally:
+        sock.close()
+        recv.close()
+
+
+def test_a_session_closed_as_idle_is_not_resumed(tmp_path):
+    """After the idle close, the client's resync (SESSION_START with
+    resume_through) is turned down with a reason instead of re-opening the
+    session, which would take the lease again."""
+    recv, sock, raw = _stuck_run(tmp_path, "sess-gone")
+    try:
+        _drive(recv, 0.8)
+        assert "sess-gone" not in recv.sessions
+        while sock.poll(10):
+            sock.recv_multipart()
+        sock.send_multipart(
+            pack_message(MSG_SESSION_START, "sess-gone", _header(raw, resume_through=1))
+        )
+        ack = _pump(recv, sock)
+        assert ack is not None and ack.get("unknown_session")
+        assert "no new data" in ack.get("rejected", "")
+        assert "sess-gone" not in recv.sessions
+    finally:
+        sock.close()
+        recv.close()

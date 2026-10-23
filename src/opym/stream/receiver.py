@@ -80,7 +80,13 @@ as much. Nothing here depends on which link a message came in on.
 Recovery ("resume"): a FRAME or RESUME for a session this process doesn't
 know (it restarted, or idle-timed the session out) is answered with
 `unknown_session`, and the client re-sends SESSION_START with
-`resume_through`. The session then continues in its old stores -- on the
+`resume_through`. Only new data counts as activity for the idle timeout:
+resent duplicates do not, or a run stopped mid-volume (whose last volume is
+never ACKed, so its client resends it forever) would never close. A session
+this process closed as idle is not resumed: its SESSION_START is answered
+"rejected", or it would re-open, take the live lease again and wait on the
+same unfinished volume (rig, 2026-10-23). A resumed session continues in
+its old stores -- on the
 staging root if its copy is still there, else straight into raw_root. With
 the one-format live lane it stays live: volumes already complete in the raw
 store (one chunk file per plane, so completeness is on disk) are handed to
@@ -152,6 +158,10 @@ DEFAULT_BIND_ADDR = "tcp://127.0.0.1:5555"
 ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
 IDLE_TIMEOUT_SEC = 600.0
+# A session closed as idle is not resumed for this long (see
+# _handle_session_start); then the id is forgotten.
+_IDLE_CLOSED_FORGET_S = 24 * 3600.0
+_IDLE_CLOSED_REASON = "closed on Argus after 10 min with no new data; not resuming it"
 POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
@@ -454,6 +464,8 @@ class StreamReceiver:
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
         self._unknown_noticed: dict[str, float] = {}
+        # Sessions closed for idling, by close time (see _handle_session_start).
+        self._idle_closed: dict[str, float] = {}
         # Always constructed (cheap: idle threads blocked on a queue read)
         # so staging can be toggled per-session via the env var without
         # needing the receiver process restarted -- mirrors `_decon_enabled`
@@ -726,6 +738,15 @@ class StreamReceiver:
         session_id: str,
         header: dict[str, Any],
     ) -> None:
+        if session_id in self._idle_closed:
+            # Closed here for sending nothing new; a resume would only re-open
+            # it -- and the live lease -- to wait on the same unfinished
+            # volume. The client keeps its data and reports the reason.
+            logger.info(
+                "Session %s: closed as idle earlier -- not resuming it", session_id
+            )
+            self._send_unknown(sock, identity, session_id, rejected=_IDLE_CLOSED_REASON)
+            return
         existing = self.sessions.get(session_id)
         if existing is not None and not existing.ended:
             # A resend (the client re-synced after a link hiccup): the
@@ -1233,7 +1254,6 @@ class StreamReceiver:
             return
 
         recv_s = time.time()
-        session.last_activity = time.monotonic()
         t, c, frame_index = header["t"], header["c"], header["frame_index"]
         wire_bytes = len(payload)
         if header.get("codec") == "blosc":
@@ -1260,6 +1280,7 @@ class StreamReceiver:
             self._handle_slab(session, header, payload, recv_s, wire_bytes)
         elif frame_index not in session.processed_frame_indices:
             if (t, c) not in session.received_pairs:
+                session.last_activity = time.monotonic()
                 try:
                     self._stage_frame(session, header, payload)
                 except Exception:
@@ -1341,6 +1362,11 @@ class StreamReceiver:
         if z0 in asm.z0s:
             asm.dups += 1
             return  # a resend of a slab already written
+        # Only new data counts as activity: a client whose run stopped
+        # mid-volume resends that volume's unACKed slabs forever, and if each
+        # resend reset the idle clock the session (and the live lease) would
+        # never close. Rig, 2026-10-23.
+        session.last_activity = time.monotonic()
         asm.wire_bytes += len(payload) if wire_bytes is None else wire_bytes
         try:
             t_start = time.perf_counter()
@@ -1697,7 +1723,11 @@ class StreamReceiver:
         now = time.monotonic()
         for session in list(self.sessions.values()):
             if now - session.last_activity >= self.idle_timeout_sec:
+                self._idle_closed[session.session_id] = now
                 self._finalize_session(session, reason="idle_timeout")
+        for sid, at in list(self._idle_closed.items()):
+            if now - at > _IDLE_CLOSED_FORGET_S:
+                del self._idle_closed[sid]
 
 
 # Client-clock times a FRAME header may carry (see protocol.py), traced as
