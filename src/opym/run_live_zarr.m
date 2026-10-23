@@ -35,9 +35,10 @@ function stats = run_live_zarr(p, numCPUs)
 %                   decode). It lands before the compressed store is written,
 %                   so the view never waits on encoding.
 %   view_bits       optional, 16 (default) or 8: an 8-bit view buffer holds
-%                   round(255 * sqrt(min(v, 4095) / 4095)), the square-root
-%                   curve naparym-live decodes back to counts (see
-%                   displayLut below and opym.live_view.DisplayEncoding),
+%                   round(255 * sqrt(min(v, vmax) / vmax)), the square-root
+%                   curve naparym-live decodes back to counts, vmax fixed per
+%                   channel for the session by its first volume (see
+%                   displayLut below and opym.live_view.DisplayEncoding) and
 %                   recorded in <view dir>/display_C<c>.json.
 %   psf_path, decon_dir (the session's work dir), plus a 'live' ticket's
 %                   decon and DSR fields
@@ -190,7 +191,7 @@ end
 % viewer shows, so its landing time is where the viewer's hops start.)
 outArgs = {dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]};
 if ~isempty(viewNpy) && getp(p, 'view_bits', 16) == 8
-    outArgs{end + 1} = displayLut(fileparts(viewNpy), c);
+    outArgs{end + 1} = displayLut(dsr, fileparts(viewNpy), c);
 end
 tCall = posixtime(datetime('now', 'TimeZone', 'UTC'));
 tt = opymWriteLiveOutputs(outArgs{:});
@@ -219,37 +220,53 @@ zeroIdx = idx;
 end
 
 
-function lut = displayLut(viewDir, c)
-% Every count's code in channel c's 8-bit view buffers: the square-root
-% curve, round(255 * sqrt(min(v, 4095) / 4095)) for v = 0..65535 (uint8),
-% as opym.live_view.DisplayEncoding.sqrt builds it. Its rounding adds about
-% a third of the data's own (shot-like) noise at every level, and nothing
-% below 4095 clips. The same for every channel and session; recorded in
-% <view dir>/display_C<c>.json so the viewer decodes it (whoever publishes
-% first wins). A session an older server started has a shift recorded
-% instead: its buffers keep that shift, so they and the record agree.
-persistent table
-if isempty(table)
-    v = min(0 : 65535, 4095);
-    table = uint8(round(255 * sqrt(v / 4095)));
-end
-lut = table;
+function lut = displayLut(dsr, viewDir, c)
+% Every count's code in channel c's 8-bit view buffers (uint8, v = 0..65535):
+% the square-root curve round(255 * sqrt(min(v, vmax) / vmax)), as
+% opym.live_view.DisplayEncoding builds it. Its rounding stays below the
+% data's own (shot-like) noise, and nothing below vmax clips. vmax is fixed
+% for the session by the channel's first volume: 2^k - 1 >= 2x its maximum,
+% within [4095, 65535] (DisplayEncoding.sqrt_for; the deconvolved data can
+% pass 12 bits). Recorded in <view dir>/display_C<c>.json, whoever publishes
+% first wins (one link(2)), and every server encodes by the record. A session an
+% older server started has a shift recorded instead: its buffers keep it.
 fn = fullfile(viewDir, sprintf('display_C%d.json', c));
-if exist(fn, 'file') == 2
+if exist(fn, 'file') ~= 2
+    vmax = opymDisplayVmax(max(dsr(:)));
+    tmp = sprintf('%s.%s.tmp', fn, get_uuid());
+    fid = fopen(tmp, 'w');
+    fprintf(fid, '{"encoding": "sqrt", "vmax": %d}\n', vmax);
+    fclose(fid);
+    % link(2), not rename(2): a rename would replace a record another server
+    % has already published (and encoded by), a link fails if there is one.
     try
-        rec = jsondecode(fileread(fn));
-        if isfield(rec, 'shift')
-            lut = uint8(min(bitshift(0 : 65535, -double(rec.shift)), 255));
-        end
+        java.nio.file.Files.createLink(java.io.File(fn).toPath(), java.io.File(tmp).toPath());
     catch
+        if exist(fn, 'file') ~= 2
+            delete(tmp);
+            error('run_live_zarr:publish', 'Cannot publish %s', fn);
+        end
     end
+    delete(tmp);
+end
+rec = jsondecode(fileread(fn));
+if isfield(rec, 'shift')
+    lut = uint8(min(bitshift(0 : 65535, -double(rec.shift)), 255));
     return;
 end
-tmp = sprintf('%s.%s.tmp', fn, get_uuid());
-fid = fopen(tmp, 'w');
-fprintf(fid, '{"encoding": "sqrt", "vmax": 4095}\n');
-fclose(fid);
-publishOnce(tmp, fn, false);
+lut = sqrtLut(double(rec.vmax));
+end
+
+
+function lut = sqrtLut(vmax)
+% The square-root LUT for vmax, built once per vmax and server.
+persistent key table
+if isempty(key) || key ~= vmax
+    v = min(0 : 65535, vmax);
+    table = uint8(round(255 * sqrt(v / vmax)));
+    key = vmax;
+end
+lut = table;
 end
 
 

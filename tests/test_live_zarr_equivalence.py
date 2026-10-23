@@ -202,7 +202,8 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
             else:
                 rec = json.loads((tmp_path / "view" / f"display_C{c}.json").read_text())
                 encoding = DisplayEncoding.from_record(rec)
-                assert encoding == DisplayEncoding.sqrt()
+                # vmax fixed by the channel's first volume
+                assert encoding == DisplayEncoding.sqrt_for(out["0/0"][0, c])
                 assert view.dtype == np.uint8
                 np.testing.assert_array_equal(view, encoding.lut()[level0])
             level1 = downsample2(level0)

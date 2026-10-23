@@ -280,3 +280,15 @@ def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
             matlab.uint8(lut[:100].tolist()),
             nargout=1,
         )
+
+
+def test_the_servers_view_ceiling_matches_the_viewers(eng):
+    """opymDisplayVmax (what run_live_zarr.m records) and
+    DisplayEncoding.sqrt_for (what the viewer picks without a record) agree
+    for every peak, the bright cells' (> 4095) included."""
+    from opym.live_view import DisplayEncoding
+
+    for peak in (0, 1, 639, 2047, 2048, 4095, 7990, 16383, 16384, 40000, 65535):
+        vol = np.array([[[peak]]], np.uint16)
+        want = DisplayEncoding.sqrt_for(vol).vmax
+        assert eng.opymDisplayVmax(float(peak), nargout=1) == want, peak
