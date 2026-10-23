@@ -857,7 +857,21 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         self._unknown_noticed.pop(session_id, None)
-        self._maybe_start_live(session)
+        try:
+            self._maybe_start_live(session)
+        except Exception:
+            # The live view is a convenience; the acquisition is not. An
+            # unreachable PSF (GPFS down after a reboot, 2026-10-23) used to
+            # kill the receiver here, and the client's resync then killed it
+            # again on every restart, so nothing was received at all. Keep
+            # receiving, staging and draining; the backfill deconvolves later.
+            logger.exception(
+                "Session %s: live lane could not start -- receiving without "
+                "a live view",
+                session_id,
+            )
+            session.live = False
+            session.live_zarr = False
         if session.resumed:
             restaged = self._restage_from_raw_store(session)
             logger.warning(
