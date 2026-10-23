@@ -12,9 +12,10 @@ three cells that share one camera (rotate one, all turn):
   3. 16-bit   the stored counts, the same contrast as 2
 
 Every cell is a LiveImage, so 2 is drawn by the real decoding shader. Once
-drawn, the canvas is grabbed and each cell compared with 3: the mean and
-99th-percentile difference in screen grey levels, and how much of the cell
-is at full brightness. With --out, the screenshot and numbers are saved;
+drawn, each cell is drawn alone in the same place (grid off: vispy jitters
+rays by screen position) and compared with 3: the mean and 99th-percentile
+difference in screen grey levels, and how much of the cell is at full
+brightness. With --out, the side-by-side screenshot and numbers are saved;
 without --quit, the window stays open to look at.
 
 usage: DISPLAY=:N XAUTHORITY=... PYTHONPATH=<opym>/src \\
@@ -54,16 +55,17 @@ def old_contrast(codes: np.ndarray, shift: int) -> tuple[float, float]:
     return float(lo) * 2**shift, float(max(hi, lo + 1)) * 2**shift
 
 
-def cell_stats(shot: np.ndarray, cols: int, ref: int) -> list[dict]:
-    """Each grid cell of an (H, W, 4) canvas grab against cell `ref`."""
-    w = shot.shape[1] // cols
-    cells = [shot[:, i * w : (i + 1) * w, :3].astype(np.int16) for i in range(cols)]
-    ref = cells[ref]
-    signal = ref.max(axis=2) > 24  # where the 16-bit cell shows the cell
+def screen_stats(shots: list[np.ndarray], ref: int) -> list[dict]:
+    """Each (H, W, 4) grab against grab `ref`. Each is the canvas with one
+    cell's layers alone and the grid off, so every one is drawn in the same
+    place: vispy jitters each ray's start by its screen position, and two
+    grid cells of the same noisy volume differ by ~3 grey levels anyway."""
+    imgs = [shot[..., :3].astype(np.int16) for shot in shots]
+    signal = imgs[ref].max(axis=2) > 24  # where the 16-bit view shows the cell
     out = []
-    for cell in cells:
-        diff = np.abs(cell - ref).max(axis=2)[signal]
-        bright = cell.max(axis=2)[signal]
+    for img in imgs:
+        diff = np.abs(img - imgs[ref]).max(axis=2)[signal]
+        bright = img.max(axis=2)[signal]
         out.append(
             {
                 "mean_abs_diff_vs_16bit": round(float(diff.mean()), 2),
@@ -80,6 +82,7 @@ def main() -> None:
     ap.add_argument("--t", type=int, default=0)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--quit", action="store_true", help="close once grabbed")
+    ap.add_argument("--interpolation", default="linear", help="3D interpolation")
     args = ap.parse_args()
 
     from opym import lanes, live_view
@@ -144,6 +147,7 @@ def main() -> None:
                 encoding=(lambda e=enc: e),
             )
             layer.contrast_limits = clim
+            layer.interpolation3d = args.interpolation
             viewer.add_layer(layer)
             layers.setdefault(i, []).append(layer)
     viewer.grid.enabled = True
@@ -163,17 +167,26 @@ def main() -> None:
         w = shot.shape[1] // 3
         return int(np.argmax([shot[:, j * w : (j + 1) * w].sum() for j in range(3)]))
 
+    def show_only(i: int | None) -> None:
+        for k, group in layers.items():
+            for layer in group:
+                layer.visible = i is None or k == i
+
     def grab() -> None:
         col = {i: column_of(i) for i in layers}
-        for group in layers.values():
-            for layer in group:
-                layer.visible = True
+        viewer.grid.enabled = False
+        alone = []
+        for i in range(3):
+            show_only(i)
+            alone.append(viewer.screenshot(canvas_only=True, flash=False))
+        stats = screen_stats(alone, 2)
+        report["screen"] = {NAMES[i]: stats[i] for i in range(3)}
+        viewer.grid.enabled = True
+        show_only(None)
         order = sorted(layers, key=col.get)
         report["cells_left_to_right"] = [NAMES[i] for i in order]
         viewer.text_overlay.text = "   |   ".join(NAMES[i] for i in order)
         shot = viewer.screenshot(canvas_only=True, flash=False)
-        stats = cell_stats(shot, 3, order.index(2))
-        report["screen"] = {NAMES[i]: stats[k] for k, i in enumerate(order)}
         print(json.dumps(report["screen"], indent=1), flush=True)
         if args.out:
             args.out.write_text(json.dumps(report, indent=1))
