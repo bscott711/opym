@@ -881,26 +881,69 @@ def test_an_auto_texture_cache_without_a_free_reading_stays_small():
     assert cache.fits(10**9) and cache.trim() == 0
 
 
-def test_display_shift_keeps_enough_grey_levels_in_the_display_window():
-    rng = np.random.default_rng(0)
-    for top, shift in ((60, 0), (366, 1), (1000, 3)):
-        vol = rng.integers(1, top + 1, size=(40, 40, 40)).astype(np.uint16)
-        assert live_view.display_shift(vol) == shift
-        assert (top >> shift) >= live_view.DISPLAY_LEVELS or shift == 0
-    assert live_view.display_shift(np.zeros((8, 8, 8), np.uint16)) == 0
+def _round_trip(encoding):
+    """Every count 0..4095 encoded and decoded, as the viewer shows it."""
+    v = np.arange(4096, dtype=np.uint16)
+    codes = live_view.to_8bit(v.reshape(-1, 1, 1), encoding).ravel()
+    return v.astype(np.float64), codes, encoding.decode(codes).astype(np.float64)
 
 
-def test_to_8bit_shifts_and_clips():
-    vol = np.array([0, 1, 511, 512, 1620], np.uint16).reshape(5, 1, 1)
-    out = live_view.to_8bit(vol, 1)
-    assert out.dtype == np.uint8
-    assert out.ravel().tolist() == [0, 0, 255, 255, 255]
-    assert live_view.to_8bit(vol[:3], 0).ravel().tolist() == [0, 1, 255]
+def _excess_error(v, shown) -> float:
+    """How far beyond half a square-root step (sqrt(v * 4095) / 255) any
+    count is shown."""
+    return float(np.max(np.abs(shown - v) - np.sqrt(v * 4095) / 255))
 
 
-def test_an_8bit_viewer_shows_each_channel_scaled_by_a_fixed_shift(tmp_path):
-    """The stores stay 16-bit; the viewer holds and shows 8-bit volumes,
-    each channel scaled by one shift for the whole session."""
+def test_the_sqrt_encoding_keeps_every_count_to_4095_within_half_a_step():
+    v, codes, shown = _round_trip(live_view.DisplayEncoding.sqrt())
+    assert codes.dtype == np.uint8 and codes[0] == 0 and codes[-1] == 255
+    assert np.all(np.diff(codes.astype(int)) >= 0)
+    assert len(set(codes[:8].tolist())) == 8  # 0..7: a code each
+    assert _excess_error(v, shown) <= 0.02  # nothing clips below 4095
+    # its rounding against the processed data's noise (~0.45 sqrt(v),
+    # measured on WT_Stim_001): about a third of it
+    rel = (shown[16:] - v[16:]) / (0.45 * np.sqrt(v[16:]))
+    assert float(np.sqrt(np.mean(rel**2))) < 0.35
+    above = np.array([4095, 5000, 65535], np.uint16).reshape(-1, 1, 1)
+    assert live_view.to_8bit(above, live_view.DisplayEncoding.sqrt()).max() == 255
+
+
+def test_the_old_linear_shift_fails_the_same_check():
+    """Negative control: the shift it replaced (shift 0, the live cell's)
+    flattens everything above 255 -- 4095 shows as 255."""
+    v, _, shown = _round_trip(live_view.DisplayEncoding.linear(0))
+    assert _excess_error(v, shown) > 3000
+    assert shown[4095] == 255
+
+
+def test_display_encodings_round_trip_through_their_records():
+    sqrt = live_view.DisplayEncoding.sqrt()
+    assert live_view.DisplayEncoding.from_record(sqrt.record()) == sqrt
+    old = live_view.DisplayEncoding.from_record({"shift": 3, "levels": 120})
+    assert old == live_view.DisplayEncoding.linear(3) and old.vmax == 255 << 3
+    assert float(old.decode(200)) == 1600
+    vol = np.array([0, 8, 2047, 2048, 4000], np.uint16).reshape(5, 1, 1)
+    assert live_view.to_8bit(vol, old).ravel().tolist() == [0, 1, 255, 255, 255]
+    assert live_view.DisplayEncoding.from_record({"nope": 1}) is None
+    assert live_view.DisplayEncoding.from_record({"encoding": "sqrt"}) is None
+
+
+def test_contrast_limits_in_counts_meet_the_shaders_decoded_value():
+    """The shader compares (code / 255) ** power with the texture clim / 255:
+    that has to be counts / vmax, so napari's limits stay in counts."""
+    for enc in (live_view.DisplayEncoding.sqrt(), live_view.DisplayEncoding.linear(2)):
+        lo, hi = enc.texture_clim((100, 900))
+        codes = np.arange(256)
+        in_shader = (codes / 255) ** enc.power
+        counts = enc.decode(codes)
+        assert np.allclose(in_shader >= hi / 255, counts >= 900 - 1e-3)
+        assert np.allclose(in_shader <= lo / 255, counts <= 100 + 1e-3)
+
+
+def test_an_8bit_viewer_shows_each_channel_by_the_sqrt_encoding(tmp_path):
+    """The stores stay 16-bit; the viewer holds 8-bit codes, the same curve
+    for every channel and timepoint, nothing clipped above 255, and its
+    contrast limits and values are in counts."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
@@ -918,23 +961,62 @@ def test_an_8bit_viewer_shows_each_channel_scaled_by_a_fixed_shift(tmp_path):
     cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
     follower = live_view.LiveFollower(viewer, store, cache=cache, follow=False)
     gfp, msc = follower.layers
+    sqrt = live_view.DisplayEncoding.sqrt()
+    lut = sqrt.lut()
     viewer.dims.set_current_step(0, 0)
     shown = _shown_data(gfp)
-    assert shown.dtype == np.uint8 and int(shown.max()) == 480 >> 2
-    assert int(_shown_data(msc).max()) == 60  # dim channel: exact
-    assert follower.sources[0].shift == 2 and follower.sources[1].shift == 0
+    assert shown.dtype == np.uint8 and int(shown.max()) == lut[480]
+    assert abs(gfp._decoded(int(shown.max())) - 480) < 4  # not 255
+    assert int(_shown_data(msc).max()) == lut[60]
+    assert follower.sources[0].encoding == sqrt == follower.sources[1].encoding
     viewer.dims.set_current_step(0, 1)
-    assert int(_shown_data(gfp).max()) == 960 >> 2  # the same shift at t=1
-    assert int(_shown_data(msc).max()) == 120
-    assert 0 <= gfp.contrast_limits[0] < gfp.contrast_limits[1] <= 255
+    assert int(_shown_data(gfp).max()) == lut[960]
+    assert abs(gfp.contrast_limits[1] - 960) < 8  # counts, from t=1's MIP
+    assert gfp.contrast_limits_range[1] >= 4095
     assert follower.sources[0]._levels[0].dtype == np.uint16  # the store
 
 
-def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_shift(tmp_path):
+def test_the_default_contrast_top_comes_from_the_mip(tmp_path):
+    """A dim cell body with a few bright voxels, one per column: the voxel
+    percentile the contrast used to come from lands on the body (most
+    voxels are background), so a MIP render showed every column white.
+    The top now comes from the Z-MIP, where those columns are."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store = tmp_path / "Cell_009" / "viewer" / "Cell_009_dsr.ome.zarr"
+    store.parent.mkdir(parents=True)
+    w.create_store(
+        store,
+        n_t=1,
+        n_c=2,
+        shape_zyx=(40, 64, 64),
+        dtype=np.uint16,
+        channel_labels=["GFP 488", "mScarlet 561"],
+    )
+    vol = np.full((40, 64, 64), 3, np.uint16)
+    vol[:, 16:48, 16:48] = 100  # the body
+    vol[21, 20:26, 20:27] = 600  # bright, off the 4th-voxel grid in z
+    for c in range(2):
+        w.write_timepoint(store, 0, c, vol)
+    w.write_progress(store, n_t=1, n_c=2, done=[[0, 0], [0, 1]], state="running")
+    sub = vol[::4, ::4, ::4]
+    assert np.percentile(sub[sub > 0], 99.9) <= 100  # the old rule's top
+
+    cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
+    follower = live_view.LiveFollower(ViewerModel(), store, cache=cache, follow=False)
+    lo, hi = follower.layers[0].contrast_limits
+    assert 590 < hi < 610 and lo < 10
+
+
+def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_encoding(
+    tmp_path,
+):
     """The server writes 8-bit view buffers and publishes each channel's
-    shift: the viewer maps the buffer as it is (no copy, no conversion) and
-    scales what it reads from the store by that same shift. A 16-bit viewer
-    skips an 8-bit buffer rather than mix scales."""
+    encoding: the viewer maps the buffer as it is (no copy, no conversion)
+    and encodes what it reads from the store the same way -- the sqrt curve,
+    or an older server's shift. A 16-bit viewer skips an 8-bit buffer
+    rather than mix scales."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
@@ -945,10 +1027,11 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_shift(tmp_p
     store = _store(tmp_path)
     buffers = tmp_path / "view" / "buffers"
     buffers.mkdir(parents=True)
-    (buffers / "display_C0.json").write_text(json.dumps({"shift": 3}))
-    (buffers / "display_C1.json").write_text(json.dumps({"shift": 0}))
+    sqrt = live_view.DisplayEncoding.sqrt()
+    (buffers / "display_C0.json").write_text(json.dumps(sqrt.record()))
+    (buffers / "display_C1.json").write_text(json.dumps({"shift": 3}))  # older
     for c in range(2):  # t=0 in the store, 16-bit, as the server wrote it
-        w.write_timepoint(store, 0, c, np.full((8, 16, 12), (800, 40)[c], np.uint16))
+        w.write_timepoint(store, 0, c, np.full((8, 16, 12), (800, 400)[c], np.uint16))
     w.write_progress(store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running")
     np.save(buffers / buffer_name(1, 0), np.full((8, 16, 12), 200, np.uint8))
     np.save(buffers / buffer_name(1, 1), np.full((8, 16, 12), 45, np.uint8))
@@ -963,18 +1046,22 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_shift(tmp_p
         follow=False,
         prefetch_pool=_NoPrefetch(),
     )
-    src = follower.sources[0]
+    src, old = follower.sources
     src.update({0}, {1}, live=True)
+    old.update({0}, {1}, live=True)
     buf = src.load(1, 0)
     assert buf.dtype == np.uint8 and int(buf.max()) == 200
     assert not buf.flags.owndata  # the mapped buffer itself
-    assert int(src.load(0, 0).max()) == 800 >> 3  # the store, by the server's shift
-    assert src.shift == 3
+    assert int(src.load(0, 0).max()) == sqrt.lut()[800]  # the store, encoded
+    assert src.encoding == sqrt
+    assert old.encoding == live_view.DisplayEncoding.linear(3)
+    assert int(old.load(0, 0).max()) == 400 >> 3
+    assert float(old.encoding.decode(45)) == 360
+    assert follower.layers[1].contrast_limits_range[1] >= 255 << 3
 
     cache16 = live_view.ViewCache(full_gb=1, small_gb=1, bits=16)
-    src16 = live_view.ChannelSource(
-        store, follower.sources[0]._levels, 0, buffers, cache16
-    )
+    src16 = live_view.ChannelSource(store, src._levels, 0, buffers, cache16)
     src16.update({0}, {1}, live=True)
+    assert src16.encoding is None
     assert src16.load(1, 0) is None  # an 8-bit buffer: wait for the store
     assert int(src16.load(0, 0).max()) == 800

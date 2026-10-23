@@ -7,6 +7,15 @@ change behaviour).
 
 ## [Unreleased]
 
+### Fixed
+- naparym-live's 8-bit display no longer saturates. The 8-bit view buffers hold each count by its square root
+  (`round(255·√(v/4095))`, `live_view.DisplayEncoding`, written by `run_live_zarr.m` through a LUT in
+  `opymWriteLiveOutputs`) and the volume shader decodes them back to linear counts, so nothing below 4095 clips and
+  contrast limits are in counts. It replaces a per-session right shift that flattened every count above
+  `255 << shift` (7% of WT_Stim_001's projection). The default contrast top is now the 99.9th percentile of the
+  Z-MIP rather than of all voxels. Sessions an older server started keep their recorded shift and still display
+  correctly. `scripts/live_bench/sqrt8_compare.py` shows before | now | 16-bit side by side.
+
 ### Added
 - SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
   receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with

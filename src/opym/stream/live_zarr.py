@@ -78,9 +78,9 @@ SHEET_ANGLE_DEG = 60.0
 # others do.
 WARMUP_NAME = "live_warmup.json"
 # The view buffers' bit depth (OPYM_LIVE_VIEW_BITS, 8 or 16): 8-bit buffers
-# are what naparym-live shows (see its DISPLAY_LEVELS), half the bytes for
-# the server to write and the viewer to map and upload. The stores stay
-# 16-bit either way.
+# are what naparym-live shows (the square-root encoding it decodes, see
+# opym.live_view.DisplayEncoding), half the bytes for the server to write
+# and the viewer to map and upload. The stores stay 16-bit either way.
 VIEW_BITS_ENV_VAR = "OPYM_LIVE_VIEW_BITS"
 
 
