@@ -694,6 +694,21 @@ def test_no_live_lease_unless_the_live_lane_is_enabled(tmp_path, receiver, clien
     assert not lanes.lease_path().exists()
 
 
+def test_session_start_survives_a_live_lane_that_cannot_start(
+    tmp_path, receiver, client, monkeypatch
+):
+    """A PSF on an unmounted filesystem used to raise out of SESSION_START and
+    kill the receiver (and, on every restart, the client's resync did it
+    again). The session must still be taken, just without a live view."""
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    monkeypatch.setenv("OPYM_DECON_PSF", str(tmp_path / "gone" / "psf.tif"))
+    sock = client("sess-nopsf")
+    _start_session(sock, "sess-nopsf", receiver, _session_header(tmp_path / "raw"))
+    session = receiver.sessions["sess-nopsf"]
+    assert not session.live and not session.live_zarr
+    assert receiver._live is None
+
+
 def _prepare(client, receiver, plan, prepare_id="prepare-1"):
     sock = client(prepare_id)
     sock.send_multipart(pack_message(MSG_PREPARE, prepare_id, plan))
