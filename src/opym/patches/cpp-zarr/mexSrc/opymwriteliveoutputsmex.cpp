@@ -1,4 +1,4 @@
-// t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, shift])
+// t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, lut])
 //
 // Everything the live job writes for one deskewed (t, c) volume, from a
 // single transpose. deskewRotateFrame3D returns (Y, X, Z) column-major and
@@ -14,8 +14,11 @@
 //     happens, so the viewer never waits on encoding. With npyPath '' the
 //     transpose goes to memory and no view buffer is written.
 //
-//     With `shift`, the view buffer is uint8 instead: min(v >> shift, 255),
-//     what naparym-live shows (half the bytes to write, map and upload). The
+//     With `lut` (uint8, 65536 entries: each count's code), the view buffer
+//     is uint8 instead: lut[v], what naparym-live shows (half the bytes to
+//     write, map and upload; run_live_zarr.m passes the square-root curve,
+//     see opym.live_view.DisplayEncoding). A scalar `lut` is an older
+//     caller's shift: min(v >> shift, 255). The
 //     volume is transposed into a uint16 working buffer kept across calls
 //     (its pages already present; steps 2 and 3 read it), then scaled into
 //     the map row by contiguous row, and published. (Transposing straight
@@ -352,7 +355,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     if (nrhs != 5 && nrhs != 6)
         mexErrMsgIdAndTxt(
             "opymLive:input",
-            "Usage: t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, shift])");
+            "Usage: t = opymWriteLiveOutputs(dsr, npyPath, levelStores, mipStore, leadingIndex[, lut])");
     if (mxGetClassID(prhs[0]) != mxUINT16_CLASS || mxGetNumberOfDimensions(prhs[0]) != 3)
         mexErrMsgIdAndTxt("opymLive:input", "dsr must be a 3-D uint16 array (Y, X, Z)");
     const std::string npyPath = str(prhs[1], "npyPath");
@@ -371,12 +374,25 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         leading.push_back((uint64_t)v - 1);
     }
 
-    int shift = -1;  // < 0: a uint16 view buffer
+    // The uint16 -> uint8 code of every count: from `lut`, or built from an
+    // older caller's shift. Empty: a uint16 view buffer.
+    std::vector<uint8_t> lut;
     if (nrhs == 6) {
-        const double v = mxGetScalar(prhs[5]);
-        if (!(v >= 0 && v <= 15) || v != (double)(int)v)
-            mexErrMsgIdAndTxt("opymLive:input", "shift must be an integer in 0..15");
-        shift = (int)v;
+        if (mxGetClassID(prhs[5]) == mxUINT8_CLASS && mxGetNumberOfElements(prhs[5]) == 65536) {
+            const uint8_t *src = (const uint8_t *)mxGetData(prhs[5]);
+            lut.assign(src, src + 65536);
+        } else if (mxGetNumberOfElements(prhs[5]) == 1 && !mxIsChar(prhs[5])) {
+            const double v = mxGetScalar(prhs[5]);
+            if (!(v >= 0 && v <= 15) || v != (double)(int)v)
+                mexErrMsgIdAndTxt("opymLive:input", "shift must be an integer in 0..15");
+            lut.resize(65536);
+            for (unsigned u = 0; u < 65536; u++) {
+                const unsigned c = u >> (unsigned)v;
+                lut[u] = (uint8_t)(c > 255u ? 255u : c);
+            }
+        } else {
+            mexErrMsgIdAndTxt("opymLive:input", "lut must be uint8 with 65536 entries (or a shift)");
+        }
     }
 
     const mwSize *d = mxGetDimensions(prhs[0]);
@@ -399,7 +415,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     // plane by plane, in cache-sized tiles, into the memory map (a uint16
     // buffer), or into the working buffer and, scaled, the map (uint8).
     const bool view = !npyPath.empty();
-    const bool u8 = view && shift >= 0;
+    const bool u8 = view && !lut.empty();
     const std::string header = npyHeader(Z, Y, X, u8);
     const uint64_t nVox = Z * Y * X;
     const uint64_t fileSize = header.size() + nVox * (u8 ? 1 : sizeof(uint16_t));
@@ -435,15 +451,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     }
     transpose16(dsr, vol, Y, X, Z);
     if (u8) {
-        const unsigned sh = (unsigned)shift;
+        const uint8_t *__restrict code = lut.data();
         #pragma omp parallel for schedule(static)
         for (int64_t z = 0; z < (int64_t)Z; z++) {
             const uint16_t *__restrict src = vol + (uint64_t)z * Y * X;
             uint8_t *__restrict dst = vol8 + (uint64_t)z * Y * X;
-            for (uint64_t i = 0; i < Y * X; i++) {
-                const unsigned v = (unsigned)src[i] >> sh;
-                dst[i] = (uint8_t)(v > 255u ? 255u : v);
-            }
+            for (uint64_t i = 0; i < Y * X; i++) dst[i] = code[src[i]];
         }
     }
     if (view && rename(tmp.c_str(), npyPath.c_str()) != 0) {

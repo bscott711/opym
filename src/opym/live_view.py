@@ -118,14 +118,41 @@ _TOUCH_FRAG = """
 uniform sampler3D u_tex;
 void main() { gl_FragColor = texture3D(u_tex, vec3(0.5, 0.5, 0.5)); }
 """
+# vispy's volume texture lookups (vispy.visuals.volume: _TEXTURE_LOOKUP,
+# _INTERPOLATION_TEMPLATE), decoding an 8-bit layer's codes as they are
+# sampled: n -> n ** $decode_power (2 for the square-root encoding, 1 for
+# none). See LiveVolumeNode.
+_DECODED_LOOKUP = """
+    vec4 texture_lookup(vec3 texcoord) {
+        vec4 v = texture3D($texture, texcoord);
+        v.r = pow(max(v.r, 0.0), $decode_power);
+        return v;
+    }"""
+_DECODED_INTERPOLATED_LOOKUP = """
+    #include "misc/spatial-filters.frag"
+    vec4 texture_lookup_filtered(vec3 texcoord) {
+        vec4 v = %s($texture, $shape, texcoord);
+        v.r = pow(max(v.r, 0.0), $decode_power);
+        return v;
+    }"""
 # Volumes are shown as 8-bit by default (`--bits`): half the bytes to upload
-# to the GPU, cache in RAM and keep as textures. Each channel is scaled by a
-# power of two fixed for the session (so its intensities compare across
-# time): the largest that keeps DISPLAY_LEVELS grey levels below the top of
-# its display window. Side by side on 2026-09-27, 121-138 levels looked the
-# same as 16-bit; the processed data spans only ~60-800 counts. The stores
-# stay 16-bit; only what the viewer holds and uploads changes.
-DISPLAY_LEVELS = 120
+# to the GPU, cache in RAM and keep as textures. The 8 bits hold a count v by
+# its square root, code = round(255 * sqrt(v / SQRT_VMAX)) (`DisplayEncoding`),
+# and the GPU squares it back, so what is shown -- and the contrast limits --
+# are linear counts. One curve for every channel and session. The noise in
+# the processed data grows like sqrt(v) (2026-10-23, WT_Stim_001: neighbour-
+# difference sd 1.2 at 7 counts, 4.6 at 60, 13.3 at 225), and so does this
+# curve's step (0.5 sqrt(v)): its rounding adds ~0.3x the noise at every
+# level, counts 0-7 keep codes of their own, and nothing below 4095 clips.
+# (The scheme 12-bit space cameras use to send 8 bits.) It replaced a linear
+# right shift fixed by each session's first volume, which flattened every
+# count above 255 << shift: 7% of that cell's projection. The stores stay
+# 16-bit; only what the viewer holds and uploads changes.
+SQRT_VMAX = 4095
+# The default contrast top: this percentile of the newest volume's Z-MIP --
+# a MIP render shows projections, and the voxel percentile it replaced (most
+# voxels are background) left 16% of that cell's projection white.
+CONTRAST_TOP_PERCENTILE = 99.9
 _PREFETCH_READ_POOL = None
 
 
@@ -225,36 +252,115 @@ def read_volume(arr, t: int, c: int, *, background: bool = False):
     return out
 
 
-def display_shift(vol) -> int:
-    """The right shift that takes a channel's 16-bit data to 8 bits: the
-    largest that keeps DISPLAY_LEVELS grey levels below the 99.9th
-    percentile (the top of naparym-live's contrast), leaving 1-2x that as
-    headroom above it."""
+class DisplayEncoding:
+    """How a channel's 8-bit volumes hold its counts: v ~= vmax * (code /
+    255) ** power. `sqrt()` (power 2) is what servers and viewers write now;
+    `linear(shift)` (power 1, vmax = 255 << shift) reads an older server's
+    shifted buffers. Recorded per channel in the buffer dir as
+    display_C<c>.json (`record`, `from_record`)."""
+
+    def __init__(self, power: int, vmax: float, shift: int | None = None) -> None:
+        self.power = power
+        self.vmax = float(vmax)
+        self.shift = shift
+        self._lut = None
+
+    @classmethod
+    def sqrt(cls) -> DisplayEncoding:
+        return cls(2, SQRT_VMAX)
+
+    @classmethod
+    def linear(cls, shift: int) -> DisplayEncoding:
+        return cls(1, 255 << shift, shift=shift)
+
+    @classmethod
+    def from_record(cls, rec) -> DisplayEncoding | None:
+        """From a display_C<c>.json record; None if it names neither."""
+        try:
+            if rec.get("encoding") == "sqrt":
+                return cls(2, float(rec["vmax"]))
+            if "shift" in rec:
+                return cls.linear(int(rec["shift"]))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+        return None
+
+    def record(self) -> dict:
+        if self.power == 2:
+            return {"encoding": "sqrt", "vmax": self.vmax}
+        return {"shift": self.shift}
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, DisplayEncoding) and (self.power, self.vmax) == (
+            other.power,
+            other.vmax,
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.power, self.vmax))
+
+    def __repr__(self) -> str:
+        return f"DisplayEncoding(power={self.power}, vmax={self.vmax:g})"
+
+    def lut(self):
+        """Every uint16 count's code (65536 uint8), built once."""
+        import numpy as np
+
+        if self._lut is None:
+            v = np.arange(65536, dtype=np.float64)
+            if self.power == 2:
+                code = np.rint(255 * np.sqrt(np.minimum(v, self.vmax) / self.vmax))
+            else:
+                code = np.minimum(np.arange(65536) >> self.shift, 255)
+            self._lut = code.astype(np.uint8)
+        return self._lut
+
+    def decode(self, codes):
+        """Codes back to counts (float32), as the GPU decodes them."""
+        import numpy as np
+
+        n = np.asarray(codes, dtype=np.float32) / np.float32(255)
+        return (n**self.power * np.float32(self.vmax)).astype(np.float32)
+
+    def texture_clim(self, clim) -> tuple[float, float]:
+        """Contrast limits in counts as the 8-bit texture's own clim: the
+        GPU normalizes that by 255 and compares it with the decoded value,
+        v / vmax."""
+        return (float(clim[0]) * 255 / self.vmax, float(clim[1]) * 255 / self.vmax)
+
+
+def to_8bit(vol, encoding: DisplayEncoding, *, background: bool = False):
+    """`vol`'s codes (uint8) by `encoding`, a lookup per voxel: a z-slab per
+    decode thread."""
     import numpy as np
 
-    sub = np.asarray(vol[::4, ::4, ::4])
-    sub = sub[sub > 0]
-    if not sub.size:
-        return 0
-    hi = float(np.percentile(sub, 99.9))
-    return max(0, math.floor(math.log2(max(hi, 1.0) / DISPLAY_LEVELS)))
-
-
-def to_8bit(vol, shift: int, *, background: bool = False):
-    """`vol` shifted right by `shift` and clipped to 255, as uint8: a z-slab
-    per decode thread (1 GB in ~0.035 s on 48 threads)."""
-    import numpy as np
-
+    lut = encoding.lut()
     out = np.empty(vol.shape, np.uint8)
     step = max(1, -(-vol.shape[0] // 32))
 
     def one(z0: int) -> None:
-        tmp = np.right_shift(vol[z0 : z0 + step], shift)
-        np.minimum(tmp, 255, out=tmp)
-        out[z0 : z0 + step] = tmp
+        np.take(lut, vol[z0 : z0 + step], out=out[z0 : z0 + step], mode="clip")
 
     list(_read_pool(background).map(one, range(0, vol.shape[0], step)))
     return out
+
+
+def default_contrast(vol, encoding: DisplayEncoding | None = None):
+    """A volume's contrast limits in counts (`vol` holds `encoding`'s codes,
+    or counts with None): the bottom at the 0.5th percentile of every 4th
+    nonzero voxel, the top at CONTRAST_TOP_PERCENTILE of its Z-MIP (every
+    4th row and column) -- what a MIP render shows, where most voxels are
+    background."""
+    import numpy as np
+
+    decode = encoding.decode if encoding is not None else np.asarray
+    sub = np.asarray(vol[::4, ::4, ::4])
+    if not sub.any():
+        return 0.0, 300.0
+    mip = np.asarray(vol[:, ::4, ::4]).max(axis=0)
+    lo = float(decode(np.percentile(sub[sub > 0], 0.5)))
+    hi = float(decode(np.percentile(mip[mip > 0], CONTRAST_TOP_PERCENTILE)))
+    return lo, max(hi, lo + 1)
 
 
 def map_buffer(path: Path):
@@ -341,8 +447,8 @@ class ViewCache:
     """The viewer's two caches: full-resolution volumes (level 0, the big
     ones, `full_gb`) and coarser levels (the layer thumbnails', `small_gb`),
     so a long session's full resolution can't push the thumbnails out.
-    `bits`: what they hold, and so what the viewer shows -- 8 (each
-    channel's data scaled to 8 bits, see DISPLAY_LEVELS) or 16 (as stored)."""
+    `bits`: what they hold -- 8 (each channel's data encoded in 8 bits, see
+    `DisplayEncoding`; shown decoded) or 16 (as stored)."""
 
     def __init__(
         self, full_gb: float = 100.0, small_gb: float = 40.0, bits: int = 16
@@ -380,11 +486,11 @@ class ChannelSource:
 
     With an 8-bit cache (`ViewCache.bits`), what is cached and shown is
     8-bit: the server's 8-bit view buffers as they are (mapped, no copy),
-    and every volume read from the store scaled by the same shift, which
-    the server published in the buffer dir (display_C<c>.json); without it
-    (an older server, a finished session) the shift comes from the first
-    volume read, by the same rule (`display_shift`). A 16-bit viewer skips
-    8-bit buffers and waits for the store.
+    and every volume read from the store encoded the same way, by the
+    encoding the server published in the buffer dir (display_C<c>.json;
+    an older server's is a linear shift), else the square-root curve
+    (`DisplayEncoding`). The layer decodes it back to counts on the GPU. A
+    16-bit viewer skips 8-bit buffers and waits for the store.
 
     Not dask: dask copies every result it computes, a fresh 1 GB allocation
     per channel per timepoint shown. `update` is called once per poll with
@@ -418,8 +524,8 @@ class ChannelSource:
         self.shapes = [(n_t, *arr.shape[2:]) for arr in levels]
         self.bits = cache.bits
         self.dtype = np.dtype(np.uint8) if self.bits == 8 else levels[0].dtype
-        self.shift: int | None = None  # 8-bit: fixed by the first volume
-        self._shift_lock = threading.Lock()
+        self._encoding: DisplayEncoding | None = None  # 8-bit: fixed once used
+        self._encoding_lock = threading.Lock()
 
     @property
     def has(self) -> set[int]:
@@ -455,29 +561,44 @@ class ChannelSource:
                 del self._maps[min(self._maps)]
         return mapped
 
-    def _published_shift(self) -> int | None:
-        """The shift the server scaled this channel's view buffers by."""
+    def _published_encoding(self) -> DisplayEncoding | None:
+        """The encoding the server wrote this channel's view buffers in."""
         if self._dir is None:
             return None
         try:
             rec = json.loads((self._dir / f"display_C{self.c}.json").read_text())
-            return int(rec["shift"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError):
             return None
+        return DisplayEncoding.from_record(rec)
+
+    @property
+    def encoding(self) -> DisplayEncoding | None:
+        """How this channel's 8-bit volumes hold counts (None at 16 bits):
+        the server's, once published, else the square-root curve. Fixed by
+        the first volume this viewer encodes itself, so what it caches
+        stays one scale."""
+        if self.bits == 16:
+            return None
+        with self._encoding_lock:
+            if self._encoding is None:
+                published = self._published_encoding()
+                if published is None:
+                    return DisplayEncoding.sqrt()  # not fixed: a server may publish
+                self._encoding = published
+            return self._encoding
 
     def _shown(self, arr, background: bool = False):
         """`arr` as the viewer holds it: itself at 16 bits or when it is
-        already 8-bit (a server's buffer), else scaled to 8 bits by this
-        channel's shift."""
+        already 8-bit (a server's buffer), else encoded to 8 bits."""
         import numpy as np
 
         if self.bits == 16 or arr.dtype == np.uint8:
             return arr
-        with self._shift_lock:
-            if self.shift is None:
-                published = self._published_shift()
-                self.shift = published if published is not None else display_shift(arr)
-        return to_8bit(arr, self.shift, background=background)
+        with self._encoding_lock:
+            if self._encoding is None:
+                self._encoding = self._published_encoding() or DisplayEncoding.sqrt()
+            encoding = self._encoding
+        return to_8bit(arr, encoding, background=background)
 
     def _usable(self, buf):
         """A mapped buffer this viewer can show: an 8-bit one only at 8 bits
@@ -870,14 +991,60 @@ def live_image_class():
                 return request
 
         class LiveImage(Image):
-            def __init__(self, *args, vram: TextureCache | None = None, **kwargs):
+            def __init__(
+                self, *args, vram: TextureCache | None = None, encoding=None, **kwargs
+            ):
                 self.vram = vram
+                # () -> DisplayEncoding | None: how its 8-bit data holds
+                # counts. Its renderer decodes on the GPU; the value under
+                # the cursor and the thumbnail decode here.
+                self.display_encoding = encoding or (lambda: None)
                 self.live_node = None  # set by its renderer, on a real canvas
                 super().__init__(*args, **kwargs)
                 self._data_level = 0
 
             def _get_layer_slicing_state(self, data, cache):
                 return _LiveSlicingState(self, data, cache)
+
+            def _decoded(self, value):
+                encoding = self.display_encoding()
+                if encoding is None or value is None:
+                    return value
+                return round(float(encoding.decode(value)), 1)
+
+            def _get_value(self, position):
+                return self._decoded(super()._get_value(position))
+
+            def _get_value_3d(self, *args, **kwargs):
+                value = super()._get_value_3d(*args, **kwargs)
+                if isinstance(value, tuple):
+                    return value[0], self._decoded(value[1])
+                return self._decoded(value)
+
+            def _update_thumbnail(self) -> None:
+                """napari's, on the decoded counts: its own would clip the
+                counts' contrast limits to the codes' 0..255."""
+                import numpy as np
+                from scipy import ndimage as ndi
+
+                encoding = self.display_encoding()
+                if encoding is None or self._slice.empty:
+                    return super()._update_thumbnail()
+                image = self._slice.thumbnail.raw
+                if self._slice_input.ndisplay == 3 and self.ndim > 2:
+                    image = np.max(image, axis=0)
+                image = encoding.decode(image)
+                zoom = np.divide(self._thumbnail_shape[:2], image.shape[:2]).min()
+                shape = np.clip(zoom * np.array(image.shape[:2]), 1, None)
+                small = ndi.zoom(
+                    image, tuple(shape / image.shape[:2]), prefilter=False, order=0
+                )
+                lo, hi = self.contrast_limits
+                small = (np.clip(small, lo, hi) - lo) / max(hi - lo, 1e-9)
+                colors = self.colormap.map((small**self.gamma).ravel())
+                colors = colors.reshape((*small.shape, 4))
+                colors[..., 3] *= self.opacity
+                self.thumbnail = colors
 
             def _update_draw(self, *args, **kwargs) -> None:
                 super()._update_draw(*args, **kwargs)
@@ -898,15 +1065,31 @@ def _register_live_renderer(live_image) -> None:
     import numpy as np
     from napari._vispy.layers.image import ImageLayerNode, VispyImageLayer
     from napari._vispy.utils.visual import layer_to_visual
+    from napari._vispy.visuals.image import Image as ImageNode
     from napari._vispy.visuals.volume import Volume as VolumeNode
 
     class LiveVolumeNode(VolumeNode):
         """A volume node whose texture follows the timepoint: a volume the
         viewer served (`served_key`) gets a texture of its own, kept in the
         `TextureCache`; showing it again rebinds that texture -- no upload.
-        Anything else (zeros, a stand-in) uses the node's own texture."""
+        Anything else (zeros, a stand-in) uses the node's own texture.
 
-        def __init__(self, *args, vram=None, texture_format=None, **kwargs):
+        An 8-bit layer's codes are decoded as they are sampled (`encoding`:
+        the texture value n = code / 255 becomes n ** power = v / vmax), and
+        its contrast limits, in counts, become the texture clim that
+        normalizes to v / vmax (`DisplayEncoding.texture_clim`): napari's
+        clim, MIP and colormap then work on linear counts. Needs the
+        GPU-scaled (texture_format "auto") texture napari uses."""
+
+        _func_templates = {
+            **VolumeNode._func_templates,
+            "texture_lookup_interpolated": _DECODED_INTERPOLATED_LOOKUP,
+            "texture_lookup": _DECODED_LOOKUP,
+        }
+
+        def __init__(
+            self, *args, vram=None, texture_format=None, encoding=None, **kwargs
+        ):
             self._vram = vram
             self._live_format = texture_format
             super().__init__(*args, texture_format=texture_format, **kwargs)
@@ -915,7 +1098,39 @@ def _register_live_renderer(live_image) -> None:
             self._filling = None  # [key, texture, next plane] being preloaded
             self._spare = None  # [texture, next plane]: pre-touched, for a new volume
             self._toucher = None  # (program, framebuffer) for _make_resident
+            self._encoding_of = encoding or (lambda: None)
+            self._encoding = None  # what the shader decodes now
+            self._counts_clim = None  # napari's contrast limits, in counts
             self.freeze()
+            self._set_decode(None)
+
+        def _set_decode(self, encoding) -> None:
+            self._encoding = encoding
+            power = float(encoding.power) if encoding is not None else 1.0
+            for fn in set(self._interpolation_fun.values()):
+                fn["decode_power"] = power
+            if self._counts_clim is not None:
+                self.clim = self._counts_clim
+
+        def _follow_encoding(self) -> None:
+            encoding = self._encoding_of()
+            if encoding != self._encoding:
+                self._set_decode(encoding)
+
+        @property
+        def clim(self):
+            return VolumeNode.clim.fget(self)
+
+        @clim.setter
+        def clim(self, value):
+            if getattr(self, "_encoding_of", None) is None:  # vispy's own init
+                VolumeNode.clim.fset(self, value)
+                return
+            self._counts_clim = tuple(value)
+            encoding = self._encoding
+            VolumeNode.clim.fset(
+                self, encoding.texture_clim(value) if encoding is not None else value
+            )
 
         def _bind(self, texture) -> None:
             current = self._texture
@@ -931,6 +1146,7 @@ def _register_live_renderer(live_image) -> None:
         def set_data(self, vol, clim=None, copy=True):
             if getattr(self, "_own_texture", None) is None:  # vispy's own init
                 return super().set_data(vol, clim=clim, copy=copy)
+            self._follow_encoding()
             key = served_key(vol) if self._vram is not None else None
             if key is None:
                 self._bind(self._own_texture)
@@ -1110,16 +1326,45 @@ def _register_live_renderer(live_image) -> None:
             return float(kb) * 1024
         return None
 
+    class LiveImageNode(ImageNode):
+        """napari's 2D image node, showing an 8-bit layer's slice decoded
+        to counts (float32, on the CPU: one plane is cheap)."""
+
+        def __init__(self, *args, encoding=None, **kwargs):
+            self._encoding_of = encoding or (lambda: None)
+            super().__init__(*args, **kwargs)
+
+        def set_data(self, image):
+            encoding = self._encoding_of()
+            if encoding is not None and getattr(image, "dtype", None) == np.uint8:
+                image = encoding.decode(image)
+            super().set_data(image)
+
     class LiveImageLayerNode(ImageLayerNode):
-        def __init__(self, custom_node=None, texture_format=None, vram=None):
+        def __init__(
+            self, custom_node=None, texture_format=None, vram=None, encoding=None
+        ):
             super().__init__(custom_node, texture_format=texture_format)
-            if vram is not None:
+            if encoding is not None:
+                self._image_node = LiveImageNode(
+                    (
+                        None
+                        if (texture_format is None or texture_format == "auto")
+                        else np.array([[0.0]], dtype=np.float32)
+                    ),
+                    method="auto",
+                    texture_format=texture_format,
+                    encoding=encoding,
+                )
+            if vram is not None or encoding is not None:
                 self._volume_node = LiveVolumeNode(
                     np.zeros((1, 1, 1), dtype=np.float32),
                     clim=[0, 1],
                     texture_format=texture_format,
                     vram=vram,
+                    encoding=encoding,
                 )
+            if vram is not None:
                 live_nodes.append(self._volume_node)
                 vram.in_use = _in_use
                 vram.free_vram = _free_vram
@@ -1131,7 +1376,9 @@ def _register_live_renderer(live_image) -> None:
                 node=node,
                 texture_format=texture_format,
                 layer_node_class=functools.partial(
-                    LiveImageLayerNode, vram=getattr(layer, "vram", None)
+                    LiveImageLayerNode,
+                    vram=getattr(layer, "vram", None),
+                    encoding=getattr(layer, "display_encoding", None),
                 ),
             )
             volume = self._layer_node._volume_node
@@ -1609,16 +1856,16 @@ class LiveFollower:
         return phases
 
     def _set_contrast(self, src: ChannelSource, layer) -> None:
-        """From every 4th voxel of the channel's newest timepoint (the empty
-        store it started from has no range to go on)."""
+        """From the channel's newest timepoint (the empty store it started
+        from has no range to go on); see `default_contrast`."""
         import numpy as np
 
         vol = src.load(max(src.has), 0)
         if vol is None:
             return
-        sub = np.asarray(vol[::4, ::4, ::4])
-        lo, hi = np.percentile(sub[sub > 0], [0.5, 99.9]) if sub.any() else (0, 300)
-        layer.contrast_limits = (float(lo), float(max(hi, lo + 1)))
+        layer.contrast_limits = default_contrast(
+            vol, src.encoding if vol.dtype == np.uint8 else None
+        )
         self._contrast_set.add(src.c)
 
     # --- the session's first build ----------------------------------------
@@ -1644,8 +1891,9 @@ class LiveFollower:
             visible=False,
             colormap=_COLORMAPS.get(color, "gray"),
             blending="additive",
-            contrast_limits=[0, 255 if src.bits == 8 else 300],
+            contrast_limits=[0, src.encoding.vmax if src.bits == 8 else 300],
             vram=self.vram,
+            encoding=lambda: src.encoding,
         )
         layer._slice_dims(self.viewer.dims)
         layer.visible = True

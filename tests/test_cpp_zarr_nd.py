@@ -200,10 +200,12 @@ def test_live_outputs_without_a_view_buffer(eng, tmp_path):
 
 
 def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
-    """With a shift, the view buffer is uint8 min(v >> shift, 255) -- what
-    naparym-live shows -- while every store level stays the exact 16-bit
-    volume. Calls alternate 16-bit and 8-bit into one directory (the readied
-    next buffer must not be reused at the wrong size), after an 8-bit
+    """With a LUT, the view buffer is uint8 lut[v] -- the square-root curve
+    naparym-live decodes, bit for bit the viewer's own -- and an older
+    caller's scalar shift still gives min(v >> shift, 255), while every
+    store level stays the exact 16-bit volume. Calls alternate 16-bit and
+    8-bit into one directory (the readied next buffer must not be reused at
+    the wrong size), after an 8-bit
     'prepare' as the warm-up does."""
     import matlab
 
@@ -220,9 +222,13 @@ def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
         8.0,
         nargout=0,
     )
+    from opym.live_view import DisplayEncoding
+
+    lut = DisplayEncoding.sqrt().lut()
     rng = np.random.default_rng(3)
-    for t, c, shift in ((0, 0, 1.0), (1, 0, None), (1, 1, 3.0)):
+    for t, c, shift in ((0, 0, "lut"), (1, 0, None), (1, 1, 3.0), (0, 1, "lut")):
         vol = rng.integers(0, 700, shape, dtype=np.uint16)
+        vol.flat[:3] = (4095, 5000, 65535)  # the top of the curve, and above
         npy = view_dir / f"T{t}_C{c}.npy"
         args = [
             matlab.uint16(np.ascontiguousarray(vol.transpose(1, 2, 0))),
@@ -231,7 +237,9 @@ def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
             str(arrs.mip),
             matlab.double([t + 1, c + 1]),
         ]
-        if shift is not None:
+        if shift == "lut":
+            args.append(matlab.uint8(lut.tolist()))
+        elif shift is not None:
             args.append(shift)
         eng.opymWriteLiveOutputs(*args, nargout=1)
         view = np.load(npy, mmap_mode="r")
@@ -239,6 +247,9 @@ def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
         if shift is None:
             assert view.dtype == np.uint16
             np.testing.assert_array_equal(view, vol)
+        elif shift == "lut":
+            assert view.dtype == np.uint8
+            np.testing.assert_array_equal(view, lut[vol])
         else:
             assert view.dtype == np.uint8
             want = np.minimum(vol >> int(shift), 255).astype(np.uint8)
@@ -257,5 +268,15 @@ def test_live_outputs_with_an_8bit_view_buffer(eng, tmp_path):
             str(arrs.mip),
             matlab.double([1, 1]),
             16.0,
+            nargout=1,
+        )
+    with pytest.raises(Exception, match="lut must be"):
+        eng.opymWriteLiveOutputs(
+            matlab.uint16(np.zeros((shape[1], shape[2], shape[0]), np.uint16)),
+            str(view_dir / "bad.npy"),
+            [str(p) for p in arrs.levels],
+            str(arrs.mip),
+            matlab.double([1, 1]),
+            matlab.uint8(lut[:100].tolist()),
             nargout=1,
         )

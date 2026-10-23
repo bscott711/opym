@@ -56,7 +56,7 @@ Argus (micro001)                                          v
      -> opymWriteLiveOutputs: view buffer .npy FIRST, then the processed store
      │
      ├──> buffers/T<tttt>_C<c>.npy on /dev/shm (uncompressed 8-bit, 419 × 1458 × 833, 0.51 GB;
-     │        each channel's shift in buffers/display_C<c>.json)
+     │        the square-root encoding recorded in buffers/display_C<c>.json)
      │        └──> naparym-live (mmap, full resolution, 3D, 8-bit) ──> DCV ──> your screen
      └──> processed OME-Zarr on /dev/shm (bioformats2raw layout 3: 3 levels + Z-MIP)
               └──> archived per (t, c) to <leaf>/viewer/<base>_dsr.ome.zarr on GPFS
@@ -131,7 +131,8 @@ steady one does.
 | **Live queue first, lease, preemption** | Streaming always has a GPU. A backfill server is killed and its ticket requeued when live work has none. | Waiting for backfill tickets, which run for minutes. |
 | **View buffer before the store** | The viewer maps the uncompressed volume; it never waits on encoding. | The viewer decoding 1 GB per channel from the compressed store every timepoint. |
 | **Full resolution in the viewer** | napari's 3D view only ever renders a multiscale's coarsest level. | Multiscale layers (a quarter of the resolution). |
-| **8-bit display, written by the GPU server** | Half the bytes to write, map and upload: last plane → painted 0.73 → 0.63 s p50, scrubbing ~35% faster. Side by side on DCV, 16-bit and 8-bit looked the same: the processed data spans ~60–800 counts, and each channel keeps ≥ 120 grey levels below its display window (a per-session power-of-two shift, `display_C<c>.json`). The stores stay 16-bit. | Converting in the viewer (paint 0.13 → 0.07 s, but the conversion cost as much on the UI thread). |
+| **8-bit display, written by the GPU server** | Half the bytes to write, map and upload: last plane → painted 0.73 → 0.63 s p50, scrubbing ~35% faster. The stores stay 16-bit. | Converting in the viewer (paint 0.13 → 0.07 s, but the conversion cost as much on the UI thread). |
+| **…by the square root, decoded on the GPU** (2026-10-23) | 8 bits hold `round(255·√(v/4095))`; the volume shader squares it back, so contrast limits and the image stay linear counts. The step (0.5√v) follows the data's own noise (≈0.45√v, measured), so rounding adds ~⅓ of it at every level, and nothing below 4095 clips. On WT_Stim_001 t=9 the decoded Z-MIP matched 16-bit to ≤ 6 counts. The default contrast top is the 99.9th percentile of the Z-MIP (what a MIP render shows). | The per-session power-of-two shift it replaced (`min(v >> shift, 255)`, fixed by the first volume's 99.9th voxel percentile): that cell got shift 0, so every count above 255 was flat — 7% of its projection clipped, and 16% white under the voxel-percentile contrast, i.e. the cell looked saturated. |
 | **FFT-friendly decon sizes** | cuFFT is slow on large primes (161 = 7 × 23): padding to 162 takes the decon from 0.21 to 0.19 s. Differences ≤ 14 counts at a few voxels; live and batch both pad. | Unpadded (the archives before 2026-09-27). |
 | **No VRAM texture cache by default** (`--vram-gb`) | Measured: a cached timepoint still costs ~0.1 s per step (after the upload, not paging), and once dozens of textures exist, misses slow from 0.14 to ~0.4 s. | On by default (the fixes and a residency draw are in; it stays opt-in). |
 | **Session warm-up and shared PSF cache; no GPU reset between live tickets** | The first timepoint costs what the others do; cached OTFs and FFT plans are reused. | Resetting the GPU after each ticket (about 0.3 s, and loses the caches). |

@@ -20,6 +20,7 @@ import zarr
 from numcodecs import Blosc
 
 from opym.decon_config import deskew_decon_kwargs
+from opym.live_view import DisplayEncoding
 from opym.ome_zarr_writer import downsample2, level_shapes
 from opym.petakit import (
     live_zarr_parameters,
@@ -55,7 +56,11 @@ def eng(matlab_engine):
 def test_the_engine_runs_opyms_patches_not_the_shared_copies(eng):
     """What the servers run: patches/ shadows the shared PetaKit5D install
     (run_petakit_server.m adds it after setup.m)."""
-    for fn in ("decon_lucy_omw_function", "decon_lucy_function", "XR_deskewRotateFrame"):
+    for fn in (
+        "decon_lucy_omw_function",
+        "decon_lucy_function",
+        "XR_deskewRotateFrame",
+    ):
         where = eng.which(fn, nargout=1)
         assert "/opym/patches/" in where, (fn, where)
 
@@ -186,8 +191,8 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 tifffile.imread(dsr_dir / "MIPs" / f"{name}_MIP_z.tif"),
             )
             # The live viewer's copy: the same volume, memory-mapped as is,
-            # or at 8 bits (odd channels), scaled by the shift the channel's
-            # first volume fixed for the session.
+            # or at 8 bits (odd channels) by the square-root curve, recorded
+            # for the viewer -- bit for bit what the viewer would encode.
             view = np.load(tmp_path / "view" / f"T{t}_C{c}.npy", mmap_mode="r")
             assert view.flags.c_contiguous
             if c % 2 == 0:
@@ -196,16 +201,10 @@ def test_zarr_path_is_bit_identical_to_the_tiff_path(eng, tmp_path):
                 assert not (tmp_path / "view" / f"display_C{c}.json").exists()
             else:
                 rec = json.loads((tmp_path / "view" / f"display_C{c}.json").read_text())
-                if t == 0:  # the rule: 120 levels below the 99.9th percentile
-                    sub = level0[::4, ::4, ::4]
-                    sub = np.sort(sub[sub > 0])
-                    p999 = int(sub[-int(np.ceil(sub.size / 1000))])
-                    assert rec["p999"] == p999
-                    assert rec["shift"] == max(0, int(np.floor(np.log2(p999 / 120))))
+                encoding = DisplayEncoding.from_record(rec)
+                assert encoding == DisplayEncoding.sqrt()
                 assert view.dtype == np.uint8
-                np.testing.assert_array_equal(
-                    view, np.minimum(level0 >> rec["shift"], 255).astype(np.uint8)
-                )
+                np.testing.assert_array_equal(view, encoding.lut()[level0])
             level1 = downsample2(level0)
             np.testing.assert_array_equal(out["0/1"][t, c], level1)
             np.testing.assert_array_equal(out["0/2"][t, c], downsample2(level1))

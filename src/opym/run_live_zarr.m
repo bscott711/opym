@@ -35,10 +35,10 @@ function stats = run_live_zarr(p, numCPUs)
 %                   decode). It lands before the compressed store is written,
 %                   so the view never waits on encoding.
 %   view_bits       optional, 16 (default) or 8: an 8-bit view buffer holds
-%                   min(v >> shift, 255), what naparym-live shows. The shift
-%                   is fixed per channel for the session by its first volume
-%                   and shared through <view dir>/display_C<c>.json (see
-%                   displayShift below and naparym-live's DISPLAY_LEVELS).
+%                   round(255 * sqrt(min(v, 4095) / 4095)), the square-root
+%                   curve naparym-live decodes back to counts (see
+%                   displayLut below and opym.live_view.DisplayEncoding),
+%                   recorded in <view dir>/display_C<c>.json.
 %   psf_path, decon_dir (the session's work dir), plus a 'live' ticket's
 %                   decon and DSR fields
 %   psf_cache_dir   optional: where the generated PSF and OMW back projector
@@ -190,7 +190,7 @@ end
 % viewer shows, so its landing time is where the viewer's hops start.)
 outArgs = {dsr, viewNpy, levels, char(p.mip), [t + 1, c + 1]};
 if ~isempty(viewNpy) && getp(p, 'view_bits', 16) == 8
-    outArgs{end + 1} = displayShift(dsr, fileparts(viewNpy), c);
+    outArgs{end + 1} = displayLut(fileparts(viewNpy), c);
 end
 tCall = posixtime(datetime('now', 'TimeZone', 'UTC'));
 tt = opymWriteLiveOutputs(outArgs{:});
@@ -219,45 +219,37 @@ zeroIdx = idx;
 end
 
 
-function k = displayShift(dsr, viewDir, c)
-% The right shift that takes channel c's volumes to the viewer's 8 bits:
-% the largest that keeps 120 grey levels below the 99.9th percentile of
-% every 4th nonzero voxel (naparym-live's DISPLAY_LEVELS rule). Fixed for
-% the session by the channel's first volume, so its intensities compare
-% across time, and shared with the other server and the viewer through
-% <view dir>/display_C<c>.json: whoever publishes first wins.
+function lut = displayLut(viewDir, c)
+% Every count's code in channel c's 8-bit view buffers: the square-root
+% curve, round(255 * sqrt(min(v, 4095) / 4095)) for v = 0..65535 (uint8),
+% as opym.live_view.DisplayEncoding.sqrt builds it. Its rounding adds about
+% a third of the data's own (shot-like) noise at every level, and nothing
+% below 4095 clips. The same for every channel and session; recorded in
+% <view dir>/display_C<c>.json so the viewer decodes it (whoever publishes
+% first wins). A session an older server started has a shift recorded
+% instead: its buffers keep that shift, so they and the record agree.
+persistent table
+if isempty(table)
+    v = min(0 : 65535, 4095);
+    table = uint8(round(255 * sqrt(v / 4095)));
+end
+lut = table;
 fn = fullfile(viewDir, sprintf('display_C%d.json', c));
-k = readShift(fn);
-if ~isempty(k), return; end
-sub = dsr(1 : 4 : end, 1 : 4 : end, 1 : 4 : end);
-sub = sub(sub > 0);
-k = 0;
-hi = 0;
-if ~isempty(sub)
-    % The 99.9th percentile as the smallest of the top 0.1%: maxk is linear.
-    hi = double(min(maxk(sub, max(1, ceil(numel(sub) / 1000)))));
-    k = max(0, floor(log2(max(hi, 1) / 120)));
+if exist(fn, 'file') == 2
+    try
+        rec = jsondecode(fileread(fn));
+        if isfield(rec, 'shift')
+            lut = uint8(min(bitshift(0 : 65535, -double(rec.shift)), 255));
+        end
+    catch
+    end
+    return;
 end
 tmp = sprintf('%s.%s.tmp', fn, get_uuid());
 fid = fopen(tmp, 'w');
-fprintf(fid, '{"shift": %d, "levels": 120, "p999": %g}\n', k, hi);
+fprintf(fid, '{"encoding": "sqrt", "vmax": 4095}\n');
 fclose(fid);
 publishOnce(tmp, fn, false);
-k = readShift(fn);
-end
-
-
-function k = readShift(fn)
-% The published shift, or [] if there is none yet (or it can't be read).
-k = [];
-if exist(fn, 'file') == 2
-    try
-        s = jsondecode(fileread(fn));
-        k = double(s.shift);
-    catch
-        k = [];
-    end
-end
 end
 
 
