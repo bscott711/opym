@@ -38,6 +38,8 @@ _OUTPUT_DIR_NAMES = frozenset(
         # Other convenience output written beside the crop/deskew stages.
         "viewer",
         "decon_qc",
+        # The live lane's QC sidecars (per-frame projections, verdicts).
+        "qc",
         # Earlier acquisitions a new one reused the name of
         # (opym.stream.receiver._supersede): kept, never processed.
         ".superseded",
@@ -141,8 +143,10 @@ def find_channel_zarr_stores(leaf_dir: Path) -> list[Path]:
 # "bead". Verified against every real example seen so far (mScarlet_561,
 # GFP_488, ...); a name that doesn't match this shape falls back to being
 # its own singleton group (see parse_zarr_group_prefix) rather than
-# guessing wrong.
-_ZARR_CHANNEL_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)_(?P<channel>[A-Za-z]+)_(?P<wavelength>\d+)$")
+# guessing wrong. Since 2026-10-22 the channel presets carry the unit
+# ("mNG_488nm"); without the optional "nm" those stores grouped under their
+# full name, not the sample name the live lane uses for the dataset folder.
+_ZARR_CHANNEL_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)_(?P<channel>[A-Za-z]+)_(?P<wavelength>\d+)(?:nm)?$")
 
 
 def parse_zarr_group_prefix(zarr_store: Path) -> str:
@@ -207,7 +211,14 @@ def walk_leaf_datasets(root: Path) -> Iterator[tuple[Path, str]]:
             dirnames[:] = []
         elif is_zarr_leaf_dataset_dir(current):
             yield current, KIND_ZARR_PRECROPPED
-            dirnames[:] = []
+            # Unlike an OME-TIF leaf, keep descending: stores can sit in a
+            # folder that also holds whole acquisitions (on 2026-10-14 a set
+            # landed straight in the microscopy root, and stopping here hid
+            # every dated acquisition below it for 9 days). Never walk into a
+            # store, or into a sample's own output dir (`<prefix>/`: viewer,
+            # qc, decon_stage, ...).
+            prefixes = group_channel_zarr_stores(current)
+            dirnames[:] = [d for d in dirnames if not d.endswith(".zarr") and d not in prefixes]
 
 
 def discover_leaf_datasets(roots: Sequence[Path]) -> list[LeafDataset]:
