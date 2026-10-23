@@ -97,7 +97,6 @@ def main() -> None:
     scale = group.attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][
         0
     ]["scale"][2:]
-    sqrt = live_view.DisplayEncoding.sqrt()
     report: dict = {"store": str(store), "t": args.t, "channels": {}}
     cells: list[list[tuple]] = [[], [], []]  # per cell: (name, data, enc, clim, color)
     for c in range(arr.shape[1]):
@@ -105,12 +104,15 @@ def main() -> None:
         shift = old_shift(vol)
         before = live_view.DisplayEncoding.linear(shift)
         old8 = before.lut()[vol]
+        # the session's curve: fixed by its first volume, as the server does
+        sqrt = live_view.DisplayEncoding.sqrt_for(np.asarray(arr[0, c]))
         new8 = live_view.to_8bit(vol, sqrt)
         clim_before = old_contrast(old8, shift)
         clim_now = live_view.default_contrast(new8, sqrt)
         nz = vol[vol > 0]
         report["channels"][c] = {
             "shift_before": shift,
+            "sqrt_vmax": sqrt.vmax,
             "max_count": int(vol.max()),
             "frac_voxels_clipped_before": round(float((nz > (255 << shift)).mean()), 5),
             "contrast_before": [round(v, 1) for v in clim_before],

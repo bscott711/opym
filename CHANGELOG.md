@@ -8,6 +8,11 @@ change behaviour).
 ## [Unreleased]
 
 ### Fixed
+- The square-root 8-bit view's ceiling (`vmax`) is fixed per channel and session by the first volume (2^k − 1 ≥ 2× its
+  maximum, within [4095, 65535]; `DisplayEncoding.sqrt_for`) instead of 4095: deconvolved data passes 12 bits, and
+  Gapvd1_Stim_002 (up to ~8000 counts) had 28% of its projection flattened at the fixed 12-bit ceiling. The server
+  publishes the record with `link(2)`, so two servers can never encode by different ceilings, and the contrast slider
+  reaches the channel's ceiling.
 - naparym-live's 8-bit display no longer saturates. The 8-bit view buffers hold each count by its square root
   (`round(255·√(v/4095))`, `live_view.DisplayEncoding`, written by `run_live_zarr.m` through a LUT in
   `opymWriteLiveOutputs`) and the volume shader decodes them back to linear counts, so nothing below 4095 clips and

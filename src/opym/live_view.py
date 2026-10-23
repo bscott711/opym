@@ -137,17 +137,21 @@ _DECODED_INTERPOLATED_LOOKUP = """
     }"""
 # Volumes are shown as 8-bit by default (`--bits`): half the bytes to upload
 # to the GPU, cache in RAM and keep as textures. The 8 bits hold a count v by
-# its square root, code = round(255 * sqrt(v / SQRT_VMAX)) (`DisplayEncoding`),
+# its square root, code = round(255 * sqrt(v / vmax)) (`DisplayEncoding`),
 # and the GPU squares it back, so what is shown -- and the contrast limits --
-# are linear counts. One curve for every channel and session. The noise in
-# the processed data grows like sqrt(v) (2026-10-23, WT_Stim_001: neighbour-
-# difference sd 1.2 at 7 counts, 4.6 at 60, 13.3 at 225), and so does this
-# curve's step (0.5 sqrt(v)): its rounding adds ~0.3x the noise at every
-# level, counts 0-7 keep codes of their own, and nothing below 4095 clips.
-# (The scheme 12-bit space cameras use to send 8 bits.) It replaced a linear
-# right shift fixed by each session's first volume, which flattened every
-# count above 255 << shift: 7% of that cell's projection. The stores stay
-# 16-bit; only what the viewer holds and uploads changes.
+# are linear counts. The noise in the processed data grows like sqrt(v)
+# (2026-10-23, WT_Stim_001: neighbour-difference sd 1.2 at 7 counts, 4.6 at
+# 60, 13.3 at 225), and so does this curve's step (2 sqrt(v * vmax) / 255):
+# at vmax 4095 its rounding adds ~0.3x the noise at every level and counts
+# 0-7 keep codes of their own. (The scheme 12-bit space cameras use to send 8
+# bits.) The deconvolved data isn't 12-bit, though: a bright cell
+# (Gapvd1_Stim_002) reaches ~8000 counts. So vmax is fixed per channel and
+# session (`DisplayEncoding.sqrt_for`) at the first volume's maximum with 2x
+# headroom, rounded up to 2^k - 1, never below SQRT_VMAX (the dim cells'
+# precision) nor above 65535. It replaced a linear right shift fixed by the
+# first volume's 99.9th voxel percentile, which flattened every count above
+# 255 << shift: 7% of WT_Stim_001's projection, 28% of Gapvd1_Stim_002's.
+# The stores stay 16-bit; only what the viewer holds and uploads changes.
 SQRT_VMAX = 4095
 # The default contrast top: this percentile of the newest volume's Z-MIP --
 # a MIP render shows projections, and the voxel percentile it replaced (most
@@ -266,8 +270,20 @@ class DisplayEncoding:
         self._lut = None
 
     @classmethod
-    def sqrt(cls) -> DisplayEncoding:
-        return cls(2, SQRT_VMAX)
+    def sqrt(cls, vmax: float = SQRT_VMAX) -> DisplayEncoding:
+        return cls(2, vmax)
+
+    @classmethod
+    def sqrt_for(cls, vol) -> DisplayEncoding:
+        """The square-root curve for a channel whose first volume is `vol`:
+        vmax = 2^k - 1 >= 2 * its maximum, within [SQRT_VMAX, 65535]. As
+        run_live_zarr.m's displayLut picks it."""
+        import numpy as np
+
+        top = 2 * int(np.max(vol)) + 1 if np.size(vol) else 0
+        return cls.sqrt(
+            min(65535, max(SQRT_VMAX, 2 ** math.ceil(math.log2(max(top, 1))) - 1))
+        )
 
     @classmethod
     def linear(cls, shift: int) -> DisplayEncoding:
@@ -596,7 +612,9 @@ class ChannelSource:
             return arr
         with self._encoding_lock:
             if self._encoding is None:
-                self._encoding = self._published_encoding() or DisplayEncoding.sqrt()
+                self._encoding = self._published_encoding() or DisplayEncoding.sqrt_for(
+                    arr
+                )
             encoding = self._encoding
         return to_8bit(arr, encoding, background=background)
 
@@ -1863,9 +1881,11 @@ class LiveFollower:
         vol = src.load(max(src.has), 0)
         if vol is None:
             return
-        layer.contrast_limits = default_contrast(
-            vol, src.encoding if vol.dtype == np.uint8 else None
-        )
+        encoding = src.encoding if vol.dtype == np.uint8 else None
+        if encoding is not None:  # the slider reaches the channel's top
+            top = max(layer.contrast_limits_range[1], encoding.vmax)
+            layer.contrast_limits_range = (0, top)
+        layer.contrast_limits = default_contrast(vol, encoding)
         self._contrast_set.add(src.c)
 
     # --- the session's first build ----------------------------------------

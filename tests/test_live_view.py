@@ -916,6 +916,34 @@ def test_the_old_linear_shift_fails_the_same_check():
     assert shown[4095] == 255
 
 
+def test_the_sqrt_ceiling_is_fixed_by_the_first_volume_with_headroom():
+    """The deconvolved data passes 12 bits (Gapvd1_Stim_002 reached ~8000
+    counts): vmax is 2^k - 1 >= 2x the first volume's maximum, never below
+    4095 (the dim cells' precision) nor above 65535."""
+    sqrt_for = live_view.DisplayEncoding.sqrt_for
+    for top, vmax in (
+        (0, 4095),
+        (639, 4095),
+        (2047, 4095),
+        (2048, 8191),
+        (7990, 16383),
+        (40000, 65535),
+        (65535, 65535),
+    ):
+        vol = np.zeros((4, 4, 4), np.uint16)
+        vol[1, 2, 3] = top
+        assert sqrt_for(vol).vmax == vmax, top
+    bright = np.array([0, 1, 4000, 7990, 15000], np.uint16).reshape(-1, 1, 1)
+    enc = sqrt_for(bright[:4])
+    shown = enc.decode(live_view.to_8bit(bright, enc)).ravel()
+    half_step = np.sqrt(bright.ravel() * enc.vmax) / 255 + 0.1
+    assert np.all(np.abs(shown - bright.ravel()) <= half_step)  # 15000 too
+    # negative control: the fixed 12-bit curve flattens that cell's top
+    fixed = live_view.DisplayEncoding.sqrt()
+    assert fixed.decode(live_view.to_8bit(bright, fixed)).max() == 4095
+    assert live_view.DisplayEncoding.from_record(enc.record()) == enc
+
+
 def test_display_encodings_round_trip_through_their_records():
     sqrt = live_view.DisplayEncoding.sqrt()
     assert live_view.DisplayEncoding.from_record(sqrt.record()) == sqrt
@@ -974,6 +1002,28 @@ def test_an_8bit_viewer_shows_each_channel_by_the_sqrt_encoding(tmp_path):
     assert abs(gfp.contrast_limits[1] - 960) < 8  # counts, from t=1's MIP
     assert gfp.contrast_limits_range[1] >= 4095
     assert follower.sources[0]._levels[0].dtype == np.uint16  # the store
+
+
+def test_a_bright_channel_is_not_clipped_at_4095(tmp_path):
+    """No server record (a store read by the viewer itself): its curve comes
+    from the first volume it encodes, so a channel reaching 7990 counts
+    shows them."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+
+    store = _store(tmp_path)
+    vol = np.full((8, 16, 12), 300, np.uint16)
+    vol[4, 8, 6] = 7990
+    for c in range(2):
+        w.write_timepoint(store, 0, c, vol)
+    w.write_progress(store, n_t=3, n_c=2, done=[[0, 0], [0, 1]], state="running")
+    cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
+    follower = live_view.LiveFollower(ViewerModel(), store, cache=cache, follow=False)
+    src = follower.sources[0]
+    shown = src.load(0, 0)
+    assert src.encoding.vmax == 16383
+    assert abs(float(src.encoding.decode(shown.max())) - 7990) < 12
+    assert follower.layers[0].contrast_limits_range[1] >= 16383  # slider reach
 
 
 def test_the_default_contrast_top_comes_from_the_mip(tmp_path):
