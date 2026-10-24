@@ -39,9 +39,9 @@ Per session:
   frames are skipped.
 
 The lane creates the dataset's GPFS leaf directory itself, before anything
-else writes there. `opym.utils.resolve_output_base` treats a leaf directory
-that doesn't exist yet as unwritable, so creating it first is what makes the
-lane and the backfill resolve the same output path.
+else writes there, so the lane and the backfill resolve the same output path
+(`opym.utils.resolve_output_base`) whatever else has or hasn't been created
+yet.
 """
 
 from __future__ import annotations
