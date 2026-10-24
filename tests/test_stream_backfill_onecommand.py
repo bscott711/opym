@@ -390,6 +390,56 @@ def test_the_logon_task_relaunches_the_launcher_script_when_that_started_the_sen
     assert svc.entry_arguments() == ["-m", "opym.stream.backfill_client"]
 
 
+@pytest.mark.parametrize(
+    ("python", "ephemeral"),
+    [
+        ("/home/u/.cache/uv/environments-v2/0f612892604ebfd9/bin/python", True),
+        (r"C:\Users\opm\AppData\Local\uv\cache\environments-v2\ab12\Scripts\python.exe", True),
+        (r"C:\Users\opm\opym\.venv-backfill\Scripts\python.exe", False),
+        ("/home/u/.local/share/uv/python/cpython-3.12/bin/python3", False),
+    ],
+)
+def test_uvs_throwaway_script_environments_are_recognised(python, ephemeral):
+    assert svc.is_ephemeral_env(python) is ephemeral
+
+
+FAKE_UV = """#!/bin/sh
+echo "$@" >> "$FAKE_UV_LOG"
+if [ "$1" = "venv" ]; then
+  for last; do :; done
+  mkdir -p "$last/bin" && : > "$last/bin/python" && chmod +x "$last/bin/python"
+fi
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake uv is a shell script")
+def test_a_logon_task_started_from_a_throwaway_env_gets_a_persistent_one_built_with_uv(tmp_path, monkeypatch):
+    uv = tmp_path / "uv"
+    uv.write_text(FAKE_UV)
+    uv.chmod(uv.stat().st_mode | stat.S_IEXEC)
+    log = tmp_path / "uv.log"
+    monkeypatch.setenv("FAKE_UV_LOG", str(log))
+    monkeypatch.setenv("OPYM_BACKFILL_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(svc, "is_ephemeral_env", lambda python=None: True)
+    monkeypatch.setattr(svc.shutil, "which", lambda name: str(uv))
+    py = svc.service_python()
+    assert py == str(tmp_path / "state" / "venv" / "bin" / "python")
+    first = log.read_text().splitlines()
+    assert first[0].startswith("venv --python") and first[0].endswith(str(tmp_path / "state" / "venv"))
+    assert first[1] == f"pip install --python {py} " + " ".join(svc.SENDER_REQUIREMENTS)
+    svc.service_python()                                    # a rerun refreshes, never rebuilds
+    assert [line.split()[0] for line in log.read_text().splitlines()] == ["venv", "pip", "pip"]
+
+
+def test_a_normal_environment_is_used_as_it_is_and_a_missing_uv_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(svc, "is_ephemeral_env", lambda python=None: False)
+    assert svc.service_python() == svc.task_python()
+    monkeypatch.setattr(svc, "is_ephemeral_env", lambda python=None: True)
+    monkeypatch.setattr(svc.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit, match="uv was not found"):
+        svc.service_python()
+
+
 LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "opym_backfill_send.py"
 
 
@@ -519,3 +569,13 @@ def test_a_second_sender_started_while_one_runs_is_refused_but_a_dry_run_is_not(
     with svc.SingleInstance():
         assert onecommand() == 2
         assert onecommand("--dry-run") == 0
+
+
+
+def test_the_launchers_inline_script_metadata_matches_the_requirements_the_service_installs():
+    text = (Path(__file__).resolve().parents[1] / "scripts" / "opym_backfill_send.py").read_text()
+    assert text.startswith("# /// script\n") and "\n# ///\n" in text
+    deps = json.loads(next(line for line in text.splitlines() if line.startswith("# dependencies = "))
+                      .split("=", 1)[1])
+    assert deps == svc.SENDER_REQUIREMENTS
+    assert 'requires-python = ">=3.10"' in text

@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["numpy", "zarr<3", "pyzmq", "msgpack", "numcodecs"]
+# ///
 # Ruff style: Compliant
 """Run `opym-backfill-send` from a checkout of this repo, with nothing else installed.
 
@@ -7,15 +11,15 @@ The sender needs only numpy, zarr<3, pyzmq, msgpack and numcodecs. Importing it 
 packages pointing at this checkout's `src/` and imports the sender directly. It always runs the
 code next to it, whatever else is installed.
 
-    python scripts\\opym_backfill_send.py --dry-run
-    python scripts\\opym_backfill_send.py            # S:\\ -> Argus, forever
-    python scripts\\opym_backfill_send.py --install  # start at every logon (Windows)
+    uv run --script scripts\\opym_backfill_send.py --dry-run
+    uv run --script scripts\\opym_backfill_send.py            # S:\\ -> Argus, forever
+    uv run --script scripts\\opym_backfill_send.py --install  # start at every logon (Windows)
 
-A small environment of its own keeps it clear of the acquisition software's:
-
-    py -3 -m venv .venv-backfill
-    .venv-backfill\\Scripts\\python -m pip install numpy "zarr<3" pyzmq msgpack numcodecs
-    .venv-backfill\\Scripts\\python scripts\\opym_backfill_send.py --dry-run
+The five packages are declared at the top of this file (inline script metadata), so `uv run --script`
+builds and caches a small environment of its own the first time: nothing to create or activate, and the
+acquisition software's environment is never touched. `--install` builds a persistent one with uv
+(`%LOCALAPPDATA%\\opym\\backfill-send\\venv`) for the logon task, since uv's cached script environments
+may be pruned.
 """
 
 from __future__ import annotations

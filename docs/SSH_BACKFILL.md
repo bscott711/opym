@@ -61,28 +61,23 @@ It binds 127.0.0.1:5556 only, at `Nice=15` / idle I/O class. Edit `OPYM_BACKFILL
 
 The sender needs only numpy, zarr<3, pyzmq, msgpack and numcodecs, and an `ssh` Host alias `Argus` that logs in
 without a prompt (key or agent). It runs from a checkout of this repo through `scripts/opym_backfill_send.py`, which
-does not import the rest of opym (the processing stack: ipywidgets, scikit-image, ...), so give it a small
-environment of its own, apart from the acquisition software's:
+does not import the rest of opym (the processing stack: ipywidgets, scikit-image, ...) and declares its five
+packages as inline script metadata, so [uv](https://docs.astral.sh/uv/) builds and caches a small environment of its
+own on first use. There is nothing to install or activate, and the acquisition software's environment is never touched:
 
 ```bat
 cd C:\Users\opm\opym
-py -3 -m venv .venv-backfill
-.venv-backfill\Scripts\python -m pip install numpy "zarr<3" pyzmq msgpack numcodecs
+uv run --script scripts\opym_backfill_send.py --dry-run     :: one pass: what would be sent, per folder (sends nothing)
+uv run --script scripts\opym_backfill_send.py               :: S:\ -> Argus, forever: tunnels, scanning, sending, retrying
+uv run --script scripts\opym_backfill_send.py --install     :: ... and start it at every logon, hidden, restarted if it dies
+uv run --script scripts\opym_backfill_send.py --status      :: is it running, what is it doing, how did the last pass go
+uv run --script scripts\opym_backfill_send.py --stop        :: stop it           (--uninstall also removes the logon task)
 ```
 
-After that one-time setup (`SEND` below stands for `.venv-backfill\Scripts\python scripts\opym_backfill_send.py`;
-where bioimaging is installed the same program is also the `opym-backfill-send` command), one command does the rest:
-
-```bat
-SEND --dry-run     :: one pass: what would be sent, per folder (sends nothing)
-SEND               :: S:\ -> Argus, forever: tunnels, scanning, sending, retrying
-SEND --install     :: ... and start it at every logon, hidden, restarted if it dies
-SEND --status      :: is it running, what is it doing, how did the last pass go
-SEND --stop        :: stop it           (--uninstall also removes the logon task)
-```
-
-`--install` records the interpreter and script it was started with, so the logon task runs the same ones; install
-from the environment you want it to keep using.
+(Where bioimaging is installed the same program is also the `opym-backfill-send` command.) `uv run --script`
+environments live in uv's cache, which `uv cache prune` may clear, so `--install` builds a persistent one with uv
+(`%LOCALAPPDATA%\opym\backfill-send\venv`, the same five packages) and points the logon task's `pythonw.exe` at that;
+running `--install` again only refreshes it.
 
 **Mapping.** The drive root mirrors `/mmfs1/scratch/jacks.local/microscopy` (change with `--remote-root` or
 `OPYM_BACKFILL_REMOTE_ROOT`): `S:\20261023_LCK-NG_JB\Cell_001\x.ome.zarr` goes to

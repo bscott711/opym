@@ -32,9 +32,10 @@ change behaviour).
   store names the receiver would refuse, and logs a per-pass summary and a per-folder table. `--install` registers a
   hidden Windows logon task (restarted if it dies, below-normal priority); the sender runs at background CPU/IO
   priority and only one can run per PC. `--status`, `--stop`, `--uninstall`, `--once`, `--rescan`, `--dry-run`.
-  `scripts/opym_backfill_send.py` runs it from a checkout without importing the rest of opym, so the PC needs
-  only numpy, zarr<3, pyzmq, msgpack and numcodecs (the `opym-backfill-send` command exists only where bioimaging
-  is installed).
+  `uv run --script scripts/opym_backfill_send.py` runs it from a checkout without importing the rest of opym:
+  its five packages (numpy, zarr<3, pyzmq, msgpack, numcodecs) are inline script metadata, so uv builds the
+  environment on first use (the `opym-backfill-send` command exists only where bioimaging is installed).
+  `--install` builds a persistent uv environment for the logon task rather than relying on uv's cache.
   Behaviour change: it now watches continuously by default (`--once` for a single pass) and a store the receiver
   refuses is reported under that store (`result: failed`) instead of failing its whole folder.
 - SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
 import socket
 import subprocess  # nosec B404 - schtasks/taskkill with fixed argv, never a shell
 import sys
@@ -195,6 +197,45 @@ def task_python() -> str:
     return str(exe)
 
 
+# What the sender imports; scripts/opym_backfill_send.py declares the same list as inline script metadata.
+SENDER_REQUIREMENTS = ["numpy", "zarr<3", "pyzmq", "msgpack", "numcodecs"]
+
+
+def is_ephemeral_env(python: str | None = None) -> bool:
+    """True for the throwaway environments `uv run --script` builds inside uv's cache
+    (`.../environments-v2/<hash>/`): fine for running by hand, but a logon task must not depend on
+    something `uv cache prune` is free to delete."""
+    return any(part.startswith("environments-v") for part in re.split(r"[\\/]+", str(python or sys.executable)))
+
+
+def service_python() -> str:
+    """The interpreter the logon task runs (`pythonw.exe` on Windows, so no console window).
+
+    The one running this process when it lives in a normal environment. When it is one of uv's
+    throwaway script environments, a persistent one is built with uv next to the sender's other
+    state files, and kept (a rerun only refreshes it).
+    """
+    if not is_ephemeral_env():
+        return task_python()
+    uv = shutil.which("uv")
+    if uv is None:
+        raise SystemExit("uv was not found on PATH; it is needed to build the sender's own environment")
+    venv = state_dir() / "venv"
+    bindir, name = ("Scripts", "python.exe") if sys.platform == "win32" else ("bin", "python")
+    exe = venv / bindir / name
+    steps = []
+    if not exe.exists():
+        steps.append([uv, "venv", "--python", sys.executable, str(venv)])
+    steps.append([uv, "pip", "install", "--python", str(exe), *SENDER_REQUIREMENTS])
+    for argv in steps:
+        done = subprocess.run(argv, capture_output=True, text=True, check=False)  # nosec B603 - uv, fixed argv
+        if done.returncode != 0:
+            raise SystemExit(f"could not build the sender's environment ({' '.join(argv[:3])}): "
+                             f"{(done.stderr or done.stdout).strip()}")
+    w = exe.with_name("pythonw.exe")
+    return str(w if w.exists() else exe)
+
+
 ENTRY_ENV = "OPYM_BACKFILL_ENTRY"
 
 
@@ -276,7 +317,7 @@ def install_task(arguments: list[str], start_now: bool = True) -> str:
     _require_windows("--install")
     user = os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
     user = user if len(user) > 1 else None
-    xml = task_xml(arguments, user=user, workdir=str(Path.home()))
+    xml = task_xml(arguments, python=service_python(), user=user, workdir=str(Path.home()))
     xml_file = state_dir() / "task.xml"
     xml_file.write_text(xml, encoding="utf-16")  # schtasks wants UTF-16 with a BOM
     done = _schtasks("/Create", "/TN", TASK_NAME, "/XML", str(xml_file), "/F")
