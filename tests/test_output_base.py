@@ -6,7 +6,7 @@ from opym import utils
 from opym.utils import resolve_output_base
 
 # The mirror reproduces an absolute POSIX path under its root (Argus only).
-pytestmark = pytest.mark.skipif(os.name != "posix", reason="mirror paths are POSIX paths")
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="mirror paths are POSIX")
 
 
 @pytest.fixture
@@ -42,12 +42,13 @@ def test_a_writable_leaf_is_its_own_output_base(world):
 
 def test_a_flat_folders_missing_leaf_goes_in_place_when_its_folder_is_writable(world):
     """`<day>/<base>_<channel>.ome.zarr` groups under `<day>/<base>`, which nothing
-    creates: its output belongs in place (where the live lane puts it), not the mirror."""
+    creates: its output belongs in place (where the live lane puts it), not in
+    the mirror."""
     day = world.raw / "20261023_LCK"
     (day / "WT_Stim_mNG_488nm.ome.zarr").mkdir(parents=True)
     leaf = day / "WT_Stim"
     assert resolve_output_base(leaf) == leaf
-    assert not leaf.exists()                                 # resolving never creates anything
+    assert not leaf.exists()  # resolving never creates anything
 
 
 def test_a_missing_leaf_under_an_unwritable_folder_is_mirrored(world):
@@ -79,5 +80,5 @@ def test_once_created_in_place_the_leaf_keeps_resolving_in_place(world):
     day.mkdir()
     leaf = day / "WT_Stim"
     base = resolve_output_base(leaf)
-    (base / "decon_stage").mkdir(parents=True)               # what the pipeline does next
+    (base / "decon_stage").mkdir(parents=True)  # what the pipeline does next
     assert resolve_output_base(leaf) == leaf
