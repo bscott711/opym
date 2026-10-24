@@ -1847,11 +1847,11 @@ class StreamReceiver:
                 if now - session.stall_warned_at >= _STALL_WARN_EVERY_S:
                     session.stall_warned_at = now
                     logger.warning(
-                        "Session %s (%s): no new data for %.0f min; the "
+                        "Session %s (%s): no new data for %s; the "
                         "microscope PC still reports in (%s)",
                         session.session_id,
                         session.base_name,
-                        quiet / 60,
+                        outcome.span(quiet),
                         client or "no details",
                     )
                 continue
@@ -1859,18 +1859,19 @@ class StreamReceiver:
                 reason = "stalled"
                 detail = (
                     f"the microscope PC kept reporting in but sent no new data "
-                    f"for {quiet / 60:.0f} min ({client or 'no details'})"
+                    f"for {outcome.span(quiet)} ({client or 'no details'})"
                 )
             elif hb is not None:
                 reason = "idle_timeout"
                 detail = (
-                    f"the microscope PC went silent: no data for {quiet / 60:.0f} "
-                    f"min and no heartbeat for {(now - hb) / 60:.0f} min"
+                    f"the microscope PC went silent: no data for "
+                    f"{outcome.span(quiet)} and no heartbeat for "
+                    f"{outcome.span(now - hb)}"
                     + (f"; it last reported {client}" if client else "")
                 )
             else:
                 reason = "idle_timeout"
-                detail = f"no new data from the microscope PC for {quiet / 60:.0f} min"
+                detail = f"no new data from the microscope PC for {outcome.span(quiet)}"
             self._idle_closed[session.session_id] = now
             self._finalize_session(session, reason=reason, detail=detail)
         for sid, at in list(self._idle_closed.items()):

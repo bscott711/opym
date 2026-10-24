@@ -34,6 +34,11 @@ REMEDY_IF_LONGER = (
 )
 
 
+def span(seconds: float) -> str:
+    """A duration for people: "45 s" under two minutes, else "12 min"."""
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
 def describe_client(status: dict[str, Any] | None) -> str:
     """One line from a client HEARTBEAT: links, backlog, last error."""
     if not status:
