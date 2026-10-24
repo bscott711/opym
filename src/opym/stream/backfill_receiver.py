@@ -14,13 +14,27 @@ Guarantees:
     and matched the sender's per-volume SHA-256. The root `.zattrs` is written after that, then
     `.opym_complete.json`, so an incomplete store never looks ready.
   * Destinations must lie under `OPYM_BACKFILL_RAW_ROOTS` (a colon-separated allowlist).
+
+Two exceptions keep "all of the data, once" true (2026-10-24):
+  * The live stream's own partial copy of a run (a store whose root `.zattrs` carries the
+    stream's `opym.session_id`, with no completion marker) is completed in place instead of
+    refused: its pixel array must match the sender's exactly, its pixel chunks are never
+    rewritten (only missing timepoints are added), the sender's small metadata files replace
+    the stream's, and the root `.zattrs` keeps the stream's `opym` tags. Every timepoint is
+    still read back against the sender's digests before the marker is written.
+  * A store that is absent where it is being sent but already lies elsewhere under the raw
+    roots (the same name, pixel array and, for a sampled timepoint, the same SHA-256) is
+    reported as a duplicate, so the sender skips it. Candidates come from the backfill
+    registry's folders (`OPYM_BACKFILL_REGISTRY_PATH`), listed at most every 10 min.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +52,12 @@ DEFAULT_BIND = "tcp://127.0.0.1:5556"
 _RAW_ROOTS_ENV = "OPYM_BACKFILL_RAW_ROOTS"
 _BIND_ENV = "OPYM_BACKFILL_BIND"
 _SETTLE_ENV = "OPYM_BACKFILL_SETTLE_SECONDS"
+_REGISTRY_ENV = "OPYM_BACKFILL_REGISTRY_PATH"
+INDEX_TTL_S = 600.0
+# What the live stream's store tagging looks like (opym.stream.rawmirror).
+_STREAM_TAG = "opym"
+# Pixel-array .zarray keys that decide what the chunk files mean.
+_PIXEL_KEYS = ("shape", "chunks", "dtype", "compressor", "filters", "order", "dimension_separator")
 DEFAULT_SETTLE_S = 900.0
 LOCK_STALE_S = 600.0
 
@@ -53,6 +73,7 @@ class BackfillReceiver:
         raw_roots: list[Path | str] | tuple[Path | str, ...] = (),
         settle_seconds: float | None = None,
         jobs_dir: Path | None = None,
+        registry_path: Path | str | None = None,
     ) -> None:
         self.raw_roots = [Path(r).resolve() for r in raw_roots]
         if not self.raw_roots:
@@ -60,6 +81,11 @@ class BackfillReceiver:
         env_settle = os.environ.get(_SETTLE_ENV)
         self.settle_s = settle_seconds if settle_seconds is not None else float(env_settle or DEFAULT_SETTLE_S)
         self.jobs_dir = jobs_dir
+        self.registry_path = Path(registry_path) if registry_path else (
+            Path(os.environ[_REGISTRY_ENV]) if os.environ.get(_REGISTRY_ENV) else None)
+        self._index: dict[str, list[Path]] = {}
+        self._index_at = float("-inf")
+        self._adopted: dict[Path, dict[str, Any]] = {}
         self.host = socket.gethostname()
         self._pending_zattrs: dict[Path, bytes] = {}
         self._arrays: dict[Path, zarr.Array] = {}
@@ -153,8 +179,104 @@ class BackfillReceiver:
             if not bfill.valid_store_name(name):
                 out[name] = {"state": bfill.CONFLICT, "reason": "bad store name"}
                 continue
-            out[name] = self._inspect_store(leaf / name, spec, header.get("client", ""))
+            info = self._inspect_store(leaf / name, spec, header.get("client", ""))
+            if info["state"] == bfill.ABSENT:
+                info.update(self._elsewhere(leaf / name, spec))
+            out[name] = info
         return {"kind": "inventory", "ok": True, "stores": out}
+
+    # ---- the same data elsewhere ---------------------------------------------------------
+    def _store_index(self) -> dict[str, list[Path]]:
+        """Store name -> every `*.ome.zarr` with that name in the registry's folders."""
+        if time.monotonic() - self._index_at < INDEX_TTL_S:
+            return self._index
+        self._index_at = time.monotonic()
+        if self.registry_path is None or not self.registry_path.exists():
+            logger.info("no backfill registry: duplicates elsewhere on Argus are not checked")
+            self._index = {}
+            return self._index
+        try:
+            conn = sqlite3.connect(f"file:{self.registry_path}?mode=ro", uri=True, timeout=10)
+            try:
+                rows = conn.execute(
+                    "SELECT master_file FROM datasets WHERE master_file LIKE '%.ome.zarr'"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            logger.exception("could not read the backfill registry")
+            return self._index
+        # A zarr dataset's channel stores sit beside its master store; TIFF folders (slow to
+        # list, thousands of files) hold no stores.
+        folders = {Path(master).parent for (master,) in rows if master}
+        index: dict[str, list[Path]] = {}
+        for folder in folders:
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for e in entries:
+                if e.name.endswith(".ome.zarr") and e.is_dir():
+                    index.setdefault(e.name, []).append(Path(e.path))
+        self._index = index
+        logger.info("store index: %d names in %d folders", len(index), len(folders))
+        return index
+
+    def _complete_ts(self, dest: Path, main_rel: str, spec: dict) -> list[int]:
+        per_t = bfill.expected_chunks_per_t(spec["shape"], spec["chunks"]) if len(spec["shape"]) >= 4 else None
+        have = []
+        for t in spec.get("written_t", []):
+            if per_t is None:
+                continue
+            n, smallest = bfill.chunk_count_for_t(dest, main_rel, t)
+            if n == per_t and smallest > 0:
+                have.append(t)
+        return have
+
+    def _elsewhere(self, dest: Path, spec: dict) -> dict[str, Any]:
+        """Copies of this store under another folder: name and pixel array match. With the
+        sender's `probe` ({"t", "sha256"}), the one whose volume t matches is `duplicate_of`."""
+        found = []
+        for path in self._store_index().get(dest.name, []):
+            if path == dest or not bfill.safe_leaf(str(path.parent), self.raw_roots):
+                continue
+            main_rel = bfill.main_array_rel(path)
+            meta = self._read_zarray(path, main_rel) if main_rel else None
+            if meta is None or any(list(meta.get(k) or []) != list(spec.get(k) or [])
+                                   for k in ("shape", "chunks")) or meta.get("dtype") != spec.get("dtype"):
+                continue
+            marker = bfill.read_marker(path)
+            have = marker.get("written_t", []) if marker else self._complete_ts(path, main_rel, spec)
+            found.append((path, main_rel, have, marker is not None))
+        if not found:
+            return {}
+        out: dict[str, Any] = {"elsewhere": [{"path": str(p), "have_t": h, "marked": m} for p, _r, h, m in found]}
+        probe = spec.get("probe")
+        if probe:
+            t = int(probe["t"])
+            for path, main_rel, have, _m in found:
+                if t not in have:
+                    continue
+                arr = zarr.open_array(str(bfill.array_dir(path, main_rel)), mode="r")
+                vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+                if bfill.volume_digest(vol) == probe["sha256"]:
+                    out["duplicate_of"] = str(path)
+                    out["duplicate_have_t"] = have
+                    break
+        return out
+
+    # ---- the live stream's partial copy --------------------------------------------------
+    @staticmethod
+    def _stream_tag(dest: Path) -> dict | None:
+        """The live stream's tags if `dest` is its copy of a run (and not yet marked)."""
+        if bfill.read_marker(dest) is not None:
+            return None
+        try:
+            attrs = json.loads((dest / ".zattrs").read_text())
+        except (OSError, ValueError):
+            return None
+        tag = attrs.get(_STREAM_TAG) if isinstance(attrs, dict) else None
+        return tag if isinstance(tag, dict) and tag.get("session_id") else None
 
     def _inspect_store(self, dest: Path, spec: dict, client: str) -> dict[str, Any]:
         if not dest.exists():
@@ -185,7 +307,10 @@ class BackfillReceiver:
             n, smallest = bfill.chunk_count_for_t(dest, main_rel, t)
             if n == per_t and smallest > 0:
                 have.append(t)
-        return {"state": bfill.PARTIAL, "have_t": have}
+        out: dict[str, Any] = {"state": bfill.PARTIAL, "have_t": have}
+        if self._stream_tag(dest):
+            out["stream_copy"] = True
+        return out
 
     def _main(self, dest: Path) -> str | None:
         """The store's pixel-array path, cached: finding it walks the store."""
@@ -241,6 +366,8 @@ class BackfillReceiver:
             busy = self._guard_busy(dest, self._main(dest), client)
             if busy:
                 return {"kind": "meta", "ok": False, "error": busy["reason"], "state": busy["state"]}
+        tag = self._stream_tag(dest) if dest.exists() else None
+        main_rel = self._main(dest) if tag else None
         self._touch_lock(dest, client)
         marker = dest / bfill.MARKER_NAME
         if marker.exists():  # about to modify a store that was marked complete: it is not, any more
@@ -251,15 +378,33 @@ class BackfillReceiver:
                 return {"kind": "meta", "ok": False, "error": f"unsafe path {rel!r}"}
             target = dest / rel
             if rel == ".zattrs":
-                if target.exists() and target.read_bytes() != data:
+                if target.exists() and target.read_bytes() != data and not tag:
                     return {"kind": "meta", "ok": False, "error": ".zattrs exists and differs", "state": bfill.CONFLICT}
                 self._pending_zattrs[dest] = data   # written last, at commit
                 continue
             if target.exists():
                 if target.read_bytes() != data:
-                    return {"kind": "meta", "ok": False, "error": f"{rel} exists and differs", "state": bfill.CONFLICT}
+                    if not tag:
+                        return {"kind": "meta", "ok": False, "error": f"{rel} exists and differs",
+                                "state": bfill.CONFLICT}
+                    # The live stream's copy of this run: its pixel array must mean the same
+                    # bytes; its other small files give way to the acquisition's own.
+                    if main_rel and rel == f"{main_rel}/.zarray":
+                        try:
+                            mine, theirs = json.loads(target.read_text()), json.loads(data)
+                        except ValueError:
+                            mine, theirs = None, {}
+                        if mine is None or any(mine.get(k) != theirs.get(k) for k in _PIXEL_KEYS):
+                            return {"kind": "meta", "ok": False, "state": bfill.CONFLICT,
+                                    "error": "the live stream's copy has a different pixel array"}
+                        continue  # same pixels: keep it
+                    bfill.atomic_write(target, data)
+                    self._adopted.setdefault(dest, {"session_id": tag["session_id"], "replaced": []})[
+                        "replaced"].append(rel)
                 continue
             bfill.atomic_write(target, data)
+            if tag:
+                self._adopted.setdefault(dest, {"session_id": tag["session_id"], "replaced": []})
         return {"kind": "meta", "ok": True, "store": header["store"]}
 
     # ---- volumes ---------------------------------------------------------------------------
@@ -325,9 +470,20 @@ class BackfillReceiver:
         if bad:
             return {**base, "ok": False, "error": f"{len(bad)} volume(s) differ after readback", "mismatch": bad[:20]}
         zattrs = header.get("root_zattrs") or self._pending_zattrs.get(dest)
+        adopted = self._adopted.pop(dest, None)
+        tag = self._stream_tag(dest)
+        if zattrs is not None and tag:
+            # Completing the live stream's copy: the acquisition's attributes, keeping the
+            # stream's tags (other code finds the run's session by them).
+            try:
+                attrs = json.loads(zattrs)
+                attrs[_STREAM_TAG] = tag
+                zattrs = json.dumps(attrs, indent=4).encode()
+            except ValueError:
+                pass
+            adopted = adopted or {"session_id": tag["session_id"], "replaced": []}
         if zattrs is not None:
             bfill.atomic_write(dest / ".zattrs", zattrs)
-        import json
 
         marker = {
             "format": bfill.MARKER_FORMAT,
@@ -342,6 +498,9 @@ class BackfillReceiver:
             "manifest_sha256": bfill.manifest_digest(digests),
             "verified": "readback-sha256",
         }
+        if adopted:
+            # Completed the live stream's partial copy in place (no second copy).
+            marker["completed_stream_copy"] = adopted
         bfill.atomic_write(dest / bfill.MARKER_NAME, json.dumps(marker, indent=1).encode())
         (dest / bfill.LOCK_NAME).unlink(missing_ok=True)
         self._pending_zattrs.pop(dest, None)

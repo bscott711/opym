@@ -9,6 +9,7 @@ The contract under test:
 
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 import time
@@ -18,7 +19,6 @@ import numpy as np
 import pytest
 import zarr
 import zmq
-
 from opym import lanes
 from opym.stream import backfill_client as bc
 from opym.stream import bfill
@@ -161,8 +161,8 @@ def test_interrupted_run_resumes_sending_only_what_is_missing(world, monkeypatch
         real(key, header, payload, inflight, attempts)
 
     monkeypatch.setattr(c1, "_send_slab", flaky)
-    (rep,) = c1.run_once()
-    assert "simulated tunnel failure" in rep["error"]
+    res = leaf_report(c1.run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "refused" and "simulated tunnel failure" in res["reason"]
     dst = remote_store(world)
     assert bfill.read_marker(dst) is None
     assert not (dst / ".zattrs").exists()                   # an incomplete store never looks ready
@@ -311,8 +311,8 @@ def test_readback_mismatch_blocks_the_completion_marker(world, monkeypatch):
         return real_commit(header)
 
     monkeypatch.setattr(world.receiver, "_commit", tamper_then_commit)
-    (rep,) = world.client().run_once()
-    assert "differ after readback" in rep["error"]
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "refused" and "differ after readback" in res["reason"]
     dst = remote_store(world)
     assert bfill.read_marker(dst) is None and not (dst / ".zattrs").exists()
 
@@ -400,3 +400,139 @@ def test_the_marker_is_what_the_backfill_checks_for():
     """The marker format other code reads: pinned so a change is deliberate."""
     assert bfill.MARKER_NAME == ".opym_complete.json" and bfill.MARKER_FORMAT == 1
     assert bfill.read_marker(Path("/nonexistent/store")) is None
+
+
+# ---------------------------------------------------------------- one copy of everything (2026-10-24)
+
+
+def _as_stream_copy(store: Path, session_id: str = "0eff19b1") -> Path:
+    """What the live stream leaves when a run stops early: the same pixel layout, its own
+    root attributes tagged with its session, no coordinate extras, no backfill marker."""
+    root = zarr.open_group(str(store), mode="r+")
+    root.attrs.put({"multiscales": [{"version": "0.4", "datasets": [{"path": "p0"}]}],
+                    "opym": {"session_id": session_id, "output_format": "both"}})
+    return store
+
+
+def test_the_live_streams_partial_copy_is_completed_in_place(world):
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", written=(0, 1, 2), seed=7)
+    part = _as_stream_copy(make_store(remote_store(world), written=(0,), seed=7))
+    t0_chunk = part / "p0" / "0" / "0" / "0" / "0"
+    before = t0_chunk.read_bytes()
+    reports = world.client().run_once()
+    res = leaf_report(reports, src.name)
+    assert res["result"] == "complete" and res["sent_timepoints"] == 2  # only what was missing
+    assert arrays_equal(src, part)
+    assert t0_chunk.read_bytes() == before  # the stream's pixels are never rewritten
+    marker = bfill.read_marker(part)
+    assert marker["written_t"] == [0, 1, 2]
+    assert marker["completed_stream_copy"]["session_id"] == "0eff19b1"
+    attrs = zarr.open_group(str(part), mode="r").attrs.asdict()
+    assert attrs["opym"]["session_id"] == "0eff19b1"  # the stream's tags stay
+    assert attrs["multiscales"][0]["axes"]  # the acquisition's attributes win
+    assert sorted(p.name for p in (world.remote / "exp").iterdir()) == [src.name]  # one copy
+
+
+def test_dry_run_says_it_completes_the_stream_copy(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
+    _as_stream_copy(make_store(remote_store(world), written=(0,), seed=7))
+    res = leaf_report(world.client().run_once(dry_run=True), "cell_001_GFP_488.ome.zarr")
+    assert res == {"result": "would send", "missing_timepoints": 2, "of": 3, "completes_stream_copy": True}
+
+
+def test_a_stream_copy_with_a_different_pixel_layout_is_still_a_conflict(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
+    part = _as_stream_copy(make_store(remote_store(world), written=(0,), seed=7))
+    zarray = part / "p0" / ".zarray"
+    meta = json.loads(zarray.read_text())
+    meta["compressor"] = {"id": "zstd", "level": 1}  # same shape, different bytes on disk
+    zarray.write_text(json.dumps(meta))
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "refused" and "different pixel array" in res["reason"]
+
+
+def test_a_store_that_is_not_the_streams_with_other_metadata_is_still_refused(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
+    other = make_store(remote_store(world), written=(0,), seed=7)
+    zarr.open_group(str(other), mode="r+").attrs["note"] = "someone else's"
+    snapshot = (other / ".zattrs").read_bytes()
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "refused" and ".zattrs exists and differs" in res["reason"]
+    assert (other / ".zattrs").read_bytes() == snapshot
+
+
+@pytest.fixture
+def indexed(world, tmp_path):
+    """A second receiver that knows the registry's folders (for duplicates elsewhere)."""
+    import sqlite3
+
+    reg = tmp_path / "registry.sqlite3"
+    conn = sqlite3.connect(reg)
+    conn.execute("CREATE TABLE datasets (dataset_key TEXT, leaf_dir TEXT, master_file TEXT)")
+    conn.commit()
+    conn.close()
+    receiver = BackfillReceiver(bind_addr="tcp://127.0.0.1:0", raw_roots=[world.remote], settle_seconds=0,
+                                jobs_dir=world.jobs, registry_path=reg)
+    stop = threading.Event()
+    th = threading.Thread(target=lambda: [receiver._run_once(20) for _ in iter(stop.is_set, True)], daemon=True)
+    th.start()
+
+    def register(store: Path) -> None:
+        c = sqlite3.connect(reg)
+        leaf = str(store.parent / "x")
+        c.execute("INSERT INTO datasets VALUES (?, ?, ?)", (leaf, leaf, str(store)))
+        c.commit()
+        c.close()
+
+    def client(**kw):
+        kw.setdefault("settle_s", 0)
+        kw.setdefault("reply_timeout_s", 10)
+        return bc.BackfillClient([receiver.endpoint], [(world.local, str(world.remote))], **kw)
+
+    yield receiver, register, client
+    stop.set()
+    th.join(timeout=2)
+    receiver.close()
+
+
+def test_the_same_data_in_another_folder_is_not_sent_again(world, indexed):
+    """E.g. a run that reached Argus by Globus under DataUpload/: never a second copy."""
+    _receiver, register, client = indexed
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
+    elsewhere = make_store(world.remote / "globus" / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
+    register(elsewhere)
+    c = client()
+    try:
+        res = leaf_report(c.run_once(dry_run=True), src.name)
+        assert res == {"result": "already on Argus", "at": str(elsewhere), "has": 3, "of": 3}
+        res = leaf_report(c.run_once(), src.name)
+        assert res["result"] == "already on Argus"
+    finally:
+        c.close()
+    assert not remote_store(world).exists()
+
+
+def test_a_different_run_with_the_same_name_elsewhere_is_sent(world, indexed):
+    """Cell_001 recurs across experiments: the name alone proves nothing."""
+    _receiver, register, client = indexed
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
+    register(make_store(world.remote / "older" / "cell_001_GFP_488.ome.zarr", seed=10))
+    c = client()
+    try:
+        assert leaf_report(c.run_once(), src.name)["result"] == "complete"
+    finally:
+        c.close()
+    assert arrays_equal(src, remote_store(world))
+
+
+def test_a_partial_copy_elsewhere_is_reported_not_duplicated(world, indexed):
+    _receiver, register, client = indexed
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
+    register(make_store(world.remote / "globus" / "exp" / "cell_001_GFP_488.ome.zarr", written=(0,), seed=9))
+    c = client()
+    try:
+        res = leaf_report(c.run_once(), src.name)
+    finally:
+        c.close()
+    assert res["result"] == "partial copy elsewhere" and res["has"] == 1 and res["of"] == 3
+    assert not remote_store(world).exists()

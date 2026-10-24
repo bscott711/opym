@@ -274,6 +274,7 @@ class BackfillClient:
         inv = self._request(bfill.BF_INVENTORY, {"leaf": remote, "stores": [s.spec() for s in ready]}, "inventory")
         if not inv.get("ok"):
             raise BackfillError(f"inventory refused for {remote}: {inv.get('error')}")
+        self._probe_elsewhere(remote, ready, inv["stores"])
         for s in ready:
             info = inv["stores"].get(s.name, {})
             state = info.get("state")
@@ -281,13 +282,51 @@ class BackfillClient:
                 report["stores"][s.name] = {"result": "already complete"}
             elif state in (bfill.BUSY, bfill.CONFLICT):
                 report["stores"][s.name] = {"result": state, "reason": info.get("reason")}
+            elif info.get("duplicate_of"):
+                # The same data is already on Argus under another folder: never a second copy.
+                whole = set(s.written_t) <= set(info.get("duplicate_have_t", []))
+                report["stores"][s.name] = {
+                    "result": "already on Argus" if whole else "partial copy elsewhere",
+                    "at": info["duplicate_of"],
+                    "has": len(info.get("duplicate_have_t", [])), "of": len(s.written_t)}
+            elif set(s.written_t) <= set(info.get("have_t", [])):
+                # The live stream brought it in whole; nothing to send.
+                report["stores"][s.name] = {"result": "already on Argus"}
             elif dry_run:
                 missing = [t for t in s.written_t if t not in set(info.get("have_t", []))]
                 report["stores"][s.name] = {"result": "would send", "missing_timepoints": len(missing),
                                             "of": len(s.written_t)}
+                if info.get("stream_copy"):
+                    report["stores"][s.name]["completes_stream_copy"] = True
             else:
-                report["stores"][s.name] = self._sync_store(remote, s, set(info.get("have_t", [])))
+                try:
+                    report["stores"][s.name] = self._sync_store(remote, s, set(info.get("have_t", [])))
+                except BackfillError as exc:
+                    # One refused store must not hide what the others did.
+                    logger.error("%s: %s", s.name, exc)
+                    report["stores"][s.name] = {"result": "refused", "reason": str(exc)}
         return report
+
+    def _probe_elsewhere(self, remote: str, stores: list[LocalStore], infos: dict) -> None:
+        """For stores Argus has under another folder, send one volume's digest so it can tell
+        the same data from a different run that shares the name. Updates `infos` in place."""
+        probes = []
+        for s in stores:
+            info = infos.get(s.name, {})
+            cands = info.get("elsewhere") or []
+            t = next((t for t in s.written_t if any(t in c.get("have_t", []) for c in cands)), None)
+            if t is None:
+                continue
+            arr = s.array()
+            vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+            probes.append({**s.spec(), "probe": {"t": t, "sha256": bfill.volume_digest(vol)}})
+        if not probes:
+            return
+        inv = self._request(bfill.BF_INVENTORY, {"leaf": remote, "stores": probes}, "inventory")
+        if inv.get("ok"):
+            for name, info in inv["stores"].items():
+                if info.get("duplicate_of"):
+                    infos[name] = info
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict:
         t_start = time.monotonic()
