@@ -59,16 +59,30 @@ It binds 127.0.0.1:5556 only, at `Nice=15` / idle I/O class. Edit `OPYM_BACKFILL
 
 ## Acquisition PC
 
-Same environment as `opym-stream-watch` (opym with `zmq`, `msgpack`, `numcodecs`, `zarr`), and an `ssh` Host alias
-`Argus` that logs in without a prompt (key or agent). One command does the rest:
+The sender needs only numpy, zarr<3, pyzmq, msgpack and numcodecs, and an `ssh` Host alias `Argus` that logs in
+without a prompt (key or agent). It runs from a checkout of this repo through `scripts/opym_backfill_send.py`, which
+does not import the rest of opym (the processing stack: ipywidgets, scikit-image, ...), so give it a small
+environment of its own, apart from the acquisition software's:
 
 ```bat
-opym-backfill-send --dry-run     :: one pass: what would be sent, per folder (sends nothing)
-opym-backfill-send               :: S:\ -> Argus, forever: tunnels, scanning, sending, retrying
-opym-backfill-send --install     :: ... and start it at every logon, hidden, restarted if it dies
-opym-backfill-send --status      :: is it running, what is it doing, how did the last pass go
-opym-backfill-send --stop        :: stop it           (--uninstall also removes the logon task)
+cd C:\Users\opm\opym
+py -3 -m venv .venv-backfill
+.venv-backfill\Scripts\python -m pip install numpy "zarr<3" pyzmq msgpack numcodecs
 ```
+
+After that one-time setup (`SEND` below stands for `.venv-backfill\Scripts\python scripts\opym_backfill_send.py`;
+where bioimaging is installed the same program is also the `opym-backfill-send` command), one command does the rest:
+
+```bat
+SEND --dry-run     :: one pass: what would be sent, per folder (sends nothing)
+SEND               :: S:\ -> Argus, forever: tunnels, scanning, sending, retrying
+SEND --install     :: ... and start it at every logon, hidden, restarted if it dies
+SEND --status      :: is it running, what is it doing, how did the last pass go
+SEND --stop        :: stop it           (--uninstall also removes the logon task)
+```
+
+`--install` records the interpreter and script it was started with, so the logon task runs the same ones; install
+from the environment you want it to keep using.
 
 **Mapping.** The drive root mirrors `/mmfs1/scratch/jacks.local/microscopy` (change with `--remote-root` or
 `OPYM_BACKFILL_REMOTE_ROOT`): `S:\20261023_LCK-NG_JB\Cell_001\x.ome.zarr` goes to

@@ -195,12 +195,22 @@ def task_python() -> str:
     return str(exe)
 
 
+ENTRY_ENV = "OPYM_BACKFILL_ENTRY"
+
+
+def entry_arguments() -> list[str]:
+    """How the task re-launches the sender: `scripts/opym_backfill_send.py` when that is what
+    started this process (it records its own path), else `-m opym.stream.backfill_client`."""
+    script = os.environ.get(ENTRY_ENV)
+    return [script] if script else ["-m", "opym.stream.backfill_client"]
+
+
 def task_xml(arguments: list[str], python: str | None = None, user: str | None = None,
              workdir: str | None = None) -> str:
     """Task Scheduler XML: run at logon, hidden window, below-normal priority, restart if it
     dies, no time limit, never queued twice."""
     python = python or task_python()
-    args = subprocess.list2cmdline(["-m", "opym.stream.backfill_client", *arguments])
+    args = subprocess.list2cmdline([*entry_arguments(), *arguments])
     user_xml = f"<UserId>{escape(user)}</UserId>" if user else ""
     workdir_xml = f"<WorkingDirectory>{escape(workdir)}</WorkingDirectory>" if workdir else ""
     return f"""<?xml version="1.0" encoding="UTF-16"?>

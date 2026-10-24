@@ -13,11 +13,12 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from test_stream_backfill import make_store, world  # noqa: F401  (the loopback receiver fixture)
@@ -376,6 +377,38 @@ def test_the_logon_task_xml_is_valid_hidden_low_priority_and_restarts_on_failure
     assert root.find(".//t:Settings/t:MultipleInstancesPolicy", ns).text == "IgnoreNew"
     assert root.find(".//t:Settings/t:RestartOnFailure/t:Count", ns).text == "999"
     assert root.find(".//t:Principal/t:RunLevel", ns).text == "LeastPrivilege"
+
+
+def test_the_logon_task_relaunches_the_launcher_script_when_that_started_the_sender(monkeypatch):
+    launcher = r"C:\Users\o pm\opym\scripts\opym_backfill_send.py"
+    monkeypatch.setenv("OPYM_BACKFILL_ENTRY", launcher)
+    xml = svc.task_xml(["--tunnels", "6"], python=r"C:\v\pythonw.exe")
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    root = ET.fromstring(xml.replace('encoding="UTF-16"', ""))
+    assert root.find(".//t:Arguments", ns).text == f'"{launcher}" --tunnels 6'
+    monkeypatch.delenv("OPYM_BACKFILL_ENTRY")
+    assert svc.entry_arguments() == ["-m", "opym.stream.backfill_client"]
+
+
+LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "opym_backfill_send.py"
+
+
+def test_the_launcher_runs_the_sender_without_the_rest_of_opym_installed(tmp_path):
+    """The PC needs numpy, zarr, pyzmq, msgpack and numcodecs, not the processing stack: block the
+    heavy packages and run from an unrelated directory with no PYTHONPATH."""
+    code = (
+        "import runpy, sys\n"
+        "for name in ('ipywidgets', 'tifffile', 'skimage', 'sklearn', 'PyPetaKit5D', 'matplotlib',\n"
+        "             'ome_types', 'yaml', 'tqdm', 'imagecodecs', 'matlab'):\n"
+        "    sys.modules[name] = None          # importing any of these now raises ImportError\n"
+        "sys.argv = ['opym_backfill_send.py', '--help']\n"
+        f"runpy.run_path({str(LAUNCHER)!r}, run_name='__main__')\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                          cwd=tmp_path, env=env)
+    assert done.returncode == 0, done.stderr
+    assert "--tunnels" in done.stdout and "--install" in done.stdout and "opym-backfill-send" in done.stdout
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="checks the non-Windows refusal")
