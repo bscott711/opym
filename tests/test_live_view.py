@@ -1112,7 +1112,7 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_encoding(
 
 
 def test_value_under_the_cursor_decodes_whatever_napari_hands_over(tmp_path):
-    """Rig 2026-10-24: hovering a live layer raised TypeError 649 times. The
+    """Rig 2026-10-24: hovering a live layer raised TypeError 301 times. The
     status checker passes (data level, value) tuples -- value None off the
     volume -- and arrays, not only scalars."""
     pytest.importorskip("napari")
