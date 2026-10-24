@@ -317,23 +317,29 @@ def read_progress(out_path: Path) -> dict | None:
 
 
 def write_progress(
-    out_path: Path, *, n_t: int, n_c: int, done: list[list[int]], state: str
+    out_path: Path,
+    *,
+    n_t: int,
+    n_c: int,
+    done: list[list[int]],
+    state: str,
+    end: dict | None = None,
 ) -> None:
     """`done` is a list of [t, c] pairs written so far. `state` is running,
-    complete or failed."""
+    complete or failed. `end` is how the stream ended
+    (opym.stream.outcome.summarize), once it has."""
     path = Path(out_path) / PROGRESS_NAME
     tmp = path.with_name(f".{PROGRESS_NAME}.tmp")
-    tmp.write_text(
-        json.dumps(
-            {
-                "state": state,
-                "n_t": n_t,
-                "n_c": n_c,
-                "done": sorted([int(t), int(c)] for t, c in done),
-                "updated_at": time.time(),
-            }
-        )
-    )
+    record = {
+        "state": state,
+        "n_t": n_t,
+        "n_c": n_c,
+        "done": sorted([int(t), int(c)] for t, c in done),
+        "updated_at": time.time(),
+    }
+    if end:
+        record["end"] = end
+    tmp.write_text(json.dumps(record))
     os.replace(tmp, path)
 
 

@@ -379,6 +379,55 @@ last one. It has an effect only when the receiver runs the one-format live
 lane (`OPYM_LIVE_LANE=1`, `OPYM_LIVE_FORMAT=zarr`) with a decon PSF;
 otherwise it is ignored.
 
+### 8. `HEARTBEAT` — client -> server, every ~5 s while a run is open
+
+Only once an `ACK` has listed `"heartbeat"`. Header fields are all optional:
+`state` (`"acquiring"` / `"finishing"`), `links_up`, `links_total`,
+`unacked_bytes`, `unacked_volumes`, `submitted`, `acked_through`,
+`stalled_s`, `last_error`.
+
+A heartbeat is not data: it does not reset the idle clock. It changes what
+the idle sweep does once a session has had no new data for its idle timeout:
+
+| client heartbeat | what happens |
+|---|---|
+| fresh (within 30 s) | kept open, with a WARNING every 5 min naming what the client reports, up to `STALL_MAX_SEC` (60 min); then closed as `"stalled"` |
+| stopped | closed as `"idle_timeout"`, detail "the microscope PC went silent ... it last reported N/M links up, X MB waiting to send" |
+| never sent (old client) | closed as `"idle_timeout"`, as before |
+
+So a slow time-lapse (more than 10 min between timepoints) stays open while
+its client is alive, and a stalled one says why when it is closed.
+
+Once a session is closed as idle, **every** later message for it (`FRAME`,
+`RESUME`, `HEARTBEAT`, `SESSION_START`) is answered with
+`unknown_session: true`, `rejected` and `closed: true`. A client that sees
+`closed` stops streaming that run (its local save is the copy to send)
+instead of resyncing every 30 s for the rest of the run, as on 2026-10-24.
+
+### 9. `CLIENT_LOG` — client -> server, the client's own stream log
+
+Only once an `ACK` has listed `"client_log"`: `{"lines": [str], "host": str}`.
+The receiver appends the lines, tagged `[<host> <session_id[:8]>]`, to
+`$OPYM_STREAM_CLIENT_LOG_DIR/<YYYY-MM-DD>.log` (default
+`<jobs dir>/client_logs`), so a post-mortem never needs the acquisition PC.
+
+## How each session's end is recorded
+
+`opym.stream.outcome.summarize` words each session's end once: `reason`,
+`outcome` (`complete` / `partial` / `no_data`), `summary`, `detail` and
+`remedy` (e.g. "send its local save with opym-backfill-send"). It goes to:
+
+- `<raw_root>/<base_name>/stream_status.json` beside the run on GPFS, for
+  the dashboard. A client's `SESSION_END` that arrives after the session was
+  closed here is added to it as `client_end_reason` / `client_end_detail`.
+- the live lane's `.live_status.json` and the view store's `.opym_live.json`
+  (key `end`), so naparym-live shows the summary and the remedy;
+- `<jobs>/profiling/receiver.jsonl`, and `<jobs>/stream_health.json`, which
+  also lists every open session with its client's last heartbeat.
+
+`SESSION_END` may carry `reason: "client_error"` with a `detail`: the
+client's sender failed and says how.
+
 ## Worked example (client-side pseudocode)
 
 ```python

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from opym import live_view
 from opym import ome_zarr_writer as w
 
@@ -381,7 +380,6 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     """opym-live-trace's last hop: when naparym-live built the layers for t."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
-
     from opym.stream import trace
 
     jobs = tmp_path / "jobs"
@@ -428,7 +426,6 @@ def test_paint_clock_needs_a_qt_window():
 def test_watcher_hands_its_paint_clock_to_each_follower(tmp_path):
     pytest.importorskip("napari")
     from napari.components import ViewerModel
-
     from opym.stream import trace
 
     jobs = tmp_path / "jobs"
@@ -451,7 +448,6 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
-
     from opym.stream.live_zarr import buffer_name
 
     resize_dask_cache(0)
@@ -701,7 +697,6 @@ def test_each_channel_shows_its_newest_timepoint_as_soon_as_it_lands(tmp_path):
     lands, and each channel's arrival is traced."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
-
     from opym.stream import trace
 
     store, buffers = _buffered_session(tmp_path, done_t=1)
@@ -1070,7 +1065,6 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_encoding(
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
-
     from opym.stream.live_zarr import buffer_name
 
     resize_dask_cache(0)
@@ -1115,3 +1109,48 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_encoding(
     assert src16.encoding is None
     assert src16.load(1, 0) is None  # an 8-bit buffer: wait for the store
     assert int(src16.load(0, 0).max()) == 800
+
+
+def test_value_under_the_cursor_decodes_whatever_napari_hands_over(tmp_path):
+    """Rig 2026-10-24: hovering a live layer raised TypeError 649 times. The
+    status checker passes (data level, value) tuples -- value None off the
+    volume -- and arrays, not only scalars."""
+    pytest.importorskip("napari")
+    from napari.components import ViewerModel
+    from napari.utils import resize_dask_cache
+
+    resize_dask_cache(0)
+    store = _store(tmp_path)
+    done: list = []
+    for c in range(2):
+        w.write_timepoint(store, 0, c, np.full((8, 16, 12), 480, dtype=np.uint16))
+        done.append([0, c])
+    w.write_progress(store, n_t=3, n_c=2, done=done, state="running")
+    viewer = ViewerModel()
+    cache = live_view.ViewCache(full_gb=1, small_gb=1, bits=8)
+    follower = live_view.LiveFollower(viewer, store, cache=cache, follow=False)
+    gfp = follower.layers[0]
+    code = int(live_view.DisplayEncoding.sqrt().lut()[480])
+    assert abs(gfp._decoded(code) - 480) < 4
+    assert gfp._decoded((0, None)) == (0, None)
+    level, value = gfp._decoded((0, code))
+    assert level == 0 and abs(value - 480) < 4
+    both = gfp._decoded(np.array([code, code]))
+    assert np.all(np.abs(np.asarray(both) - 480) < 4)
+
+
+def test_status_text_says_why_a_run_ended():
+    """naparym-live showed only "0/100 timepoints · failed" (2026-10-24)."""
+    end = {
+        "outcome": "no_data",
+        "summary": "no data reached Argus -- stream stalled: no new data from "
+        "the microscope PC for 10 min (0/100 timepoints arrived)",
+        "remedy": "The run is in the microscope PC's local save: send it to "
+        "Argus with opym-backfill-send (or Globus).",
+    }
+    failed = {"state": "failed", "n_t": 100, "n_c": 2, "done": [], "end": end}
+    text = live_view.status_text("WT_Stim_005", failed)
+    assert "0/100 timepoints" in text
+    assert "no data reached Argus" in text and "opym-backfill-send" in text
+    plain = {"state": "complete", "n_t": 2, "n_c": 1, "done": [[0, 0], [1, 0]]}
+    assert live_view.status_text("x", plain).endswith("complete")
