@@ -37,7 +37,11 @@ keywords = [
 dependencies = [
     "numpy",
     "tifffile",
-    "zarr<3",
+    # 2.18.3 is the last zarr 2 for Python 3.10, and it imports numcodecs.blosc.cbuffer_sizes, which
+    # numcodecs 0.16 removed; without the split the lock pairs it with numcodecs 0.16 on 3.11+.
+    # 2.18.7 caps numcodecs itself.
+    "zarr<3; python_version < '3.11'",
+    "zarr>=2.18.7,<3; python_version >= '3.11'",
     "tqdm",
     "scikit-image",
     "scikit-learn",
