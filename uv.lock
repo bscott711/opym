@@ -1080,11 +1080,9 @@ wheels = [
 name = "numcodecs"
 version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version < '3.11'",
-]
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/85/56/8895a76abe4ec94ebd01eeb6d74f587bc4cddd46569670e1402852a5da13/numcodecs-0.13.1.tar.gz", hash = "sha256:a3cf37881df0898f3a9c0d4477df88133fe85185bffe57ba31bcc2fa207709bc", size = 5955215, upload-time = "2024-10-09T16:28:00.188Z" }
 wheels = [
@@ -1104,37 +1102,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f9/ea/d925bf85f92dfe4635356018da9fe4bfecb07b1c72f62b01c1bc47f936b1/numcodecs-0.13.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:3f593c7506b0ab248961a3b13cb148cc6e8355662ff124ac591822310bc55ecf", size = 1169925, upload-time = "2024-10-09T16:27:49.512Z" },
     { url = "https://files.pythonhosted.org/packages/0f/d6/643a3839d571d8e439a2c77dc4b0b8cab18d96ac808e4a81dbe88e959ab6/numcodecs-0.13.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:80d3071465f03522e776a31045ddf2cfee7f52df468b977ed3afdd7fe5869701", size = 8814257, upload-time = "2024-10-09T16:27:52.059Z" },
     { url = "https://files.pythonhosted.org/packages/a6/c5/f3e56bc9b4e438a287fff738993d6d11abef368c0328a612ac2842ba9fca/numcodecs-0.13.1-cp313-cp313-win_amd64.whl", hash = "sha256:90d3065ae74c9342048ae0046006f99dcb1388b7288da5a19b3bddf9c30c3176", size = 821887, upload-time = "2024-10-09T16:27:55.039Z" },
-]
-
-[[package]]
-name = "numcodecs"
-version = "0.16.3"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13'",
-    "python_full_version >= '3.11' and python_full_version < '3.13'",
-]
-dependencies = [
-    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "typing-extensions", marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/48/6188e359b90a9d8a1850f2bc888c023e66f4a8b2b496820babbea414f008/numcodecs-0.16.3.tar.gz", hash = "sha256:53d705865faaf0a7927c973af3777532001c8fbb653de119c1e844608614d799", size = 6275704, upload-time = "2025-09-18T18:54:57.221Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/cc/917a85972537498f2bbd7914047efc98babc8667587ceb9dcb228378978a/numcodecs-0.16.3-cp311-cp311-macosx_10_13_x86_64.whl", hash = "sha256:95c9f2a49bef10cf91ad614a761cba9bfe96656b60c12540e1080de5d909b4ca", size = 1642356, upload-time = "2025-09-18T18:54:36.402Z" },
-    { url = "https://files.pythonhosted.org/packages/3b/6a/64c25a089e8537441fe67c09ecb7f3f7fb5d98cd04faf01f605d43aca41c/numcodecs-0.16.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e2afe73d5ebaf9ca0cd5c83aad945da80d29a33d860a80d43a7248491d8813ff", size = 1169186, upload-time = "2025-09-18T18:54:37.838Z" },
-    { url = "https://files.pythonhosted.org/packages/d8/a0/0de627baeb43e2045a3d4b3de99bf8b69af329a33df1ed4cda468d70c1fb/numcodecs-0.16.3-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:913f08194d82dcb37594e6705e6d4ae6ccd4b6571500b832fb3e4a155de1dfe8", size = 8341668, upload-time = "2025-09-18T18:54:39.444Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/0f/49d1f74a216149240c4b9403218111f11670bd11af0919fda357bb056bf2/numcodecs-0.16.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:85a7f1cae9eb18b85709af46570bf9c60056e7155c4c8f610e8080c68124d0e5", size = 8866611, upload-time = "2025-09-18T18:54:41.168Z" },
-    { url = "https://files.pythonhosted.org/packages/aa/51/03aece765108fe247717105b5131856546e5428f22a56a14ffdebd017424/numcodecs-0.16.3-cp311-cp311-win_amd64.whl", hash = "sha256:f7bb7f2c46eb7ec8a1c5f8d8fe1a72c222256dd6d6df5af9eaac7a6b905f3575", size = 806787, upload-time = "2025-09-18T18:54:42.78Z" },
-    { url = "https://files.pythonhosted.org/packages/0d/78/e4b34803a3aa1d0769919695de4b133266c18c80c474d32ebc462fa1a9bd/numcodecs-0.16.3-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:c77454d92941a335d148b0b822f5d4783103f392774d5d76283bbf7f21b49529", size = 1681108, upload-time = "2025-09-18T18:54:43.856Z" },
-    { url = "https://files.pythonhosted.org/packages/25/cf/ca36f463b03a4097767d2a1c1b72f31810e8c6384e9449dd9b925203783c/numcodecs-0.16.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:270e7a33ee96bdf5c957acf25a2487002a233811a125a155c400c2f036b69c73", size = 1165589, upload-time = "2025-09-18T18:54:44.954Z" },
-    { url = "https://files.pythonhosted.org/packages/ed/ae/670260c3c4b5ed34a0674561355f3d4ce7fcbdf09a667e5bc841526d271c/numcodecs-0.16.3-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:12f43fa4a347d1dba775c4506a1c9b15b90144c258433b81f79f1c1b1a990db5", size = 8316365, upload-time = "2025-09-18T18:54:46.073Z" },
-    { url = "https://files.pythonhosted.org/packages/bb/fa/94e022419c751a60ff0f53642ebae5ef81ed3cc3640f958588e3ad3dc18d/numcodecs-0.16.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:44869ef564a50aa545215c6a0d42ba5bbc34e9715523fb2336ada3d1fb2b331d", size = 8846228, upload-time = "2025-09-18T18:54:47.858Z" },
-    { url = "https://files.pythonhosted.org/packages/71/60/f23733589f3e059bf8589508acd23ffeec230bdf179f138a54f5ab16e0a6/numcodecs-0.16.3-cp312-cp312-win_amd64.whl", hash = "sha256:9aae6996172ba10c5f5111b2998709071b5aeba6b58b1ee0b26b61ed6aa7f2f4", size = 806260, upload-time = "2025-09-18T18:54:49.41Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/d5/d3536d06ac1e5fb848a3186958204082b68b106364c9a3669652dd786731/numcodecs-0.16.3-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:947406b01c20f2ce7ce2e631e7f21b782e8a9d4b57b374a41c9e7b1341a8f3a2", size = 1677129, upload-time = "2025-09-18T18:54:50.5Z" },
-    { url = "https://files.pythonhosted.org/packages/e1/fd/b0513a3428dc2b38ec85eea771703ae69c49f09b9650d6c44c9105c80073/numcodecs-0.16.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:7cf50e351398a34b45817974c411527629e88937b7683695e276afd65da6ed6f", size = 1159058, upload-time = "2025-09-18T18:54:51.675Z" },
-    { url = "https://files.pythonhosted.org/packages/98/05/b7c127283cfb154a97abb284363825401b69302d71a28608af66f73257cc/numcodecs-0.16.3-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f7938502fcc060ed9543814f38ca67048b33d7bd2667756e36e6b1060455b17e", size = 8260987, upload-time = "2025-09-18T18:54:52.883Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/46/320d960aff884bc63abaaf846ffa3de4803e83e8070b6f84c5688464839c/numcodecs-0.16.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:010d628c95be1214536fb22c0df4ced58da954b404b1fcb25ddebf64e4a3f7f3", size = 8805295, upload-time = "2025-09-18T18:54:54.698Z" },
-    { url = "https://files.pythonhosted.org/packages/31/ae/acc2e0f1f49ba32afa2174578f170673139248ef86f77e334f2619133867/numcodecs-0.16.3-cp313-cp313-win_amd64.whl", hash = "sha256:e83115e3c32de798c7b7164503e06aae9f9746c1cef564d029616eb44bd6cd90", size = 803204, upload-time = "2025-09-18T18:54:56.192Z" },
 ]
 
 [[package]]
@@ -1321,7 +1288,8 @@ dependencies = [
     { name = "tifffile", version = "2025.5.10", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "tifffile", version = "2025.10.16", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tqdm" },
-    { name = "zarr" },
+    { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "zarr", version = "2.18.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -1362,7 +1330,8 @@ requires-dist = [
     { name = "scikit-learn" },
     { name = "tifffile" },
     { name = "tqdm" },
-    { name = "zarr", specifier = "<3" },
+    { name = "zarr", marker = "python_full_version < '3.11'", specifier = "<3" },
+    { name = "zarr", marker = "python_full_version >= '3.11'", specifier = ">=2.18.7,<3" },
 ]
 provides-extras = ["dev", "viewer"]
 
@@ -2388,15 +2357,35 @@ wheels = [
 name = "zarr"
 version = "2.18.3"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.11'",
+]
 dependencies = [
-    { name = "asciitree" },
-    { name = "fasteners", marker = "sys_platform != 'emscripten'" },
-    { name = "numcodecs", version = "0.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numcodecs", version = "0.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "asciitree", marker = "python_full_version < '3.11'" },
+    { name = "fasteners", marker = "python_full_version < '3.11' and sys_platform != 'emscripten'" },
+    { name = "numcodecs", marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/23/c4/187a21ce7cf7c8f00c060dd0e04c2a81139bb7b1ab178bba83f2e1134ce2/zarr-2.18.3.tar.gz", hash = "sha256:2580d8cb6dd84621771a10d31c4d777dca8a27706a1a89b29f42d2d37e2df5ce", size = 3603224, upload-time = "2024-09-04T23:20:16.595Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ed/c9/142095e654c2b97133ff71df60979422717b29738b08bc8a1709a5d5e0d0/zarr-2.18.3-py3-none-any.whl", hash = "sha256:b1f7dfd2496f436745cdd4c7bcf8d3b4bc1dceef5fdd0d589c87130d842496dd", size = 210723, upload-time = "2024-09-04T23:20:14.491Z" },
+]
+
+[[package]]
+name = "zarr"
+version = "2.18.7"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13'",
+    "python_full_version >= '3.11' and python_full_version < '3.13'",
+]
+dependencies = [
+    { name = "asciitree", marker = "python_full_version >= '3.11'" },
+    { name = "fasteners", marker = "python_full_version >= '3.11' and sys_platform != 'emscripten'" },
+    { name = "numcodecs", marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/1d/01cf9e3ab2d85190278efc3fca9f68563de35ae30ee59e7640e3af98abe3/zarr-2.18.7.tar.gz", hash = "sha256:b2b8f66f14dac4af66b180d2338819981b981f70e196c9a66e6bfaa9e59572f5", size = 3604558, upload-time = "2025-04-09T07:59:28.482Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/d8/9ffd8c237b3559945bb52103cf0eed64ea098f7b7f573f8d2962ef27b4b2/zarr-2.18.7-py3-none-any.whl", hash = "sha256:ac3dc4033e9ae4e9d7b5e27c97ea3eaf1003cc0a07f010bd83d5134bf8c4b223", size = 211273, upload-time = "2025-04-09T07:59:27.039Z" },
 ]
