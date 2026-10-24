@@ -150,6 +150,8 @@ class LiveSession:
     done: set[int] = field(default_factory=set)
     failed: set[int] = field(default_factory=set)
     ended: bool = False
+    end: dict | None = None
+    """How the receiver says the session ended (opym.stream.outcome)."""
     started_at: float = field(default_factory=time.time)
     first_done_at: float | None = None
     last_status_write: float = 0.0
@@ -338,10 +340,13 @@ class LiveLane:
             by,
         )
 
-    def end_session(self, session_id: str) -> None:
+    def end_session(self, session_id: str, end: dict | None = None) -> None:
+        """The receiver closed the session; `end` is its
+        `opym.stream.outcome.summarize` record, kept in the status files."""
         session = self.sessions.get(session_id)
         if session is not None:
             session.ended = True
+            session.end = end
 
     # --- one pass, from the receiver's poll loop ------------------------------
 
@@ -487,6 +492,7 @@ class LiveLane:
                 n_c=session.n_channels,
                 done=done,
                 state=state,
+                end=session.end if state != "running" else None,
             )
         except OSError:
             logger.exception(
@@ -601,6 +607,10 @@ class LiveLane:
             "decon_params": decon_params_fingerprint(),
             "interp_method": DSR_INTERP_METHOD,
         }
+        if state != "running" and session.end:
+            # Why it ended as it did: "failed" alone said nothing (a run that
+            # got no data and one whose processing failed looked the same).
+            status["end"] = session.end
         path = session.dsr_dir / LIVE_STATUS_NAME
         tmp = path.with_name(f".{LIVE_STATUS_NAME}.tmp")
         try:

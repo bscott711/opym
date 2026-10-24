@@ -46,6 +46,8 @@ MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
 MSG_QC = b"QC"
 MSG_PREPARE = b"PREPARE"
+MSG_HEARTBEAT = b"HEARTBEAT"
+MSG_CLIENT_LOG = b"CLIENT_LOG"
 
 _VALID_TYPES = frozenset(
     {
@@ -56,6 +58,8 @@ _VALID_TYPES = frozenset(
         MSG_RESUME,
         MSG_QC,
         MSG_PREPARE,
+        MSG_HEARTBEAT,
+        MSG_CLIENT_LOG,
     }
 )
 
@@ -196,6 +200,10 @@ _VALID_TYPES = frozenset(
 #                               partial copy is NOT copied to raw_root, so
 #                               the full local save can be sent by Globus
 #                               into the same place.
+#                               | "client_error": the client's sender failed;
+#                               `detail` says how.
+#   detail           str    -- OPTIONAL, a human-readable why, shown with
+#                               the session's end everywhere (opym.stream.outcome).
 #
 # --- ACK header fields (server -> client, unsolicited or RESUME reply) ---
 #
@@ -208,7 +216,7 @@ _VALID_TYPES = frozenset(
 #                               frame_index > through_frame_index.
 #   features         [str]  -- OPTIONAL, what this receiver supports beyond
 #                               the base protocol: "slabs", "blosc",
-#                               "links", "resume".
+#                               "links", "resume", "heartbeat", "client_log".
 #   unknown_session  bool   -- OPTIONAL, true when the server has no open
 #                               session with this session_id (it answers a
 #                               RESUME, or a FRAME at most every 2 s, this
@@ -222,6 +230,12 @@ _VALID_TYPES = frozenset(
 #                               turned this SESSION_START down (e.g. its RAM
 #                               disk has no room for the session yet), and
 #                               why. The client retries with backoff.
+#   closed           bool   -- OPTIONAL, with unknown_session: the server
+#                               closed this session for good (it sent no new
+#                               data for its idle timeout) and will not
+#                               resume it. Retrying is pointless: the client
+#                               stops streaming the run and says so; its
+#                               local save is the copy to send.
 #   ended            bool   -- OPTIONAL, true on the final ACK, sent once
 #                               the server has closed the session: it
 #                               confirms SESSION_END. A client that got no
@@ -270,6 +284,35 @@ _VALID_TYPES = frozenset(
 #   dtype            str    -- optional, e.g. "uint16"
 #   num_timepoints   int    -- optional, for the log
 #   channel_names    [str]  -- optional, for the log
+
+
+# --- HEARTBEAT header fields (client -> server, once "heartbeat" is seen) --
+#
+# Every few seconds while a run is open, on any link that is up. It is how
+# the server tells a client that is alive but can't send (or is between
+# timepoints of a slow time-lapse) from one that is gone: a session whose
+# client heartbeats is not closed as idle (up to a long cap), and one that
+# is closed says what its client last reported. All fields optional:
+#
+#   state            str    -- "acquiring" | "finishing"
+#   links_up         int    -- links whose connection is up
+#   links_total      int
+#   unacked_bytes    int    -- what the client holds unACKed
+#   unacked_volumes  int
+#   submitted        int    -- volumes (or slabs) acquired so far
+#   acked_through    int
+#   stalled_s        float  -- seconds since an ACK last moved it forward
+#                               while it had data in flight
+#   last_error       str
+#
+# --- CLIENT_LOG header fields (client -> server, once "client_log" is seen) --
+#
+# The client's own stream log, so a post-mortem never needs the acquisition
+# PC: the server appends the lines to its rig log (one file per day). Sent
+# on any up link, for any session id (it only labels the lines):
+#
+#   lines            [str]  -- formatted log lines, oldest first
+#   host             str    -- OPTIONAL, the client's host name
 
 
 def pack_message(

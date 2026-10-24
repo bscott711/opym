@@ -236,6 +236,8 @@ class ZarrLiveSession:
     done: set[int] = field(default_factory=set)  # every channel archived
     failed: set[int] = field(default_factory=set)
     ended: bool = False
+    end: dict | None = None
+    """How the receiver says the session ended (opym.stream.outcome)."""
     superseded: bool = False
     started_at: float = 0.0
     first_done_at: float | None = None
@@ -683,6 +685,7 @@ class ZarrLiveLane(LiveLane):
                 n_c=session.n_channels,
                 done=[list(tc) for tc in sorted(pairs)],
                 state=state,
+                end=session.end if state != "running" else None,
             )
         except OSError:
             logger.exception("Live lane (zarr): could not update %s progress", store)

@@ -109,6 +109,24 @@ the whole session plus the floor; otherwise it is answered with
 "unknown_session" and "rejected" (the reason), and the client retries. A
 malformed or disallowed SESSION_START is still dropped unanswered.
 
+Heartbeat: a client that sees "heartbeat" sends HEARTBEAT every few
+seconds while its run is open. Its session is then not closed as idle while
+the heartbeats keep coming (a slow time-lapse, or a client still trying to
+send), up to `STALL_MAX_SEC` with no new data; and a session that is closed
+says what its client last reported. A session closed as idle answers every
+later message with `unknown_session` + `closed`, so its client stops
+retrying at once instead of every 30 s for the rest of the run (rig,
+2026-10-24).
+
+End reasons: how each session ended is worded once (opym.stream.outcome)
+and written beside the run on GPFS (`stream_status.json`), into the live
+lane's status and progress files, `profiling/receiver.jsonl` and
+`stream_health.json`, so naparym-live, the dashboard and the log all say
+why a run came in empty or short and what to do about it.
+
+Client log: a client that sees "client_log" sends its own stream log
+(CLIENT_LOG); it is appended to `OPYM_STREAM_CLIENT_LOG_DIR/<date>.log`.
+
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
 holds). The partial copy is kept on staging for the usual retention but
@@ -136,12 +154,14 @@ from numcodecs import blosc as _blosc
 
 from opym import discovery, lanes
 from opym.decon_config import resolve_decon_psf
-from opym.stream import drain, live, live_zarr, rawmirror, trace
+from opym.stream import drain, live, live_zarr, outcome, rawmirror, trace
 from opym.stream.live import LiveLane
 from opym.stream.live_zarr import ZarrLiveLane
 from opym.stream.protocol import (
     MSG_ACK,
+    MSG_CLIENT_LOG,
     MSG_FRAME,
+    MSG_HEARTBEAT,
     MSG_PREPARE,
     MSG_QC,
     MSG_RESUME,
@@ -162,6 +182,19 @@ IDLE_TIMEOUT_SEC = 600.0
 # _handle_session_start); then the id is forgotten.
 _IDLE_CLOSED_FORGET_S = 24 * 3600.0
 _IDLE_CLOSED_REASON = "closed on Argus after 10 min with no new data; not resuming it"
+# A heartbeat this recent means the client is alive (it sends one every 5 s).
+HEARTBEAT_FRESH_SEC = 30.0
+# A session whose client keeps heartbeating but sends no new data is closed
+# after this long anyway ("stalled"), so a wedged client can't hold the live
+# lease -- and the GPUs and backfill behind it -- forever.
+STALL_MAX_SEC = 3600.0
+_STALL_WARN_EVERY_S = 300.0
+# stream_health.json (see `_write_health`) is rewritten this often.
+_HEALTH_EVERY_S = 5.0
+_RECENT_ENDS_KEPT = 20
+# Where CLIENT_LOG lines go; default `<jobs dir>/client_logs`.
+_CLIENT_LOG_DIR_ENV_VAR = "OPYM_STREAM_CLIENT_LOG_DIR"
+_CLIENT_LOG_MAX_LINES = 5000
 POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
@@ -212,7 +245,7 @@ _RAW_ROOTS_ENV_VAR = "OPYM_STREAM_RAW_ROOTS"
 # the IP allowlist) for NULL-mechanism connections at all.
 _ZAP_DOMAIN = b"opym-direct"
 # Advertised in every ACK; clients only use a feature once they've seen it.
-SERVER_FEATURES = ["slabs", "blosc", "links", "resume"]
+SERVER_FEATURES = ["slabs", "blosc", "links", "resume", "heartbeat", "client_log"]
 # Unknown-session replies to FRAMEs are rate-limited per session: a client
 # resending hundreds of MB of slabs would otherwise get one per slab.
 _UNKNOWN_NOTICE_EVERY_S = 2.0
@@ -412,6 +445,11 @@ class SessionState:
     stage_tiff_s: list[float] = field(default_factory=list)
     staged_bytes: int = 0
     started_at: float = field(default_factory=time.time)
+    last_heartbeat: float | None = None
+    """monotonic time of the client's last HEARTBEAT; None if it sends none."""
+    client_status: dict[str, Any] = field(default_factory=dict)
+    """The last HEARTBEAT's fields (see protocol.py)."""
+    stall_warned_at: float = 0.0
 
     @property
     def leaf_dir(self) -> Path:
@@ -466,6 +504,12 @@ class StreamReceiver:
         self._unknown_noticed: dict[str, float] = {}
         # Sessions closed for idling, by close time (see _handle_session_start).
         self._idle_closed: dict[str, float] = {}
+        # Where each closed session's stream_status.json went, so a client's
+        # late SESSION_END can still be recorded there.
+        self._closed_status: dict[str, Path] = {}
+        # The last few session ends, newest last, for stream_health.json.
+        self._recent_ends: list[dict[str, Any]] = []
+        self._last_health_write = float("-inf")
         # Always constructed (cheap: idle threads blocked on a queue read)
         # so staging can be toggled per-session via the env var without
         # needing the receiver process restarted -- mirrors `_decon_enabled`
@@ -588,6 +632,8 @@ class StreamReceiver:
                 self._handle_incoming(sock)
         self._flush_pending_acks()
         self._sweep_idle_sessions()
+        if time.monotonic() - self._last_health_write >= _HEALTH_EVERY_S:
+            self._write_health()
         if time.monotonic() - self._last_space_check >= _SPACE_CHECK_EVERY_S:
             self._check_stage_space()
         # Held while any session is open; refreshed every few seconds so it
@@ -708,21 +754,27 @@ class StreamReceiver:
         if msg_type == MSG_PREPARE:
             self._handle_prepare(session_id, header)
             return
+        if msg_type == MSG_CLIENT_LOG:
+            self._handle_client_log(session_id, header)
+            return
         session = self.sessions.get(session_id)
         if session is not None:
             # Answer on the link (and socket) heard from last: it just
             # proved it works, and a link or route that died stops being
             # used as soon as any other one delivers something.
             session.sock, session.identity = sock, identity
-        elif msg_type == MSG_FRAME:
+        elif msg_type in (MSG_FRAME, MSG_HEARTBEAT):
             self._notice_unknown(sock, identity, session_id)
             return
         elif msg_type == MSG_SESSION_END:
             # Already closed (the client missed the final ACK and resent
-            # SESSION_END): confirm it again.
+            # SESSION_END, or ended a run closed here as idle): confirm it.
+            self._late_session_end(session_id, header)
             self._send_unknown(sock, identity, session_id)
             return
-        if msg_type == MSG_FRAME:
+        if msg_type == MSG_HEARTBEAT:
+            self._handle_heartbeat(session, header)
+        elif msg_type == MSG_FRAME:
             self._handle_frame(session_id, header, payload)
         elif msg_type == MSG_SESSION_END:
             self._handle_session_end(session_id, header)
@@ -745,7 +797,9 @@ class StreamReceiver:
             logger.info(
                 "Session %s: closed as idle earlier -- not resuming it", session_id
             )
-            self._send_unknown(sock, identity, session_id, rejected=_IDLE_CLOSED_REASON)
+            self._send_unknown(
+                sock, identity, session_id, rejected=_IDLE_CLOSED_REASON, closed=True
+            )
             return
         existing = self.sessions.get(session_id)
         if existing is not None and not existing.ended:
@@ -1087,15 +1141,31 @@ class StreamReceiver:
         if now - self._unknown_noticed.get(session_id, -1e9) < _UNKNOWN_NOTICE_EVERY_S:
             return
         self._unknown_noticed[session_id] = now
+        if session_id in self._idle_closed:
+            # Closed for good: say so, so the client stops instead of
+            # resyncing every 30 s for the rest of the run.
+            logger.info(
+                "Message for session %s, closed as idle earlier -- telling the "
+                "client it is closed",
+                session_id,
+            )
+            self._send_unknown(
+                sock, identity, session_id, rejected=_IDLE_CLOSED_REASON, closed=True
+            )
+            return
         logger.warning(
-            "FRAME for unknown session %s -- asking the client to resume it",
+            "Message for unknown session %s -- asking the client to resume it",
             session_id,
         )
         self._send_unknown(sock, identity, session_id)
 
     @staticmethod
     def _send_unknown(
-        sock: zmq.Socket, identity: bytes, session_id: str, rejected: str = ""
+        sock: zmq.Socket,
+        identity: bytes,
+        session_id: str,
+        rejected: str = "",
+        closed: bool = False,
     ) -> None:
         header: dict[str, Any] = {
             "through_frame_index": -1,
@@ -1105,6 +1175,8 @@ class StreamReceiver:
         }
         if rejected:
             header["rejected"] = rejected
+        if closed:
+            header["closed"] = True
         sock.send_multipart([identity, *pack_message(MSG_ACK, session_id, header)])
 
     def _handle_prepare(self, prepare_id: str, header: dict[str, Any]) -> None:
@@ -1577,12 +1649,25 @@ class StreamReceiver:
         if session is None:
             logger.warning("SESSION_END for unknown session %s -- ignored", session_id)
             return
-        self._finalize_session(session, reason=header.get("reason", "complete"))
+        self._finalize_session(
+            session,
+            reason=str(header.get("reason", "complete")),
+            detail=str(header.get("detail", "") or ""),
+        )
 
-    def _finalize_session(self, session: SessionState, reason: str) -> None:
+    def _finalize_session(
+        self, session: SessionState, reason: str, detail: str = ""
+    ) -> None:
         if session.ended:
             return
         session.ended = True
+        end = outcome.summarize(
+            reason,
+            session.received_pairs,
+            session.num_timepoints,
+            len(session.channels),
+            detail,
+        )
         logger.info(
             "Session %s ended (%s): %d/%d (t,c) pairs received for %s under %s",
             session.session_id,
@@ -1592,9 +1677,14 @@ class StreamReceiver:
             session.base_name,
             session.write_root,
         )
-        _write_stage_profile(session, reason)
+        log = logger.info if end["outcome"] == outcome.COMPLETE else logger.warning
+        log(
+            "Session %s (%s): %s", session.session_id, session.base_name, end["summary"]
+        )
+        _write_stage_profile(session, reason, end)
+        self._record_end(session, end)
         if session.live:
-            self._live.end_session(session.session_id)
+            self._live.end_session(session.session_id, end)
         # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
         # see protocol.py's ACK docs) previously had no way to learn about
         # this session's LAST batch of frames if SESSION_END arrived before
@@ -1712,7 +1802,15 @@ class StreamReceiver:
             # it never reached SESSION_START here: flag it, so the client
             # re-sends SESSION_START with resume_through and then everything
             # still in its buffer (see the module docstring's "Recovery").
-            self._send_unknown(sock, identity, session_id)
+            # One closed as idle says so: it won't be resumed.
+            closed = session_id in self._idle_closed
+            self._send_unknown(
+                sock,
+                identity,
+                session_id,
+                rejected=_IDLE_CLOSED_REASON if closed else "",
+                closed=closed,
+            )
             return
         session.identity = (
             identity  # reconnect: new TCP connection, same identity value
@@ -1736,12 +1834,184 @@ class StreamReceiver:
     def _sweep_idle_sessions(self) -> None:
         now = time.monotonic()
         for session in list(self.sessions.values()):
-            if now - session.last_activity >= self.idle_timeout_sec:
-                self._idle_closed[session.session_id] = now
-                self._finalize_session(session, reason="idle_timeout")
+            quiet = now - session.last_activity
+            if quiet < self.idle_timeout_sec:
+                continue
+            hb = session.last_heartbeat
+            alive = hb is not None and now - hb < HEARTBEAT_FRESH_SEC
+            client = outcome.describe_client(session.client_status)
+            if alive and quiet < STALL_MAX_SEC:
+                # Its client is alive: a slow time-lapse between timepoints,
+                # or still trying to send. Keep it open, and say so now and
+                # then, so a stall is visible long before the cap.
+                if now - session.stall_warned_at >= _STALL_WARN_EVERY_S:
+                    session.stall_warned_at = now
+                    logger.warning(
+                        "Session %s (%s): no new data for %s; the "
+                        "microscope PC still reports in (%s)",
+                        session.session_id,
+                        session.base_name,
+                        outcome.span(quiet),
+                        client or "no details",
+                    )
+                continue
+            if alive:
+                reason = "stalled"
+                detail = (
+                    f"the microscope PC kept reporting in but sent no new data "
+                    f"for {outcome.span(quiet)} ({client or 'no details'})"
+                )
+            elif hb is not None:
+                reason = "idle_timeout"
+                detail = (
+                    f"the microscope PC went silent: no data for "
+                    f"{outcome.span(quiet)} and no heartbeat for "
+                    f"{outcome.span(now - hb)}"
+                    + (f"; it last reported {client}" if client else "")
+                )
+            else:
+                reason = "idle_timeout"
+                detail = f"no new data from the microscope PC for {outcome.span(quiet)}"
+            self._idle_closed[session.session_id] = now
+            self._finalize_session(session, reason=reason, detail=detail)
         for sid, at in list(self._idle_closed.items()):
             if now - at > _IDLE_CLOSED_FORGET_S:
                 del self._idle_closed[sid]
+                self._closed_status.pop(sid, None)
+
+    def _handle_heartbeat(self, session: SessionState, header: dict[str, Any]) -> None:
+        """A client HEARTBEAT: it is alive. Not data, so it doesn't reset
+        the idle clock; `_sweep_idle_sessions` reads it instead."""
+        first = session.last_heartbeat is None
+        session.last_heartbeat = time.monotonic()
+        session.client_status = {
+            k: header[k]
+            for k in (
+                "state",
+                "links_up",
+                "links_total",
+                "unacked_bytes",
+                "unacked_volumes",
+                "submitted",
+                "acked_through",
+                "stalled_s",
+                "last_error",
+            )
+            if k in header
+        }
+        if first:
+            logger.info(
+                "Session %s: client heartbeat (%s)",
+                session.session_id,
+                outcome.describe_client(session.client_status) or "no details",
+            )
+
+    def _handle_client_log(self, session_id: str, header: dict[str, Any]) -> None:
+        """Append a client's own stream log to the day's rig log file."""
+        lines = header.get("lines")
+        if not isinstance(lines, list):
+            return
+        lines = [str(line) for line in lines[-_CLIENT_LOG_MAX_LINES:]]
+        host = str(header.get("host", "") or "")
+        tag = f"[{host + ' ' if host else ''}{session_id[:8]}]"
+        log_dir = Path(
+            os.environ.get(_CLIENT_LOG_DIR_ENV_VAR) or lanes.jobs_dir() / "client_logs"
+        )
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f"{time.strftime('%Y-%m-%d')}.log"
+            with open(path, "a") as f:
+                f.writelines(f"{tag} {line}\n" for line in lines)
+        except OSError:
+            logger.exception("Could not write the client log to %s", log_dir)
+
+    def _record_end(self, session: SessionState, end: dict[str, Any]) -> None:
+        """Write how `session` ended beside the run on GPFS and remember it
+        for stream_health.json. Best effort: never raises."""
+        record = {
+            "schema": 1,
+            "session_id": session.session_id,
+            "base_name": session.base_name,
+            "raw_root": str(session.raw_root),
+            "started_at": session.started_at,
+            "ended_at": time.time(),
+            "pairs_received": len(session.received_pairs),
+            "pairs_expected": session.num_timepoints * len(session.channels),
+            "client": session.client_status,
+            **end,
+        }
+        self._recent_ends = [*self._recent_ends, record][-_RECENT_ENDS_KEPT:]
+        self._last_health_write = float("-inf")  # show the end at once
+        path = session.dest_leaf_dir
+        self._closed_status[session.session_id] = path
+        _write_status_async(path, record)
+
+    def _late_session_end(self, session_id: str, header: dict[str, Any]) -> None:
+        """A SESSION_END for a session already closed here: log what the
+        client says, and add it to the run's stream_status.json."""
+        leaf = self._closed_status.get(session_id)
+        if leaf is None:
+            return
+        reason = str(header.get("reason", ""))
+        detail = str(header.get("detail", "") or "")
+        logger.warning(
+            "Session %s, already closed here, was ended by the client: %s%s",
+            session_id,
+            reason,
+            f" ({detail})" if detail else "",
+        )
+        record = outcome.read_status(leaf) or {}
+        if record.get("client_end_reason") == reason:
+            return
+        record.update(client_end_reason=reason, client_end_detail=detail)
+        _write_status_async(leaf, record)
+
+    def _write_health(self) -> None:
+        """`<jobs>/stream_health.json`: every open session's progress and its
+        client's last heartbeat, plus the last few session ends. Read by the
+        dashboard's status page. Best effort: never raises."""
+        now = time.monotonic()
+        self._last_health_write = now
+        sessions = []
+        for s in self.sessions.values():
+            per_t: dict[int, int] = {}
+            for t, _c in s.received_pairs:
+                per_t[t] = per_t.get(t, 0) + 1
+            sessions.append(
+                {
+                    "session_id": s.session_id,
+                    "base_name": s.base_name,
+                    "raw_root": str(s.raw_root),
+                    "started_at": s.started_at,
+                    "num_timepoints": s.num_timepoints,
+                    "timepoints_received": sum(
+                        1 for n in per_t.values() if n >= len(s.channels)
+                    ),
+                    "last_data_age_s": round(now - s.last_activity, 1),
+                    "last_heartbeat_age_s": (
+                        None
+                        if s.last_heartbeat is None
+                        else round(now - s.last_heartbeat, 1)
+                    ),
+                    "client": s.client_status,
+                    "client_summary": outcome.describe_client(s.client_status),
+                }
+            )
+        record = {
+            "updated_at": time.time(),
+            "pid": os.getpid(),
+            "idle_timeout_s": self.idle_timeout_sec,
+            "sessions": sessions,
+            "recent_ends": self._recent_ends,
+        }
+        try:
+            path = lanes.jobs_dir() / "stream_health.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".stream_health.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record, indent=1))
+            os.replace(tmp, path)
+        except OSError:
+            logger.debug("Could not write stream_health.json", exc_info=True)
 
 
 # Client-clock times a FRAME header may carry (see protocol.py), traced as
@@ -1791,14 +2061,34 @@ def _stage_stats(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def _write_stage_profile(session: SessionState, reason: str) -> None:
+def _write_status_async(leaf_dir: Path, record: dict[str, Any]) -> None:
+    """`outcome.write_status` on a thread of its own: it goes to GPFS, which
+    must never stall the poll loop. Best effort."""
+
+    def _write() -> None:
+        try:
+            outcome.write_status(leaf_dir, record)
+        except OSError:
+            logger.exception("Could not write %s in %s", outcome.STATUS_NAME, leaf_dir)
+
+    threading.Thread(target=_write, name="stream-status", daemon=True).start()
+
+
+def _write_stage_profile(
+    session: SessionState, reason: str, end: dict[str, Any] | None = None
+) -> None:
     """Log and append one JSON line of this session's staging timings to
     `<jobs dir>/profiling/receiver.jsonl`. Best effort: never raises."""
     try:
+        end = end or {}
         record = {
             "session_id": session.session_id,
             "base_name": session.base_name,
+            "raw_root": str(session.raw_root),
             "reason": reason,
+            "outcome": end.get("outcome"),
+            "detail": end.get("detail", ""),
+            "pairs_expected": session.num_timepoints * len(session.channels),
             "started_at": session.started_at,
             "ended_at": time.time(),
             "frames": len(session.stage_raw_s),
