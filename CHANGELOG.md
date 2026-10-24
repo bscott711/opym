@@ -22,6 +22,18 @@ change behaviour).
   correctly. `scripts/live_bench/sqrt8_compare.py` shows before | now | 16-bit side by side.
 
 ### Added
+- One-command SSH backfill sender (`opym-backfill-send`, `opym.stream.tunnels`, `opym.stream.backfill_service`;
+  `docs/SSH_BACKFILL.md`). With no arguments it backs up the S:\ drive to
+  `/mmfs1/scratch/jacks.local/microscopy`, mapping each path relative to the drive root, so a whole drive (or any
+  one session folder) lands in the right place with no `--map`. It opens and supervises its own SSH tunnels (4
+  separate `ssh` processes by default, on local ports 5656+, clear of the live stream's 5555-5558) instead of needing
+  a hand-run `ssh -L`, prepares the next slab on a worker thread while the tunnels send, remembers stores it has
+  verified complete (skipping them without loading them while unchanged), keeps going past one refused store, reports
+  store names the receiver would refuse, and logs a per-pass summary and a per-folder table. `--install` registers a
+  hidden Windows logon task (restarted if it dies, below-normal priority); the sender runs at background CPU/IO
+  priority and only one can run per PC. `--status`, `--stop`, `--uninstall`, `--once`, `--rescan`, `--dry-run`.
+  Behaviour change: it now watches continuously by default (`--once` for a single pass) and a store the receiver
+  refuses is reported under that store (`result: failed`) instead of failing its whole folder.
 - SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
   receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with
   per-volume SHA-256 verified by readback before a store is marked complete (`.opym_complete.json`). Never

@@ -312,7 +312,8 @@ def test_readback_mismatch_blocks_the_completion_marker(world, monkeypatch):
 
     monkeypatch.setattr(world.receiver, "_commit", tamper_then_commit)
     (rep,) = world.client().run_once()
-    assert "differ after readback" in rep["error"]
+    info = rep["stores"]["cell_001_GFP_488.ome.zarr"]   # the store fails; the pass carries on
+    assert info["result"] == "failed" and "differ after readback" in info["reason"]
     dst = remote_store(world)
     assert bfill.read_marker(dst) is None and not (dst / ".zattrs").exists()
 
