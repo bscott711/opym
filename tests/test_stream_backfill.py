@@ -848,3 +848,31 @@ def test_a_store_without_our_lock_whose_largest_array_is_smaller_is_still_a_conf
     res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
     assert res["result"] == bfill.CONFLICT
     assert not (dst / "p0").exists()
+
+
+def test_a_late_copy_of_a_metadata_request_does_not_unmark_a_finished_store(world):
+    """A sender resends a request on another tunnel when its tunnel goes silent; the
+    first copy can arrive after the store was committed. It must not run again: a
+    metadata request removes the completion marker."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    c = world.client()
+    sent = []
+    real = c.link.send
+
+    def keep(parts, *a, **k):
+        if parts[0] == bfill.BF_META:
+            sent.append(list(parts))
+        return real(parts, *a, **k)
+
+    c.link.send = keep
+    assert leaf_report(c.run_once(), "cell_001_GFP_488.ome.zarr")["result"] == "complete"
+    assert bfill.read_marker(remote_store(world))
+    c.link.send = real
+    c.link.send(sent[0])                                   # the stale copy arrives now
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        got = c.link.recv_any(200)
+        if got is not None:
+            break
+    assert bfill.read_marker(remote_store(world)), "the finished store kept its marker"
+    assert arrays_equal(src, remote_store(world))
