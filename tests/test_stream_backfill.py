@@ -822,3 +822,29 @@ def test_no_verify_trusts_whole_copies_as_before(world):
     res = leaf_report(world.client(verify=False).run_once(), "cell_001_GFP_488.ome.zarr")
     assert res["result"] == "already on Argus"
     assert bfill.read_marker(remote_store(world)) is None
+
+
+
+def test_a_store_cut_off_before_its_pixel_array_metadata_is_finished(world):
+    """2026-10-25: a run stopped after a store's `z` array landed but before `p0/.zarray`.
+    Its largest array was then the coordinate array, so it read as a conflict forever."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    dst = remote_store(world)
+    shutil.copytree(src, dst, ignore=lambda d, names: [n for n in names if n in ("p0", ".zattrs")])
+    lock = dst / bfill.LOCK_NAME
+    lock.write_text("another-pc")
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    assert bfill.main_array_rel(dst) == "z"                     # what made it look like a conflict
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "complete", res
+    assert arrays_equal(src, dst) and bfill.read_marker(dst)["written_t"] == [0, 1, 2]
+
+
+def test_a_store_without_our_lock_whose_largest_array_is_smaller_is_still_a_conflict(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    dst = remote_store(world)
+    zarr.open_group(str(dst), mode="w").create_dataset("z", data=np.arange(NZ) * 0.5)
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == bfill.CONFLICT
+    assert not (dst / "p0").exists()

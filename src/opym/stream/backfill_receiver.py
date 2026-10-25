@@ -388,6 +388,13 @@ class BackfillReceiver:
             # a store directory with no pixel array yet: ours to create unless it is being written
             return self._guard_busy(dest, None, client) or {"state": bfill.PARTIAL, "have_t": []}
         meta = self._read_zarray(dest, main_rel)
+        if (meta is not None and len(meta.get("shape") or []) < len(spec["shape"])
+                and (dest / bfill.LOCK_NAME).exists() and not (dest / ".zattrs").exists()):
+            # A backfill stopped before the pixel array's own metadata landed (2026-10-25:
+            # WT_Unstim_..._001_mScarlet was cut off after its `z` array): the largest array
+            # here is a coordinate array, not a different run. Ours to finish.
+            return self._guard_busy(dest, None, client) or {"state": bfill.PARTIAL, "have_t": [],
+                                                            "backfill_started": True}
         if meta is not None and _is_one_timepoint_of(meta, spec) and self._stream_tag(dest):
             return self._inspect_single_volume(dest, main_rel, meta, spec, client)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
@@ -526,6 +533,11 @@ class BackfillReceiver:
             bfill.atomic_write(target, data)
             if tag:
                 self._adopted.setdefault(dest, {"session_id": tag["session_id"], "replaced": []})
+        # Where the pixel array is may have changed (a store cut off before its .zarray landed
+        # looked like its coordinate array was the pixel array): find it afresh.
+        self._main_rel_cache.pop(dest, None)
+        for key in [k for k in self._arrays if k == dest or dest in k.parents]:
+            self._arrays.pop(key, None)
         return {"kind": "meta", "ok": True, "store": header["store"]}
 
     # ---- volumes ---------------------------------------------------------------------------
