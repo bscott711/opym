@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -349,8 +350,12 @@ class BackfillReceiver:
         """Timepoints of `written_t` whose every chunk is on disk (and non-empty)."""
         written = [int(t) for t in spec.get("written_t", [])]
         if len(spec["shape"]) < 4:
-            d = bfill.array_dir(dest, main_rel)
-            return written if any(not e.name.startswith(".") for e in os.scandir(d)) else []
+            # A 3-D volume is one "timepoint": complete only with every chunk, not once any
+            # plane exists (2026-10-25: a cut-off copy with 4 of 301 planes counted as held,
+            # so the sender sent nothing and the readback refused it every run).
+            n, smallest = bfill.chunk_count_for_volume(dest, main_rel)
+            expected = math.prod(math.ceil(s / c) for s, c in zip(spec["shape"], spec["chunks"], strict=True))
+            return written if n == expected and smallest > 0 else []
         per_t = bfill.expected_chunks_per_t(spec["shape"], spec["chunks"])
         try:
             sig = (bfill.newest_mtime(dest, main_rel), per_t)

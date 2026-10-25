@@ -198,6 +198,19 @@ def chunk_count_for_t(store: Path, main_rel: str, t: int) -> tuple[int, int]:
     return n, smallest or 0
 
 
+def chunk_count_for_volume(store: Path, main_rel: str) -> tuple[int, int]:
+    """(chunk files present, smallest chunk file) in a whole array dir, for a 3-D store."""
+    n, smallest = 0, None
+    for root, _dirs, files in os.walk(array_dir(store, main_rel)):
+        for f in files:
+            if f.startswith("."):
+                continue
+            n += 1
+            sz = os.stat(os.path.join(root, f)).st_size
+            smallest = sz if smallest is None else min(smallest, sz)
+    return n, smallest or 0
+
+
 def expected_chunks_per_t(shape: list[int], chunks: list[int]) -> int:
     return math.prod(math.ceil(s / c) for s, c in zip(shape[1:], chunks[1:], strict=True))
 
