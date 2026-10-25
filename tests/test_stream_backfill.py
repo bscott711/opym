@@ -554,3 +554,24 @@ def test_finding_the_pixel_array_never_walks_its_chunks(tmp_path, monkeypatch):
     monkeypatch.setattr(bfill.os, "walk", counting_walk)
     assert bfill.main_array_rel(store) == "p0"
     assert all(len(p.relative_to(store).parts) <= 1 for p in walked)  # root and array dirs only
+
+
+def test_a_conflict_says_what_differs(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", declared_t=3)
+    make_store(remote_store(world), declared_t=4, written=(0,))
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == bfill.CONFLICT
+    assert "shape on Argus [4, 4, 5, 6], on the PC [3, 4, 5, 6]" in res["reason"]
+    assert "only the declared number of timepoints differs" in res["reason"]
+
+
+def test_a_second_inventory_of_an_unchanged_store_is_not_recounted(world, monkeypatch):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    _as_stream_copy(make_store(remote_store(world), written=(0, 1), seed=0))
+    c = world.client()
+    c.run_once(dry_run=True)
+    counts = []
+    real = bfill.chunk_count_for_t
+    monkeypatch.setattr(bfill, "chunk_count_for_t", lambda *a: counts.append(a) or real(*a))
+    res = leaf_report(c.run_once(dry_run=True), "cell_001_GFP_488.ome.zarr")
+    assert res["missing_timepoints"] == 1 and counts == []

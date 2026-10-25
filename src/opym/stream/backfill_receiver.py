@@ -36,6 +36,7 @@ import os
 import socket
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,11 @@ _BIND_ENV = "OPYM_BACKFILL_BIND"
 _SETTLE_ENV = "OPYM_BACKFILL_SETTLE_SECONDS"
 _REGISTRY_ENV = "OPYM_BACKFILL_REGISTRY_PATH"
 INDEX_TTL_S = 600.0
+# Which timepoints of a store are complete is found by counting its chunk files: ~13,000
+# for a 100-timepoint run, 8.3 s one by one on GPFS (2026-10-24). GPFS is slow per request,
+# not per byte, so they are counted in parallel, and the answer is kept until the store
+# changes.
+_COUNT_WORKERS = 32
 # What the live stream's store tagging looks like (opym.stream.rawmirror).
 _STREAM_TAG = "opym"
 # Pixel-array .zarray keys that decide what the chunk files mean.
@@ -86,6 +92,10 @@ class BackfillReceiver:
         self._index: dict[str, list[Path]] = {}
         self._index_at = float("-inf")
         self._adopted: dict[Path, dict[str, Any]] = {}
+        self._have_cache: dict[Path, tuple[tuple, list[int], list[int]]] = {}
+        self._pool = ThreadPoolExecutor(max_workers=_COUNT_WORKERS, thread_name_prefix="bf-count")
+        # Separate from `_pool`: a store's inspection waits on that pool's timepoint counts.
+        self._store_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bf-store")
         self.host = socket.gethostname()
         self._pending_zattrs: dict[Path, bytes] = {}
         self._arrays: dict[Path, zarr.Array] = {}
@@ -106,6 +116,8 @@ class BackfillReceiver:
 
     def close(self) -> None:
         self._sock.close(0)
+        self._store_pool.shutdown(wait=False)
+        self._pool.shutdown(wait=False)
 
     def run_forever(self) -> None:
         logger.info("backfill receiver on %s, raw roots %s", self.endpoint, [str(r) for r in self.raw_roots])
@@ -174,15 +186,21 @@ class BackfillReceiver:
             self.stats["rejected"] += 1
             return {"kind": "inventory", "ok": False, "error": err}
         out: dict[str, Any] = {}
+        specs = []
         for spec in header.get("stores", []):
             name = spec.get("name", "")
             if not bfill.valid_store_name(name):
                 out[name] = {"state": bfill.CONFLICT, "reason": "bad store name"}
-                continue
-            info = self._inspect_store(leaf / name, spec, header.get("client", ""))
+            else:
+                specs.append(spec)
+        client = header.get("client", "")
+        # Stores are inspected side by side (a folder of 150-timepoint runs took longer
+        # than the sender's 180 s reply timeout one by one, 2026-10-24).
+        infos = list(self._store_pool.map(lambda sp: self._inspect_store(leaf / sp["name"], sp, client), specs))
+        for spec, info in zip(specs, infos):
             if info["state"] == bfill.ABSENT:
-                info.update(self._elsewhere(leaf / name, spec))
-            out[name] = info
+                info.update(self._elsewhere(leaf / spec["name"], spec))
+            out[spec["name"]] = info
         return {"kind": "inventory", "ok": True, "stores": out}
 
     # ---- the same data elsewhere ---------------------------------------------------------
@@ -223,14 +241,28 @@ class BackfillReceiver:
         return index
 
     def _complete_ts(self, dest: Path, main_rel: str, spec: dict) -> list[int]:
-        per_t = bfill.expected_chunks_per_t(spec["shape"], spec["chunks"]) if len(spec["shape"]) >= 4 else None
-        have = []
-        for t in spec.get("written_t", []):
-            if per_t is None:
-                continue
+        """Timepoints of `written_t` whose every chunk is on disk (and non-empty)."""
+        written = [int(t) for t in spec.get("written_t", [])]
+        if len(spec["shape"]) < 4:
+            d = bfill.array_dir(dest, main_rel)
+            return written if any(not e.name.startswith(".") for e in os.scandir(d)) else []
+        per_t = bfill.expected_chunks_per_t(spec["shape"], spec["chunks"])
+        try:
+            sig = (bfill.newest_mtime(dest, main_rel), per_t)
+        except OSError:
+            sig = None
+        hit = self._have_cache.get(dest)
+        if sig is not None and hit and hit[0] == sig and set(written) <= set(hit[1]) | set(hit[2]):
+            return [t for t in written if t in hit[1]]
+
+        def complete(t: int) -> bool:
             n, smallest = bfill.chunk_count_for_t(dest, main_rel, t)
-            if n == per_t and smallest > 0:
-                have.append(t)
+            return n == per_t and smallest > 0
+
+        flags = list(self._pool.map(complete, written))
+        have = [t for t, ok in zip(written, flags) if ok]
+        if sig is not None:
+            self._have_cache[dest] = (sig, have, [t for t in written if t not in have])
         return have
 
     def _elsewhere(self, dest: Path, spec: dict) -> dict[str, Any]:
@@ -292,21 +324,11 @@ class BackfillReceiver:
         meta = self._read_zarray(dest, main_rel)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
                 or list(meta.get("chunks", [])) != list(spec["chunks"]):
-            return {"state": bfill.CONFLICT, "reason": "pixel array differs from the sender's"}
+            return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec)}
         busy = self._guard_busy(dest, main_rel, client)
         if busy:
             return busy
-        per_t = bfill.expected_chunks_per_t(spec["shape"], spec["chunks"]) if len(spec["shape"]) >= 4 else None
-        have = []
-        for t in written:
-            if per_t is None:
-                n = sum(1 for _ in bfill.array_dir(dest, main_rel).iterdir() if not _.name.startswith("."))
-                if n:
-                    have.append(t)
-                continue
-            n, smallest = bfill.chunk_count_for_t(dest, main_rel, t)
-            if n == per_t and smallest > 0:
-                have.append(t)
+        have = self._complete_ts(dest, main_rel, spec)
         out: dict[str, Any] = {"state": bfill.PARTIAL, "have_t": have}
         if self._stream_tag(dest):
             out["stream_copy"] = True
@@ -508,6 +530,24 @@ class BackfillReceiver:
         self._main_rel_cache.pop(dest, None)
         self.stats["commits"] += 1
         return {**base, "ok": True, "verified": len(digests), "manifest_sha256": marker["manifest_sha256"]}
+
+
+def _array_difference(meta: dict | None, spec: dict) -> str:
+    """Why Argus's store and the sender's are not the same array, in words."""
+    if meta is None:
+        return "pixel array differs from the sender's: Argus's store has no readable .zarray"
+    parts = []
+    for key, label in (("shape", "shape"), ("chunks", "chunks"), ("dtype", "dtype")):
+        mine, theirs = meta.get(key), spec.get(key)
+        if (list(mine or []) if key != "dtype" else mine) != (list(theirs or []) if key != "dtype" else theirs):
+            parts.append(f"{label} on Argus {mine}, on the PC {theirs}")
+    shape_a, shape_b = list(meta.get("shape") or []), list(spec.get("shape") or [])
+    if len(parts) == 1 and len(shape_a) == len(shape_b) >= 4 and shape_a[1:] == shape_b[1:]:
+        parts[0] += " (only the declared number of timepoints differs)"
+    elif len(parts) == 1 and len(shape_a) == len(shape_b) >= 4 and shape_a[0] == shape_b[0] \
+            and shape_a[2:] == shape_b[2:]:
+        parts[0] += " (only the number of z planes differs)"
+    return "pixel array differs from the sender's: " + "; ".join(parts)
 
 
 def _kind(msg_type: bytes) -> str:
