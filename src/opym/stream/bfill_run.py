@@ -47,7 +47,7 @@ DONE_RESULTS = frozenset({"complete", "already complete", "already on Argus"})
 
 
 def default_runs_dir() -> Path:
-    """`%LOCALAPPDATA%\\opym-backfill\\runs` on Windows, else under XDG state."""
+    r"""`%LOCALAPPDATA%\\opym-backfill\\runs` on Windows, else under XDG state."""
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_STATE_HOME")
     if not base:
         base = str(Path.home() / ".local" / "state")
@@ -68,7 +68,8 @@ def _atomic_write_json(path: Path, doc: dict[str, Any]) -> None:
 
 class RunLog:
     """One run's record. `send(header)` mirrors each change to the receiver
-    (fire-and-forget); None keeps it local only."""
+    (fire-and-forget); None keeps it local only.
+    """
 
     def __init__(
         self,
@@ -123,7 +124,7 @@ class RunLog:
             return
         try:
             self.send({"op": op, "run_id": self.run_id, **fields})
-        except Exception:  # noqa: BLE001 - the record must never stop the transfer
+        except Exception:  # the record must never stop the transfer
             pass
 
     # ---- the run's phases ---------------------------------------------------
@@ -147,7 +148,9 @@ class RunLog:
         self._save()
         self._mirror("store", key=key, entry=entry)
 
-    def heartbeat(self, key: str | None, t: int | None = None, force: bool = False) -> None:
+    def heartbeat(
+        self, key: str | None, t: int | None = None, force: bool = False
+    ) -> None:
         """Rate-limited 'still alive, working on key/t'."""
         now = time.monotonic()
         if not force and now - self._last_beat < HEARTBEAT_S:
@@ -171,17 +174,19 @@ class RunLog:
 
 def load_run(runs_dir: Path, which: str = "latest") -> dict[str, Any] | None:
     """A previous run's record: `which` is a run id, or "latest" (newest real run,
-    not a dry run)."""
+    not a dry run).
+    """
     runs_dir = Path(runs_dir)
     if which != "latest":
         try:
-            return json.loads((runs_dir / f"{which}.json").read_text())
+            named: dict[str, Any] = json.loads((runs_dir / f"{which}.json").read_text())
         except (OSError, ValueError):
             return None
+        return named
     best: tuple[float, dict[str, Any]] | None = None
     for p in runs_dir.glob("*.json"):
         try:
-            doc = json.loads(p.read_text())
+            doc: dict[str, Any] = json.loads(p.read_text())
         except (OSError, ValueError):
             continue
         if doc.get("dry_run"):
