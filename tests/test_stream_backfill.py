@@ -876,3 +876,31 @@ def test_a_late_copy_of_a_metadata_request_does_not_unmark_a_finished_store(worl
             break
     assert bfill.read_marker(remote_store(world)), "the finished store kept its marker"
     assert arrays_equal(src, remote_store(world))
+
+
+def test_an_untagged_4d_copy_of_a_single_volume_is_checked_pixel_for_pixel(world):
+    """12 'conflicts' in the rig's 2026-10-25 dry run: single volumes the stream wrote
+    4-D on 23-24 Sept, before it tagged its stores."""
+    src = _single_volume(world.local / "exp" / "test_001_GFP_488.ome.zarr", seed=3)
+    there = _stream_single_volume(world.remote / "exp" / "test_001_GFP_488.ome.zarr", like=src)
+    attrs = json.loads((there / ".zattrs").read_text())
+    attrs.pop("opym", None)
+    (there / ".zattrs").write_text(json.dumps(attrs))
+    snapshot = {p: p.read_bytes() for p in there.rglob("*") if p.is_file()}
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "complete" and res["checked_only"], res
+    after = {p: p.read_bytes() for p in there.rglob("*") if p.is_file() and p.name != bfill.MARKER_NAME}
+    assert after == snapshot
+    assert bfill.read_marker(there)["written_t"] == [0]
+
+
+def test_an_untagged_4d_copy_with_other_pixels_is_still_a_conflict(world):
+    src = _single_volume(world.local / "exp" / "test_001_GFP_488.ome.zarr", seed=3)
+    other = _single_volume(world.local.parent / "other" / "test_001_GFP_488.ome.zarr", seed=4)
+    there = _stream_single_volume(world.remote / "exp" / "test_001_GFP_488.ome.zarr", like=other)
+    attrs = json.loads((there / ".zattrs").read_text())
+    attrs.pop("opym", None)
+    (there / ".zattrs").write_text(json.dumps(attrs))
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == bfill.CONFLICT
+    assert bfill.read_marker(there) is None

@@ -434,7 +434,9 @@ class BackfillReceiver:
             # here is a coordinate array, not a different run. Ours to finish.
             return self._guard_busy(dest, None, client) or {"state": bfill.PARTIAL, "have_t": [],
                                                             "backfill_started": True}
-        if meta is not None and _is_one_timepoint_of(meta, spec) and self._stream_tag(dest):
+        if meta is not None and _is_one_timepoint_of(meta, spec):
+            # The stream's own copy, tagged or (before it tagged its stores, Sept 2026) not:
+            # only ever checked pixel for pixel, never written to.
             return self._inspect_single_volume(dest, main_rel, meta, spec, client)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
                 or list(meta.get("chunks", [])) != list(spec["chunks"]):
