@@ -194,15 +194,41 @@ def test_a_store_that_grew_since_it_was_marked_is_topped_up(world):
 # ---------------------------------------------------------------- never damage existing data
 
 
-def test_existing_store_with_a_different_array_is_a_conflict_and_untouched(world):
-    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+def test_a_different_run_under_a_name_argus_holds_is_sent_renamed_and_the_old_one_untouched(world):
+    """2026-10-25: the acquisition software reused names (20260928 Cell_005, 20260924
+    Cell_001/007); a store whose volumes have another size is certainly another run."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
     other = make_store(world.remote / "exp" / "cell_001_GFP_488.ome.zarr", shape_yx=(NY + 1, NX), seed=5)
     snapshot = {p: p.read_bytes() for p in other.rglob("*") if p.is_file()}
-    reports = world.client().run_once()
-    res = leaf_report(reports, "cell_001_GFP_488.ome.zarr")
-    assert res["result"] == bfill.CONFLICT
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "complete" and res["as"] == "cell_001_pc2_GFP_488.ome.zarr"
     assert {p: p.read_bytes() for p in other.rglob("*") if p.is_file()} == snapshot
+    renamed = world.remote / "exp" / "cell_001_pc2_GFP_488.ome.zarr"
+    assert arrays_equal(src, renamed)
+    assert bfill.read_marker(renamed)["renamed_from"] == "cell_001_GFP_488.ome.zarr"
     assert not list((world.remote / "exp").glob(".superseded*"))
+
+    again = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert again["result"] == "already on Argus" and again["as"] == "cell_001_pc2_GFP_488.ome.zarr"
+    assert not (world.remote / "exp" / "cell_001_pc3_GFP_488.ome.zarr").exists()
+
+
+def test_every_channel_of_a_renamed_run_gets_the_same_number(world):
+    for ch in ("GFP_488", "mScarlet_561"):
+        make_store(world.local / "exp" / f"cell_001_{ch}.ome.zarr")
+        make_store(world.remote / "exp" / f"cell_001_{ch}.ome.zarr", shape_yx=(NY + 1, NX), seed=5)
+    make_store(world.remote / "exp" / "cell_001_pc2_mScarlet_561.ome.zarr", shape_yx=(NY + 2, NX), seed=6)
+    (rep,) = world.client().run_once()
+    assert {st["as"] for st in rep["stores"].values()} == {"cell_001_pc3_GFP_488.ome.zarr",
+                                                           "cell_001_pc3_mScarlet_561.ome.zarr"}
+
+
+def test_a_conflict_in_the_declared_length_only_is_not_renamed(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", declared_t=3)
+    make_store(world.remote / "exp" / "cell_001_GFP_488.ome.zarr", declared_t=5, seed=5)
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == bfill.CONFLICT and "as" not in res
+    assert not (world.remote / "exp" / "cell_001_pc2_GFP_488.ome.zarr").exists()
 
 
 def test_a_store_that_differs_only_in_declared_length_is_a_conflict(world):
@@ -633,3 +659,124 @@ def test_probes_read_one_plane_not_the_whole_volume(world, indexed, monkeypatch)
     finally:
         c.close()
     assert digested and all(len(shape) == 2 for shape in digested)  # planes only, both ends
+
+
+# ---------------------------------------------------------------- the run record (sidecar)
+# 2026-10-24: a whole-drive run stalled at 22:54 and never finished; neither end kept a
+# record of what it meant to send or how far it got.
+from opym.stream import backfill_runs, bfill_run  # noqa: E402
+
+
+def _argus_runs(w) -> list[dict]:
+    return [json.loads(p.read_text()) for p in sorted((w.remote / ".opym_backfill" / "runs").glob("*.json"))]
+
+
+def test_the_plan_is_recorded_before_the_first_volume_and_each_result_after(world, tmp_path, monkeypatch):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    make_store(world.local / "exp" / "cell_002_GFP_488.ome.zarr", seed=2)
+    runs = tmp_path / "runs"
+    seen_at_first_volume = []
+    real_volume = world.receiver._volume
+
+    def spy(header, payload):
+        if not seen_at_first_volume:
+            seen_at_first_volume.append([json.loads(p.read_text()) for p in runs.glob("*.json")])
+        return real_volume(header, payload)
+
+    monkeypatch.setattr(world.receiver, "_volume", spy)
+    world.client(runs_dir=runs).run_once()
+
+    (local_at_start,) = seen_at_first_volume[0]
+    assert local_at_start["state"] == "running"
+    assert {e["name"] for e in local_at_start["plan"]} == {"cell_001_GFP_488.ome.zarr", "cell_002_GFP_488.ome.zarr"}
+    assert all(e["action"] == "send" and e["send_t"] == 3 for e in local_at_start["plan"])
+
+    (local,) = [json.loads(p.read_text()) for p in runs.glob("*.json")]
+    (argus,) = _argus_runs(world)
+    for doc in (local, argus):
+        assert doc["state"] == "complete" and doc["counts"] == {"complete": 2}
+    key = f"{world.remote}/exp/cell_001_GFP_488.ome.zarr"
+    assert argus["stores"][key]["result"] == "complete"
+    assert argus["stores"][key]["argus"]["state"] == "verified"   # what the receiver saw itself
+    assert bfill.read_marker(remote_store(world))["run_id"] == argus["run_id"]
+
+
+def _dies_at_t1(c):
+    real = c._send_slab
+
+    def dies(key, header, payload, inflight, attempts):
+        if key == (1, 0):
+            c.runlog.heartbeat(f"{header['leaf']}/{header['store']}", 1, force=True)
+            raise KeyboardInterrupt            # the PC's window closed, the PC slept, ...
+        real(key, header, payload, inflight, attempts)
+
+    return dies
+
+
+def test_a_run_that_fails_says_so(world, tmp_path, monkeypatch):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    c = world.client(runs_dir=tmp_path / "runs", slab_bytes=NY * NX * 2)
+    monkeypatch.setattr(c, "_send_slab", _dies_at_t1(c))
+    with pytest.raises(KeyboardInterrupt):
+        c.run_once()
+    (doc,) = _argus_runs(world)
+    assert doc["state"] == "failed" and "KeyboardInterrupt" in doc["error"]
+
+
+def test_a_run_that_stops_reporting_is_marked_interrupted_where_it_was(world, tmp_path, monkeypatch):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    c = world.client(runs_dir=tmp_path / "runs", slab_bytes=NY * NX * 2)
+    monkeypatch.setattr(c, "_send_slab", _dies_at_t1(c))
+    real_send_run = c._send_run
+    monkeypatch.setattr(c, "_send_run", lambda h: None if h["op"] == "end" else real_send_run(h))  # killed
+    with pytest.raises(KeyboardInterrupt):
+        c.run_once()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (_argus_runs(world) and _argus_runs(world)[0].get("current")):
+        time.sleep(0.05)                       # the heartbeat is fire-and-forget
+    (doc,) = _argus_runs(world)
+    assert doc["state"] == "running"
+
+    monkeypatch.setattr(backfill_runs, "STALE_S", 0.0)
+    assert world.receiver.runs.sweep(force=True) == 1
+    (marked,) = _argus_runs(world)
+    assert marked["state"] == "interrupted"
+    assert marked["interrupted_during"]["key"].endswith("cell_001_GFP_488.ome.zarr")
+    assert marked["interrupted_during"]["t"] == 1
+    assert world.receiver.runs.sweep(force=True) == 0      # once
+
+
+def test_an_older_receiver_without_run_records_still_gets_the_data(world, tmp_path, monkeypatch):
+    from opym.stream import backfill_receiver
+
+    monkeypatch.setattr(backfill_receiver.bfill, "FEATURES", ["blosc", "links", "plane_probe"])
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    res = leaf_report(world.client(runs_dir=tmp_path / "runs").run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "complete"
+    assert _argus_runs(world) == []                                # nothing sent it can't read
+    assert len(list((tmp_path / "runs").glob("*.json"))) == 1      # the PC keeps its own
+
+
+def test_resume_skips_what_the_last_run_finished(world, tmp_path):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    runs = tmp_path / "runs"
+    world.client(runs_dir=runs).run_once()
+    make_store(world.local / "exp" / "cell_002_GFP_488.ome.zarr", seed=2)
+    asked = []
+    real = world.receiver._inventory
+    world.receiver._inventory = lambda h: (asked.extend(s["name"] for s in h.get("stores", [])), real(h))[1]
+
+    prev = bfill_run.load_run(runs)
+    (rep,) = world.client(runs_dir=runs).run_once(resume=prev)
+    assert rep["stores"]["cell_001_GFP_488.ome.zarr"] == {"result": "already complete", "reason": "previous run"}
+    assert rep["stores"]["cell_002_GFP_488.ome.zarr"]["result"] == "complete"
+    assert "cell_001_GFP_488.ome.zarr" not in asked
+
+
+def test_a_dry_run_records_its_plan_and_marks_itself(world, tmp_path):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    world.client(runs_dir=tmp_path / "runs").run_once(dry_run=True)
+    (doc,) = _argus_runs(world)
+    assert doc["dry_run"] is True and doc["state"] == "complete"
+    assert [e["action"] for e in doc["plan"]] == ["send"]
+    assert bfill_run.load_run(tmp_path / "runs") is None           # resume ignores dry runs

@@ -392,7 +392,8 @@ class BackfillReceiver:
             return self._inspect_single_volume(dest, main_rel, meta, spec, client)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
                 or list(meta.get("chunks", [])) != list(spec["chunks"]):
-            return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec)}
+            return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec),
+                    "argus_shape": (meta or {}).get("shape"), "argus_dtype": (meta or {}).get("dtype")}
         busy = self._guard_busy(dest, main_rel, client)
         if busy:
             return busy
@@ -400,6 +401,10 @@ class BackfillReceiver:
         out: dict[str, Any] = {"state": bfill.PARTIAL, "have_t": have}
         if self._stream_tag(dest):
             out["stream_copy"] = True
+        if (dest / bfill.LOCK_NAME).exists():
+            # A backfill began this store and never committed it: whole or not, it still
+            # needs its readback and marker.
+            out["backfill_started"] = True
         return out
 
     def _inspect_single_volume(self, dest: Path, main_rel: str, meta: dict, spec: dict,
