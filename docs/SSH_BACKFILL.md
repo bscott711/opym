@@ -95,6 +95,13 @@ The PC keeps its copy in `%LOCALAPPDATA%\opym-backfill\runs\<run_id>.json` (`--r
 tried once more at its end. The receiver logs a line per store received and per verified commit, and warns about
 any request that takes over 30 s.
 
+**Every copy is checked against the PC.** A store the live stream or Globus brought in whole is not trusted because
+its chunk files are all there: unless `--no-verify` is given, the sender hashes every volume on the PC and the receiver
+reads its copy back and compares, sending no pixels; only a match earns the completion marker. A copy whose pixels
+differ is reported (`refused`, with the timepoints that differ) and never overwritten. A single volume the stream wrote
+4-D is checked the same way, its metadata left as the stream wrote it. (2026-10-25: a faithful copy of S:\ is the
+point; 118 such stores had only ever been counted.)
+
 **Same name, different run.** The acquisition software has reused run names. When Argus holds a store of the same
 name whose volumes have another z/y/x size or pixel type, the run is sent as `<run>_pc<N>_<channel>` (every channel
 with the same N; N is the first free one), the marker records `renamed_from`, and a later run finds it again. A

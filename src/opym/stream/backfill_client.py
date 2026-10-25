@@ -183,8 +183,12 @@ class BackfillClient:
         order: str = "newest",
         reply_timeout_s: float = REPLY_TIMEOUT_S,
         runs_dir: Path | None = None,
+        verify: bool = True,
     ) -> None:
         self.runs_dir = runs_dir
+        # Check copies that came another way (live stream, Globus) against this PC before
+        # they count as done; see `_decide`.
+        self.verify = verify
         self.runlog: bfill_run.RunLog | None = None
         self.root_map = [(Path(a), b.rstrip("/")) for a, b in root_map]
         # `client_id` owns the per-store lock, so it is stable across restarts of this machine's
@@ -344,12 +348,23 @@ class BackfillClient:
             # A partial one there is completed in place.
             at = info["duplicate_of"]
             dup_have = set(info.get("duplicate_have_t", []))
+            elsewhere = {e.get("path"): e for e in info.get("elsewhere") or []}
             if set(s.written_t) <= dup_have:
-                return {**d, "action": "skip", "result": "already on Argus", "at": at}
+                if not self.verify or elsewhere.get(at, {}).get("marked"):
+                    return {**d, "action": "skip", "result": "already on Argus", "at": at}
+                return {**d, "action": "verify elsewhere", "remote": str(Path(at).parent), "have": dup_have, "at": at}
             return {**d, "action": "complete elsewhere", "remote": str(Path(at).parent), "have": dup_have, "at": at}
         if set(s.written_t) <= have and not info.get("backfill_started"):
-            # The live stream (or Globus) brought it in whole; nothing to send.
-            return {**d, "action": "skip", "result": "already on Argus"}
+            # The live stream (or Globus) brought it in whole: nothing to send. Its chunk files
+            # are all there, which says nothing about their contents, so unless told not to it
+            # is checked like any backfilled store: this PC's per-volume SHA-256 against Argus's
+            # readback, then the completion marker (2026-10-25: a faithful copy of S:\ is the
+            # point, and 118 such stores had never been compared with it).
+            if not self.verify:
+                return {**d, "action": "skip", "result": "already on Argus"}
+            # A single volume the stream wrote 4-D: its metadata is the stream's own and must
+            # stay, so only the pixels are checked.
+            return {**d, "action": "verify", "have": have, "pixels_only": bool(info.get("single_volume_as_4d"))}
         action = "complete stream copy" if info.get("stream_copy") else "send"
         return {**d, "action": action, "have": have}
 
@@ -407,8 +422,11 @@ class BackfillClient:
         s = d["store"]
         per_t = math.prod(s.shape[-3:]) * np.dtype(s.dtype).itemsize if len(s.shape) >= 3 else 0
         send_t = len([t for t in s.written_t if t not in d.get("have", set(s.written_t))])
+        verify_t = len(s.written_t) if d["action"] in ("send", "complete stream copy", "complete elsewhere",
+                                                       "send renamed", "verify", "verify elsewhere") else 0
         entry = {"key": f"{d['remote']}/{d['name']}", "leaf": d["remote"], "name": d["name"], "local": str(s.path),
-                 "action": d["action"], "timepoints": len(s.written_t), "send_t": send_t, "bytes": send_t * per_t}
+                 "action": d["action"], "timepoints": len(s.written_t), "send_t": send_t, "bytes": send_t * per_t,
+                 "verify_t": verify_t, "verify_bytes": verify_t * per_t}
         for k in ("result", "reason", "renamed_from", "at"):
             if d.get(k):
                 entry[k] = d[k]
@@ -426,7 +444,8 @@ class BackfillClient:
         elif dry_run:
             missing = len([t for t in s.written_t if t not in d.get("have", set())])
             result = {"send": "would send", "complete stream copy": "would send",
-                      "complete elsewhere": "would complete elsewhere", "send renamed": "would send renamed"}[action]
+                      "complete elsewhere": "would complete elsewhere", "send renamed": "would send renamed",
+                      "verify": "would verify", "verify elsewhere": "would verify"}[action]
             out = {"result": result, "missing_timepoints": missing, "of": len(s.written_t)}
             if action == "complete stream copy":
                 out["completes_stream_copy"] = True
@@ -437,7 +456,9 @@ class BackfillClient:
         else:
             try:
                 out = self._sync_store(d["remote"], s, d.get("have", set()), name=d["name"],
-                                       renamed_from=d.get("renamed_from"))
+                                       renamed_from=d.get("renamed_from"), meta=not d.get("pixels_only"))
+                if action.startswith("verify"):
+                    out["checked_only"] = True
             except BackfillError as exc:
                 # One refused store must not hide what the others did.
                 logger.error("%s: %s", s.name, exc)
@@ -484,11 +505,12 @@ class BackfillClient:
         return {"t": t, "sha256": bfill.volume_digest(vol)}
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int], name: str | None = None,
-                    renamed_from: str | None = None) -> dict:
+                    renamed_from: str | None = None, meta: bool = True) -> dict:
         name = name or s.name
         t_start = time.monotonic()
         before = self.sent_bytes
-        self._send_meta(remote, s, name)
+        if meta:
+            self._send_meta(remote, s, name)
         arr = s.array()
         digests: dict[int, str] = {}
         todo = [t for t in s.written_t if t not in have]
@@ -497,7 +519,7 @@ class BackfillClient:
         for t in s.written_t:                       # volumes the server already held: hash locally
             if t not in digests:
                 digests[t] = bfill.volume_digest(np.asarray(arr[t] if arr.ndim >= 4 else arr[...]))
-        root_zattrs = (s.path / ".zattrs").read_bytes() if (s.path / ".zattrs").exists() else None
+        root_zattrs = (s.path / ".zattrs").read_bytes() if meta and (s.path / ".zattrs").exists() else None
         # The receiver reads every volume back before it answers (~19 GB for a 100-timepoint run).
         readback_s = len(digests) * math.prod(s.shape[-3:]) * np.dtype(s.dtype).itemsize / (COMMIT_READBACK_MBPS * 1e6)
         commit = {"leaf": remote, "store": name, "digests": {str(t): d for t, d in digests.items()},
@@ -730,9 +752,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="where this run's record is kept (default %(default)s)")
     p.add_argument("--resume", nargs="?", const="latest", default=None, metavar="RUN_ID",
                    help="skip what the latest (or the named) run already finished")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="trust copies the live stream or Globus made instead of checking them against this PC")
     a = p.parse_args(argv)
     client = BackfillClient(a.connect or [DEFAULT_CONNECT], a.maps, settle_s=a.settle, window=a.window,
-                            max_mbps=a.max_mbps, pause_file=a.pause_file, order=a.order, runs_dir=a.runs_dir)
+                            max_mbps=a.max_mbps, pause_file=a.pause_file, order=a.order, runs_dir=a.runs_dir, verify=a.verify)
     try:
         while True:
             try:
