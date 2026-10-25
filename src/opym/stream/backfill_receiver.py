@@ -322,6 +322,8 @@ class BackfillReceiver:
             # a store directory with no pixel array yet: ours to create unless it is being written
             return self._guard_busy(dest, None, client) or {"state": bfill.PARTIAL, "have_t": []}
         meta = self._read_zarray(dest, main_rel)
+        if meta is not None and _is_one_timepoint_of(meta, spec) and self._stream_tag(dest):
+            return self._inspect_single_volume(dest, main_rel, meta, spec, client)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
                 or list(meta.get("chunks", [])) != list(spec["chunks"]):
             return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec)}
@@ -333,6 +335,29 @@ class BackfillReceiver:
         if self._stream_tag(dest):
             out["stream_copy"] = True
         return out
+
+    def _inspect_single_volume(self, dest: Path, main_rel: str, meta: dict, spec: dict,
+                               client: str) -> dict[str, Any]:
+        """The PC saved a single volume as [z, y, x]; the live stream always writes
+        [t, z, y, x], so its copy is [1, z, y, x]: the same bytes in the same order. It is
+        "already on Argus" once its one timepoint is complete and, with the sender's probe,
+        holds the same data. Never written to: the stream's metadata matches its array."""
+        busy = self._guard_busy(dest, main_rel, client)
+        if busy:
+            return busy
+        spec4 = {**spec, "shape": meta["shape"], "chunks": meta["chunks"], "written_t": [0]}
+        if not self._complete_ts(dest, main_rel, spec4):
+            return {"state": bfill.CONFLICT, "reason": "the live stream's copy of this single volume is "
+                                                         "incomplete (it is 4-D, the PC's 3-D)"}
+        probe = spec.get("probe")
+        if not probe:
+            return {"state": bfill.PARTIAL, "have_t": [], "stream_copy": True, "needs_probe": True}
+        arr = zarr.open_array(str(bfill.array_dir(dest, main_rel)), mode="r")
+        if bfill.volume_digest(np.asarray(arr[0])) != probe["sha256"]:
+            return {"state": bfill.CONFLICT, "reason": "the live stream's copy of this single volume holds "
+                                                         "different data"}
+        return {"state": bfill.PARTIAL, "have_t": list(spec.get("written_t", [])), "stream_copy": True,
+                "single_volume_as_4d": True}
 
     def _main(self, dest: Path) -> str | None:
         """The store's pixel-array path, cached: finding it walks the store."""
@@ -530,6 +555,14 @@ class BackfillReceiver:
         self._main_rel_cache.pop(dest, None)
         self.stats["commits"] += 1
         return {**base, "ok": True, "verified": len(digests), "manifest_sha256": marker["manifest_sha256"]}
+
+
+def _is_one_timepoint_of(meta: dict, spec: dict) -> bool:
+    """Argus's array is [1, *the sender's shape]: one timepoint of the same volume."""
+    shape, chunks = list(meta.get("shape") or []), list(meta.get("chunks") or [])
+    want_shape, want_chunks = list(spec.get("shape") or []), list(spec.get("chunks") or [])
+    return (len(want_shape) == 3 and shape == [1, *want_shape] and chunks == [1, *want_chunks]
+            and meta.get("dtype") == spec.get("dtype"))
 
 
 def _array_difference(meta: dict | None, spec: dict) -> str:
