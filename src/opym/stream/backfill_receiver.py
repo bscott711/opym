@@ -44,6 +44,7 @@ import socket
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,12 @@ _REQUEST_WORKERS = 16
 SLOW_REQUEST_S = 30.0
 # While requests are in flight the loop polls this often, to send their replies promptly.
 _BUSY_POLL_MS = 2
+# A sender resends a request on another tunnel when its tunnel goes silent; the first copy
+# can still arrive later. Metadata and commit requests are remembered by their echo token
+# so a late copy gets the first reply instead of running again: a stale metadata request
+# would otherwise remove the completion marker of a store finished since (2026-10-25).
+_ONCE = frozenset({bfill.BF_META, bfill.BF_COMMIT})
+_REMEMBER = 4096
 
 
 def _env_list(name: str) -> list[str]:
@@ -123,6 +130,7 @@ class BackfillReceiver:
         # Commit readback: whole volumes, ~190 MB each at today's run sizes; 8 at a time.
         self._readback_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bf-readback")
         self._started: dict[Path, float] = {}
+        self._answered: OrderedDict[str, threading.Event | dict[str, Any]] = OrderedDict()
         self.runs = RunRecords(Path(runs_dir) if runs_dir else default_runs_dir(self.raw_roots))
         self.host = socket.gethostname()
         self._pending_zattrs: dict[Path, bytes] = {}
@@ -176,11 +184,19 @@ class BackfillReceiver:
 
     def _handle(self, identity: bytes, msg_type: bytes, sid: str, header: dict, payload: bytes | None) -> None:
         t0 = time.monotonic()
-        try:
-            reply = self._dispatch(msg_type, header, payload)
-        except Exception as exc:  # noqa: BLE001 - one bad request must not stop the receiver
-            logger.exception("request failed")
-            reply = {"kind": _kind(msg_type), "ok": False, "error": f"server error: {exc}"}
+        once = f"{header.get('client', '')}/{header['echo']}" if msg_type in _ONCE and header.get("echo") else None
+        first = self._claim(once) if once else None
+        if once and first is not None:
+            logger.info("repeated %s request for %s answered from the first", _kind(msg_type), header.get("store"))
+            reply = dict(first)
+        else:
+            try:
+                reply = self._dispatch(msg_type, header, payload)
+            except Exception as exc:  # noqa: BLE001 - one bad request must not stop the receiver
+                logger.exception("request failed")
+                reply = {"kind": _kind(msg_type), "ok": False, "error": f"server error: {exc}"}
+            if once:
+                self._remember(once, reply)
         took = time.monotonic() - t0
         if took > SLOW_REQUEST_S:
             logger.warning("slow %s request: %.0f s (store %s, t %s)", _kind(msg_type), took,
@@ -194,6 +210,29 @@ class BackfillReceiver:
         if "echo" in header:
             reply["echo"] = header["echo"]
         self._replies.put((identity, sid, reply))
+
+    def _claim(self, key: str) -> dict[str, Any] | None:
+        """None if this request is new (and now ours to run); else the first copy's reply,
+        waiting for it if that copy is still running."""
+        with self._lock:
+            seen = self._answered.get(key)
+            if seen is None:
+                self._answered[key] = threading.Event()
+                while len(self._answered) > _REMEMBER:
+                    self._answered.popitem(last=False)
+                return None
+        if isinstance(seen, threading.Event):
+            seen.wait()
+            with self._lock:
+                seen = self._answered.get(key)
+        return seen if isinstance(seen, dict) else {"ok": False, "error": "repeated request"}
+
+    def _remember(self, key: str, reply: dict[str, Any]) -> None:
+        with self._lock:
+            pending = self._answered.get(key)
+            self._answered[key] = dict(reply)
+        if isinstance(pending, threading.Event):
+            pending.set()
 
     def _send_replies(self) -> None:
         while True:
