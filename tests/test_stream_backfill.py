@@ -531,9 +531,12 @@ def test_the_same_data_in_another_folder_is_not_sent_again(world, indexed):
     c = client()
     try:
         res = leaf_report(c.run_once(dry_run=True), src.name)
-        assert res == {"result": "already on Argus", "at": str(elsewhere)}
+        assert res["result"] == "would verify" and res["at"] == str(elsewhere)
         res = leaf_report(c.run_once(), src.name)
-        assert res["result"] == "already on Argus"
+        assert res["result"] == "complete" and res["checked_only"] and res["at"] == str(elsewhere)
+        assert bfill.read_marker(elsewhere)["verified"] == "readback-sha256"   # checked, then marked
+        res = leaf_report(c.run_once(), src.name)
+        assert res["result"] == "already on Argus"                           # and not checked twice
     finally:
         c.close()
     assert not remote_store(world).exists()
@@ -631,9 +634,13 @@ def test_a_single_volume_the_stream_brought_in_is_already_on_argus(world):
     there = _stream_single_volume(world.remote / "exp" / "test_001_GFP_488.ome.zarr", like=src)
     snapshot = {p: p.read_bytes() for p in there.rglob("*") if p.is_file()}
     c = world.client()
-    assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "already on Argus"
-    assert leaf_report(c.run_once(), src.name)["result"] == "already on Argus"
-    assert {p: p.read_bytes() for p in there.rglob("*") if p.is_file()} == snapshot  # untouched
+    assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "would verify"
+    res = leaf_report(c.run_once(), src.name)
+    assert res["result"] == "complete" and res["checked_only"]
+    after = {p: p.read_bytes() for p in there.rglob("*") if p.is_file() and p.name != bfill.MARKER_NAME}
+    assert after == snapshot                                  # only the pixels were checked
+    assert bfill.read_marker(there)["written_t"] == [0]
+    assert leaf_report(c.run_once(), src.name)["result"] == "already complete"
 
 
 def test_a_single_volume_with_other_data_in_the_streams_copy_is_a_conflict(world):
@@ -655,7 +662,7 @@ def test_probes_read_one_plane_not_the_whole_volume(world, indexed, monkeypatch)
     monkeypatch.setattr(bfill, "volume_digest", lambda v: digested.append(np.asarray(v).shape) or real(v))
     c = client()
     try:
-        assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "already on Argus"
+        assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "would verify"
     finally:
         c.close()
     assert digested and all(len(shape) == 2 for shape in digested)  # planes only, both ends
@@ -780,3 +787,38 @@ def test_a_dry_run_records_its_plan_and_marks_itself(world, tmp_path):
     assert doc["dry_run"] is True and doc["state"] == "complete"
     assert [e["action"] for e in doc["plan"]] == ["send"]
     assert bfill_run.load_run(tmp_path / "runs") is None           # resume ignores dry runs
+
+
+# ---------------------------------------------------------------- a faithful copy
+# 2026-10-25: "Your number one job is to make sure we have a faithful copy of the S drive
+# on Argus." Copies the stream or Globus made had only ever been counted, never compared.
+
+def test_a_copy_the_stream_made_whole_is_checked_against_the_pc_and_then_marked(world):
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    there = _as_stream_copy(make_store(remote_store(world)))
+    before = world.receiver.stats["volumes"]
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "complete" and res["checked_only"] and res["sent_timepoints"] == 0
+    assert world.receiver.stats["volumes"] == before          # nothing was sent, only checked
+    assert bfill.read_marker(there)["written_t"] == [0, 1, 2]
+    assert arrays_equal(src, there)
+
+
+def test_a_copy_whose_pixels_differ_from_the_pc_is_reported_and_left_alone(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    there = _as_stream_copy(make_store(remote_store(world)))
+    arr = zarr.open_array(str(there / "p0"), mode="r+")
+    arr[1, 2] = arr[1, 2] + 1                                  # one plane silently wrong on Argus
+    chunks = {p: p.read_bytes() for p in (there / "p0").rglob("*") if p.is_file()}
+    res = leaf_report(world.client().run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "refused" and "differ after readback" in res["reason"]
+    assert bfill.read_marker(there) is None                    # never counted as a faithful copy
+    assert {p: p.read_bytes() for p in (there / "p0").rglob("*") if p.is_file()} == chunks  # untouched
+
+
+def test_no_verify_trusts_whole_copies_as_before(world):
+    make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    _as_stream_copy(make_store(remote_store(world)))
+    res = leaf_report(world.client(verify=False).run_once(), "cell_001_GFP_488.ome.zarr")
+    assert res["result"] == "already on Argus"
+    assert bfill.read_marker(remote_store(world)) is None
