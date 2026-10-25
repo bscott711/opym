@@ -330,14 +330,26 @@ class BackfillClient:
                 t = s.written_t[0]  # e.g. the stream's 4-D copy of a single 3-D volume
             if t is None:
                 continue
-            arr = s.array()
-            vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
-            probes.append({**s.spec(), "probe": {"t": t, "sha256": bfill.volume_digest(vol)}})
+            probes.append({**s.spec(), "probe": self._probe_for(s, t)})
         if not probes:
             return
         inv = self._request(bfill.BF_INVENTORY, {"leaf": remote, "stores": probes}, "inventory")
         if inv.get("ok"):
             infos.update(inv["stores"])
+
+    def _probe_for(self, s: LocalStore, t: int) -> dict:
+        """The SHA-256 Argus compares with its copy: of one plane that is on disk here (the
+        middle one) when Argus takes plane probes, else of the whole volume t."""
+        arr = s.array()
+        if "plane_probe" in self.features:
+            nz = s.shape[1] if len(s.shape) >= 4 else s.shape[0]
+            present = s.planes_present(t, nz) if len(s.shape) >= 4 else list(range(nz))
+            if present:
+                z = present[len(present) // 2]
+                plane = np.asarray(arr[t, z] if arr.ndim >= 4 else arr[z])
+                return {"t": t, "z": z, "sha256": bfill.volume_digest(plane)}
+        vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+        return {"t": t, "sha256": bfill.volume_digest(vol)}
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict:
         t_start = time.monotonic()
