@@ -904,3 +904,21 @@ def test_an_untagged_4d_copy_with_other_pixels_is_still_a_conflict(world):
     res = leaf_report(world.client().run_once(), src.name)
     assert res["result"] == bfill.CONFLICT
     assert bfill.read_marker(there) is None
+
+
+def test_a_cut_off_3d_volume_is_finished_not_taken_for_complete(world):
+    """2026-10-25: a 3-D copy holding 4 of 301 planes counted as held, so nothing was sent and
+    the readback refused it on every run."""
+    src = _single_volume(world.local / "exp" / "test_001_GFP_488.ome.zarr", seed=5)
+    there = world.remote / "exp" / "test_001_GFP_488.ome.zarr"
+    shutil.copytree(src, there)
+    for z in range(1, NZ):                                   # only plane 0 made it
+        shutil.rmtree(there / "p0" / str(z))
+    (there / "p0" / "2").mkdir()                              # another tool's empty directory
+    assert not arrays_equal(src, there)
+    c = world.client()
+    assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "would send"
+    res = leaf_report(c.run_once(), src.name)
+    assert res["result"] == "complete"
+    assert arrays_equal(src, there)
+    assert bfill.read_marker(there) is not None
