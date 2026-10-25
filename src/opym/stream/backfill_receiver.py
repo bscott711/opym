@@ -26,6 +26,12 @@ Two exceptions keep "all of the data, once" true (2026-10-24):
     roots (the same name, pixel array and, for a sampled timepoint, the same SHA-256) is
     reported as a duplicate, so the sender skips it. Candidates come from the backfill
     registry's folders (`OPYM_BACKFILL_REGISTRY_PATH`), listed at most every 10 min.
+
+Requests are handled on a worker pool; only the socket stays on the main thread
+(2026-10-25). Before, every GPFS write and every commit's whole-store readback ran in
+the one receive loop, so four tunnels shared one writer and a long readback held up
+every other request. The run records (`backfill_runs.py`) and a log line per store
+and commit say what each run did.
 """
 
 from __future__ import annotations
@@ -33,8 +39,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import socket
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -46,6 +54,7 @@ import zmq
 
 from opym import lanes
 from opym.stream import bfill
+from opym.stream.backfill_runs import RunRecords, default_runs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +75,12 @@ _STREAM_TAG = "opym"
 _PIXEL_KEYS = ("shape", "chunks", "dtype", "compressor", "filters", "order", "dimension_separator")
 DEFAULT_SETTLE_S = 900.0
 LOCK_STALE_S = 600.0
+# Requests in flight at once: slabs from every link, plus a control request or two.
+_REQUEST_WORKERS = 16
+# A request that takes this long is logged: the 2026-10-24 stall left no trace at all.
+SLOW_REQUEST_S = 30.0
+# While requests are in flight the loop polls this often, to send their replies promptly.
+_BUSY_POLL_MS = 2
 
 
 def _env_list(name: str) -> list[str]:
@@ -80,6 +95,7 @@ class BackfillReceiver:
         settle_seconds: float | None = None,
         jobs_dir: Path | None = None,
         registry_path: Path | str | None = None,
+        runs_dir: Path | str | None = None,
     ) -> None:
         self.raw_roots = [Path(r).resolve() for r in raw_roots]
         if not self.raw_roots:
@@ -96,6 +112,18 @@ class BackfillReceiver:
         self._pool = ThreadPoolExecutor(max_workers=_COUNT_WORKERS, thread_name_prefix="bf-count")
         # Separate from `_pool`: a store's inspection waits on that pool's timepoint counts.
         self._store_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bf-store")
+        # Requests; and, separately, run-record updates, kept in the order they came.
+        self._req_pool = ThreadPoolExecutor(max_workers=_REQUEST_WORKERS, thread_name_prefix="bf-req")
+        self._run_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bf-run")
+        self._replies: queue.SimpleQueue[tuple[bytes, str, dict[str, Any]]] = queue.SimpleQueue()
+        self._inflight = 0
+        self._lock = threading.Lock()   # stats, the per-array write locks, the store index
+        self._write_locks: dict[Path, threading.Lock] = {}
+        self._index_lock = threading.Lock()
+        # Commit readback: whole volumes, ~190 MB each at today's run sizes; 8 at a time.
+        self._readback_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bf-readback")
+        self._started: dict[Path, float] = {}
+        self.runs = RunRecords(Path(runs_dir) if runs_dir else default_runs_dir(self.raw_roots))
         self.host = socket.gethostname()
         self._pending_zattrs: dict[Path, bytes] = {}
         self._arrays: dict[Path, zarr.Array] = {}
@@ -116,37 +144,69 @@ class BackfillReceiver:
 
     def close(self) -> None:
         self._sock.close(0)
-        self._store_pool.shutdown(wait=False)
-        self._pool.shutdown(wait=False)
+        for pool in (self._req_pool, self._run_pool, self._readback_pool, self._store_pool, self._pool):
+            pool.shutdown(wait=False)
 
     def run_forever(self) -> None:
-        logger.info("backfill receiver on %s, raw roots %s", self.endpoint, [str(r) for r in self.raw_roots])
+        logger.info("backfill receiver on %s, raw roots %s, run records in %s", self.endpoint,
+                    [str(r) for r in self.raw_roots], self.runs.runs_dir)
         while True:
             self._run_once(1000)
 
     def _run_once(self, timeout_ms: int = 100) -> bool:
-        if not self._sock.poll(timeout_ms):
-            return False
-        frames = self._sock.recv_multipart()
-        identity, parts = frames[0], frames[1:]
-        try:
-            msg_type, sid, header, payload = bfill.unpack(parts)
-        except Exception:  # noqa: BLE001 - malformed input is dropped, never answered
-            self.stats["rejected"] += 1
-            logger.warning("dropped a malformed message")
-            return True
+        """Receive at most one request and hand it to a worker; send whatever replies are
+        ready. The socket is only ever used from this thread."""
+        self._send_replies()
+        got = bool(self._sock.poll(_BUSY_POLL_MS if self._inflight else timeout_ms))
+        if got:
+            frames = self._sock.recv_multipart()
+            identity, parts = frames[0], frames[1:]
+            try:
+                msg_type, sid, header, payload = bfill.unpack(parts)
+            except Exception:  # noqa: BLE001 - malformed input is dropped, never answered
+                self._count("rejected")
+                logger.warning("dropped a malformed message")
+            else:
+                self._inflight += 1
+                pool = self._run_pool if msg_type == bfill.BF_RUN else self._req_pool
+                pool.submit(self._handle, identity, msg_type, sid, header, payload)
+        self._send_replies()
+        self.runs.sweep()
+        return got
+
+    def _handle(self, identity: bytes, msg_type: bytes, sid: str, header: dict, payload: bytes | None) -> None:
+        t0 = time.monotonic()
         try:
             reply = self._dispatch(msg_type, header, payload)
         except Exception as exc:  # noqa: BLE001 - one bad request must not stop the receiver
             logger.exception("request failed")
             reply = {"kind": _kind(msg_type), "ok": False, "error": f"server error: {exc}"}
-        reply.setdefault("live_active", self.live_active())
+        took = time.monotonic() - t0
+        if took > SLOW_REQUEST_S:
+            logger.warning("slow %s request: %.0f s (store %s, t %s)", _kind(msg_type), took,
+                           header.get("store") or header.get("leaf"), header.get("t"))
+        try:
+            reply.setdefault("live_active", self.live_active())
+        except Exception:  # noqa: BLE001
+            reply.setdefault("live_active", False)
         reply["server_time_s"] = time.time()
         reply["features"] = bfill.FEATURES
         if "echo" in header:
             reply["echo"] = header["echo"]
-        self._sock.send_multipart([identity, *bfill.pack(bfill.BF_ACK, sid, reply)])
-        return True
+        self._replies.put((identity, sid, reply))
+
+    def _send_replies(self) -> None:
+        while True:
+            try:
+                identity, sid, reply = self._replies.get_nowait()
+            except queue.Empty:
+                return
+            self._inflight -= 1
+            self._sock.send_multipart([identity, *bfill.pack(bfill.BF_ACK, sid, reply)])
+
+    def _count(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self.stats[key] += n
 
     # ---- policy ----------------------------------------------------------------------------
     def live_active(self) -> bool:
@@ -161,7 +221,9 @@ class BackfillReceiver:
             return self._volume(header, payload or b"")
         if msg_type == bfill.BF_COMMIT:
             return self._commit(header)
-        self.stats["rejected"] += 1
+        if msg_type == bfill.BF_RUN:
+            return self.runs.apply(header)
+        self._count("rejected")
         return {"kind": "error", "ok": False, "error": "unexpected message type"}
 
     def _dest(self, header: dict) -> tuple[Path | None, str | None]:
@@ -183,7 +245,7 @@ class BackfillReceiver:
     def _inventory(self, header: dict) -> dict[str, Any]:
         leaf, err = self._dest(header)
         if err:
-            self.stats["rejected"] += 1
+            self._count("rejected")
             return {"kind": "inventory", "ok": False, "error": err}
         out: dict[str, Any] = {}
         specs = []
@@ -206,6 +268,10 @@ class BackfillReceiver:
     # ---- the same data elsewhere ---------------------------------------------------------
     def _store_index(self) -> dict[str, list[Path]]:
         """Store name -> every `*.ome.zarr` with that name in the registry's folders."""
+        with self._index_lock:
+            return self._store_index_locked()
+
+    def _store_index_locked(self) -> dict[str, list[Path]]:
         if time.monotonic() - self._index_at < INDEX_TTL_S:
             return self._index
         self._index_at = time.monotonic()
@@ -316,7 +382,8 @@ class BackfillReceiver:
         written = list(spec.get("written_t", []))
         marker = bfill.read_marker(dest)
         if marker and set(written) <= set(marker.get("written_t", [])):
-            return {"state": bfill.MARKED, "have_t": marker.get("written_t", [])}
+            return {"state": bfill.MARKED, "have_t": marker.get("written_t", []), "from": marker.get("from"),
+                    "renamed_from": marker.get("renamed_from")}
         if main_rel is None:
             # a store directory with no pixel array yet: ours to create unless it is being written
             return self._guard_busy(dest, None, client) or {"state": bfill.PARTIAL, "have_t": []}
@@ -325,7 +392,8 @@ class BackfillReceiver:
             return self._inspect_single_volume(dest, main_rel, meta, spec, client)
         if meta is None or list(meta.get("shape", [])) != list(spec["shape"]) or meta.get("dtype") != spec["dtype"] \
                 or list(meta.get("chunks", [])) != list(spec["chunks"]):
-            return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec)}
+            return {"state": bfill.CONFLICT, "reason": _array_difference(meta, spec),
+                    "argus_shape": (meta or {}).get("shape"), "argus_dtype": (meta or {}).get("dtype")}
         busy = self._guard_busy(dest, main_rel, client)
         if busy:
             return busy
@@ -333,6 +401,10 @@ class BackfillReceiver:
         out: dict[str, Any] = {"state": bfill.PARTIAL, "have_t": have}
         if self._stream_tag(dest):
             out["stream_copy"] = True
+        if (dest / bfill.LOCK_NAME).exists():
+            # A backfill began this store and never committed it: whole or not, it still
+            # needs its readback and marker.
+            out["backfill_started"] = True
         return out
 
     def _inspect_single_volume(self, dest: Path, main_rel: str, meta: dict, spec: dict,
@@ -404,7 +476,7 @@ class BackfillReceiver:
     def _meta(self, header: dict) -> dict[str, Any]:
         dest, err = self._store_dir(header)
         if err:
-            self.stats["rejected"] += 1
+            self._count("rejected")
             return {"kind": "meta", "ok": False, "error": err}
         client = header.get("client", "")
         # re-check ownership: a store another process took since the inventory is not ours
@@ -415,6 +487,9 @@ class BackfillReceiver:
         tag = self._stream_tag(dest) if dest.exists() else None
         main_rel = self._main(dest) if tag else None
         self._touch_lock(dest, client)
+        self._started[dest] = time.monotonic()
+        logger.info("receiving %s from %s%s", dest, client, " (completing the live stream's copy)" if tag else "")
+        self.runs.note(header.get("run_id"), _run_key(header), state="receiving")
         marker = dest / bfill.MARKER_NAME
         if marker.exists():  # about to modify a store that was marked complete: it is not, any more
             marker.unlink()
@@ -466,10 +541,10 @@ class BackfillReceiver:
         base = {"kind": "volume", "store": header.get("store"), "t": header.get("t"), "z0": header.get("z0")}
         dest, err = self._store_dir(header)
         if err:
-            self.stats["rejected"] += 1
+            self._count("rejected")
             return {**base, "ok": False, "error": err}
         if self.live_active():
-            self.stats["held"] += 1
+            self._count("held")
             return {**base, "ok": False, "hold": "live", "error": "live acquisition active"}
         main_rel = self._main(dest)
         if main_rel is None:
@@ -486,14 +561,27 @@ class BackfillReceiver:
         if bfill.volume_digest(slab) != header.get("sha256"):
             return {**base, "ok": False, "error": "digest mismatch in transit", "retry": True}
         t, z0 = int(header["t"]), int(header["z0"])
-        if arr.ndim >= 4:
-            arr[t, z0:z0 + nz] = slab
+        lock = self._write_lock(bfill.array_dir(dest, main_rel), arr)
+        if lock is None:
+            _write_slab(arr, t, z0, nz, slab)
         else:
-            arr[z0:z0 + nz] = slab
+            with lock:
+                _write_slab(arr, t, z0, nz, slab)
         (dest / bfill.LOCK_NAME).write_text(header.get("client", ""))
-        self.stats["volumes"] += 1
-        self.stats["bytes"] += slab.nbytes
+        with self._lock:
+            self.stats["volumes"] += 1
+            self.stats["bytes"] += slab.nbytes
         return {**base, "ok": True}
+
+    def _write_lock(self, key: Path, arr: zarr.Array) -> threading.Lock | None:
+        """None when slabs can be written side by side: a slab is whole planes, so when
+        each chunk is one plane (the acquisition writer's layout) no two slabs share a
+        chunk. Any other chunking writes one slab at a time per array."""
+        chunks, shape = list(arr.chunks), list(arr.shape)
+        if all(c == 1 for c in chunks[:-2]) and chunks[-2:] == shape[-2:]:
+            return None
+        with self._lock:
+            return self._write_locks.setdefault(key, threading.Lock())
 
     # ---- commit ----------------------------------------------------------------------------
     def _commit(self, header: dict) -> dict[str, Any]:
@@ -508,12 +596,20 @@ class BackfillReceiver:
             return {**base, "ok": False, "error": "store has no pixel array"}
         digests = {int(t): d for t, d in header.get("digests", {}).items()}
         arr = self._array(dest, main_rel)
-        bad = []
-        for t in sorted(digests):
+        run_id, key = header.get("run_id"), _run_key(header)
+        t0 = time.monotonic()
+
+        def matches(t: int) -> bool:
             vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
-            if bfill.volume_digest(vol) != digests[t]:
-                bad.append(t)
+            return bfill.volume_digest(vol) == digests[t]
+
+        ts = sorted(digests)
+        bad = [t for t, ok in zip(ts, self._readback_pool.map(matches, ts)) if not ok]
+        readback_s = time.monotonic() - t0
         if bad:
+            logger.error("readback mismatch in %s: %d of %d timepoint(s) differ (first %s)", dest, len(bad), len(ts),
+                         bad[:5])
+            self.runs.note(run_id, key, state="readback mismatch", mismatch=bad[:20])
             return {**base, "ok": False, "error": f"{len(bad)} volume(s) differ after readback", "mismatch": bad[:20]}
         zattrs = header.get("root_zattrs") or self._pending_zattrs.get(dest)
         adopted = self._adopted.pop(dest, None)
@@ -547,13 +643,35 @@ class BackfillReceiver:
         if adopted:
             # Completed the live stream's partial copy in place (no second copy).
             marker["completed_stream_copy"] = adopted
+        if header.get("renamed_from"):
+            # A different run under a name Argus already holds: sent as `<base>_pc<N>_...`.
+            marker["renamed_from"] = header["renamed_from"]
+        if run_id:
+            marker["run_id"] = run_id
         bfill.atomic_write(dest / bfill.MARKER_NAME, json.dumps(marker, indent=1).encode())
         (dest / bfill.LOCK_NAME).unlink(missing_ok=True)
         self._pending_zattrs.pop(dest, None)
         self._arrays.pop(bfill.array_dir(dest, main_rel), None)
         self._main_rel_cache.pop(dest, None)
-        self.stats["commits"] += 1
+        self._count("commits")
+        started = self._started.pop(dest, None)
+        gb = (arr.nbytes / max(arr.shape[0], 1) * len(ts) if arr.ndim >= 4 else arr.nbytes) / 1e9
+        logger.info("verified %s: %d timepoint(s), %.2f GB read back in %.0f s%s", dest, len(ts), gb, readback_s,
+                    f", {time.monotonic() - started:.0f} s since its metadata" if started else "")
+        self.runs.note(run_id, key, state="verified", verified_t=len(ts), readback_s=round(readback_s, 1))
         return {**base, "ok": True, "verified": len(digests), "manifest_sha256": marker["manifest_sha256"]}
+
+
+def _write_slab(arr: zarr.Array, t: int, z0: int, nz: int, slab: np.ndarray) -> None:
+    if arr.ndim >= 4:
+        arr[t, z0:z0 + nz] = slab
+    else:
+        arr[z0:z0 + nz] = slab
+
+
+def _run_key(header: dict) -> str:
+    """Where a store lands, as the sender names it in its run record."""
+    return f"{header.get('leaf', '')}/{header.get('store', '')}"
 
 
 def _probe_matches(arr: zarr.Array, t: int, probe: dict) -> bool:

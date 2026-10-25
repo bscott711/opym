@@ -76,9 +76,35 @@ Useful flags: `--settle 900` (skip stores written to recently), `--max-mbps`, `-
 stop sending), `--order oldest`, repeated `--connect tcp://127.0.0.1:PORT` for several tunnels. Start it as a
 Task Scheduler task at logon; it exits nonzero on nothing and logs one JSON line per folder.
 
+## Run records (sidecar)
+
+Every run writes its record before it sends anything, then updates it as it goes (2026-10-25; a whole-drive run
+had stalled overnight with no trace of what it meant to send or where it stopped):
+
+* **plan**: every store found, with its action (`send`, `complete stream copy`, `complete elsewhere`,
+  `send renamed`, `skip`, `report`, `wait`), timepoints, bytes, where it lands;
+* **stores**: each store's result as it finishes (`complete`, `refused` + reason, `already on Argus`, ...), and,
+  on Argus, what the receiver saw itself (`receiving`, `verified`, `readback mismatch`);
+* **current**: the store and timepoint being sent, refreshed every 60 s;
+* **state**: `running`, then `complete` or `failed`; the receiver marks a run that has been silent for 10 min
+  `interrupted`, keeping the store it was on.
+
+The PC keeps its copy in `%LOCALAPPDATA%\opym-backfill\runs\<run_id>.json` (`--runs-dir`); Argus keeps one in
+`<raw root>/.opym_backfill/runs/` (`OPYM_BACKFILL_RUNS_DIR`), which opym-dashboard shows under Transfers.
+`--resume` (or `--resume <run_id>`) skips the stores the last real run finished. A store refused during a run is
+tried once more at its end. The receiver logs a line per store received and per verified commit, and warns about
+any request that takes over 30 s.
+
+**Same name, different run.** The acquisition software has reused run names. When Argus holds a store of the same
+name whose volumes have another z/y/x size or pixel type, the run is sent as `<run>_pc<N>_<channel>` (every channel
+with the same N; N is the first free one), the marker records `renamed_from`, and a later run finds it again. A
+store that differs only in its declared number of timepoints stays a conflict for a person to decide.
+
 ## Limits
 
 * OME-Zarr stores only. OME-TIFF acquisitions still use their current route.
 * The sender must be able to read the stores while the acquisition software is closed or idle; `--settle` guards writes in progress.
-* The receiver is single-threaded; one tunnel is the usual ceiling, not the receiver.
+* The receiver handles requests on a worker pool (writes side by side when chunks are one plane each, commit
+  readback 8 volumes at a time): 3.7 GB over 4 local links into GPFS took 53.8 s before, 11.3 s after
+  (2026-10-25). The SSH tunnels (~33-63 MB/s each) are the ceiling.
 * Retire the registry rows of anything you later delete; the registry still lists every discovered copy.
