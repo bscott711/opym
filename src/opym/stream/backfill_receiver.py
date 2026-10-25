@@ -290,8 +290,7 @@ class BackfillReceiver:
                 if t not in have:
                     continue
                 arr = zarr.open_array(str(bfill.array_dir(path, main_rel)), mode="r")
-                vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
-                if bfill.volume_digest(vol) == probe["sha256"]:
+                if _probe_matches(arr, t, probe):
                     out["duplicate_of"] = str(path)
                     out["duplicate_have_t"] = have
                     break
@@ -353,7 +352,7 @@ class BackfillReceiver:
         if not probe:
             return {"state": bfill.PARTIAL, "have_t": [], "stream_copy": True, "needs_probe": True}
         arr = zarr.open_array(str(bfill.array_dir(dest, main_rel)), mode="r")
-        if bfill.volume_digest(np.asarray(arr[0])) != probe["sha256"]:
+        if not _probe_matches(arr, 0, probe):
             return {"state": bfill.CONFLICT, "reason": "the live stream's copy of this single volume holds "
                                                          "different data"}
         return {"state": bfill.PARTIAL, "have_t": list(spec.get("written_t", [])), "stream_copy": True,
@@ -555,6 +554,18 @@ class BackfillReceiver:
         self._main_rel_cache.pop(dest, None)
         self.stats["commits"] += 1
         return {**base, "ok": True, "verified": len(digests), "manifest_sha256": marker["manifest_sha256"]}
+
+
+def _probe_matches(arr: zarr.Array, t: int, probe: dict) -> bool:
+    """Whether Argus's volume t (or, with `z`, its one plane z) has the probe's SHA-256.
+    A plane identifies an acquisition as surely (camera noise) for 1/Z of the reading:
+    whole-volume probes made the rig's dry run read ~190 MB per candidate (2026-10-24)."""
+    z = probe.get("z")
+    if arr.ndim >= 4:
+        sel = arr[t] if z is None else arr[t, int(z)]
+    else:
+        sel = arr[...] if z is None else arr[int(z)]
+    return bfill.volume_digest(np.asarray(sel)) == probe["sha256"]
 
 
 def _is_one_timepoint_of(meta: dict, spec: dict) -> bool:

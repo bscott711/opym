@@ -617,3 +617,19 @@ def test_a_single_volume_with_other_data_in_the_streams_copy_is_a_conflict(world
     res = leaf_report([r for r in world.client().run_once(dry_run=True) if r["leaf"].endswith("exp")],
                       src.name)
     assert res["result"] == bfill.CONFLICT and "different data" in res["reason"]
+
+
+def test_probes_read_one_plane_not_the_whole_volume(world, indexed, monkeypatch):
+    """The whole-drive dry run read every candidate's whole volume on both ends."""
+    _receiver, register, client = indexed
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
+    register(make_store(world.remote / "globus" / "exp" / "cell_001_GFP_488.ome.zarr", seed=9))
+    digested = []
+    real = bfill.volume_digest
+    monkeypatch.setattr(bfill, "volume_digest", lambda v: digested.append(np.asarray(v).shape) or real(v))
+    c = client()
+    try:
+        assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "already on Argus"
+    finally:
+        c.close()
+    assert digested and all(len(shape) == 2 for shape in digested)  # planes only, both ends
