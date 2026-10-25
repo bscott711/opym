@@ -10,6 +10,7 @@ The contract under test:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -536,3 +537,20 @@ def test_a_partial_copy_elsewhere_is_reported_not_duplicated(world, indexed):
         c.close()
     assert res["result"] == "partial copy elsewhere" and res["has"] == 1 and res["of"] == 3
     assert not remote_store(world).exists()
+
+
+def test_finding_the_pixel_array_never_walks_its_chunks(tmp_path, monkeypatch):
+    """Rig 2026-10-24: a whole-drive dry run sat for minutes: every store's chunk files
+    (tens of thousands per run) were walked just to find its pixel array."""
+    store = make_store(tmp_path / "cell_GFP_488.ome.zarr", declared_t=3, written=(0, 1, 2))
+    walked = []
+    real_walk = os.walk
+
+    def counting_walk(top, *a, **kw):
+        for dirpath, dirnames, filenames in real_walk(top, *a, **kw):
+            walked.append(Path(dirpath))
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(bfill.os, "walk", counting_walk)
+    assert bfill.main_array_rel(store) == "p0"
+    assert all(len(p.relative_to(store).parts) <= 1 for p in walked)  # root and array dirs only
