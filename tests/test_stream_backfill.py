@@ -505,7 +505,7 @@ def test_the_same_data_in_another_folder_is_not_sent_again(world, indexed):
     c = client()
     try:
         res = leaf_report(c.run_once(dry_run=True), src.name)
-        assert res == {"result": "already on Argus", "at": str(elsewhere), "has": 3, "of": 3}
+        assert res == {"result": "already on Argus", "at": str(elsewhere)}
         res = leaf_report(c.run_once(), src.name)
         assert res["result"] == "already on Argus"
     finally:
@@ -526,18 +526,22 @@ def test_a_different_run_with_the_same_name_elsewhere_is_sent(world, indexed):
     assert arrays_equal(src, remote_store(world))
 
 
-def test_a_partial_copy_elsewhere_is_reported_not_duplicated(world, indexed):
+def test_a_partial_copy_elsewhere_is_completed_where_it_is(world, indexed):
+    """Never a second copy: the run's other copy on Argus is filled in, in its own folder."""
     _receiver, register, client = indexed
     src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=9)
-    register(make_store(world.remote / "globus" / "exp" / "cell_001_GFP_488.ome.zarr", written=(0,), seed=9))
+    there = make_store(world.remote / "globus" / "exp" / "cell_001_GFP_488.ome.zarr", written=(0,), seed=9)
+    register(there)
     c = client()
     try:
+        dry = leaf_report(c.run_once(dry_run=True), src.name)
+        assert dry == {"result": "would complete elsewhere", "at": str(there), "missing_timepoints": 2, "of": 3}
         res = leaf_report(c.run_once(), src.name)
     finally:
         c.close()
-    assert res["result"] == "partial copy elsewhere" and res["has"] == 1 and res["of"] == 3
+    assert res["result"] == "complete" and res["at"] == str(there) and res["sent_timepoints"] == 2
+    assert arrays_equal(src, there) and bfill.read_marker(there)
     assert not remote_store(world).exists()
-
 
 def test_finding_the_pixel_array_never_walks_its_chunks(tmp_path, monkeypatch):
     """Rig 2026-10-24: a whole-drive dry run sat for minutes: every store's chunk files
@@ -575,3 +579,41 @@ def test_a_second_inventory_of_an_unchanged_store_is_not_recounted(world, monkey
     monkeypatch.setattr(bfill, "chunk_count_for_t", lambda *a: counts.append(a) or real(*a))
     res = leaf_report(c.run_once(dry_run=True), "cell_001_GFP_488.ome.zarr")
     assert res["missing_timepoints"] == 1 and counts == []
+
+
+def _single_volume(path: Path, seed: int) -> Path:
+    """How the PC saves a one-timepoint run: a 3-D [z, y, x] array."""
+    rng = np.random.default_rng(seed)
+    root = zarr.open_group(str(path), mode="w")
+    arr = root.create_dataset("p0", shape=(NZ, NY, NX), chunks=(1, NY, NX), dtype="<u2", dimension_separator="/")
+    arr[...] = rng.integers(1, 4000, size=(NZ, NY, NX), dtype=np.uint16)
+    return path
+
+
+def _stream_single_volume(path: Path, like: Path) -> Path:
+    """The live stream's copy of it: [1, z, y, x], stream-tagged."""
+    vol = zarr.open_array(str(like / "p0"), mode="r")[...]
+    root = zarr.open_group(str(path), mode="w")
+    arr = root.create_dataset("p0", shape=(1, NZ, NY, NX), chunks=(1, 1, NY, NX), dtype="<u2", dimension_separator="/")
+    arr[0] = vol
+    return _as_stream_copy(path)
+
+
+def test_a_single_volume_the_stream_brought_in_is_already_on_argus(world):
+    """52 of 60 'conflicts' in the rig's first whole-drive dry run (2026-10-24)."""
+    src = _single_volume(world.local / "exp" / "test_001_GFP_488.ome.zarr", seed=3)
+    there = _stream_single_volume(world.remote / "exp" / "test_001_GFP_488.ome.zarr", like=src)
+    snapshot = {p: p.read_bytes() for p in there.rglob("*") if p.is_file()}
+    c = world.client()
+    assert leaf_report(c.run_once(dry_run=True), src.name)["result"] == "already on Argus"
+    assert leaf_report(c.run_once(), src.name)["result"] == "already on Argus"
+    assert {p: p.read_bytes() for p in there.rglob("*") if p.is_file()} == snapshot  # untouched
+
+
+def test_a_single_volume_with_other_data_in_the_streams_copy_is_a_conflict(world):
+    src = _single_volume(world.local / "exp" / "test_001_GFP_488.ome.zarr", seed=3)
+    other = _single_volume(world.local / "other" / "x_GFP_488.ome.zarr", seed=4)
+    _stream_single_volume(world.remote / "exp" / "test_001_GFP_488.ome.zarr", like=other)
+    res = leaf_report([r for r in world.client().run_once(dry_run=True) if r["leaf"].endswith("exp")],
+                      src.name)
+    assert res["result"] == bfill.CONFLICT and "different data" in res["reason"]

@@ -284,11 +284,22 @@ class BackfillClient:
                 report["stores"][s.name] = {"result": state, "reason": info.get("reason")}
             elif info.get("duplicate_of"):
                 # The same data is already on Argus under another folder: never a second copy.
-                whole = set(s.written_t) <= set(info.get("duplicate_have_t", []))
-                report["stores"][s.name] = {
-                    "result": "already on Argus" if whole else "partial copy elsewhere",
-                    "at": info["duplicate_of"],
-                    "has": len(info.get("duplicate_have_t", [])), "of": len(s.written_t)}
+                # A partial one there is completed in place.
+                dup_have = set(info.get("duplicate_have_t", []))
+                at = info["duplicate_of"]
+                if set(s.written_t) <= dup_have:
+                    report["stores"][s.name] = {"result": "already on Argus", "at": at}
+                elif dry_run:
+                    report["stores"][s.name] = {"result": "would complete elsewhere", "at": at,
+                                                "missing_timepoints": len(set(s.written_t) - dup_have),
+                                                "of": len(s.written_t)}
+                else:
+                    try:
+                        done = self._sync_store(str(Path(at).parent), s, dup_have)
+                        report["stores"][s.name] = {**done, "at": at}
+                    except BackfillError as exc:
+                        logger.error("%s: %s", s.name, exc)
+                        report["stores"][s.name] = {"result": "refused", "reason": str(exc), "at": at}
             elif set(s.written_t) <= set(info.get("have_t", [])):
                 # The live stream brought it in whole; nothing to send.
                 report["stores"][s.name] = {"result": "already on Argus"}
@@ -315,6 +326,8 @@ class BackfillClient:
             info = infos.get(s.name, {})
             cands = info.get("elsewhere") or []
             t = next((t for t in s.written_t if any(t in c.get("have_t", []) for c in cands)), None)
+            if info.get("needs_probe") and s.written_t:
+                t = s.written_t[0]  # e.g. the stream's 4-D copy of a single 3-D volume
             if t is None:
                 continue
             arr = s.array()
@@ -324,9 +337,7 @@ class BackfillClient:
             return
         inv = self._request(bfill.BF_INVENTORY, {"leaf": remote, "stores": probes}, "inventory")
         if inv.get("ok"):
-            for name, info in inv["stores"].items():
-                if info.get("duplicate_of"):
-                    infos[name] = info
+            infos.update(inv["stores"])
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict:
         t_start = time.monotonic()
