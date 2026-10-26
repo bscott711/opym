@@ -87,6 +87,26 @@ def _same_bytes(have: bytes, data: bytes, rel: str) -> bool:
         return False
 
 
+def _benign_meta_diff(rel: str, have: bytes, data: bytes, main_rel: str | None) -> bool:
+    """Differences the live stream left in its pre-tag copies (23-24 Sept) that do not touch pixels:
+    an `opym` key in `.zattrs`, and `fill_value` of a coordinate array (every chunk of which is
+    compared byte for byte)."""
+    if main_rel is None:
+        return False
+    try:
+        mine, theirs = json.loads(have), json.loads(data)
+    except ValueError:
+        return False
+    if not isinstance(mine, dict) or not isinstance(theirs, dict):
+        return False
+    name = Path(rel).name
+    if name == ".zattrs":
+        return {k: v for k, v in mine.items() if k != "opym"} == {k: v for k, v in theirs.items() if k != "opym"}
+    if name == ".zarray" and rel != f"{main_rel}/.zarray":
+        return all(mine.get(k) == theirs.get(k) for k in _PIXEL_KEYS)
+    return False
+
+
 _PIXEL_KEYS = ("shape", "chunks", "dtype", "compressor", "filters", "order", "dimension_separator")
 DEFAULT_SETTLE_S = 900.0
 LOCK_STALE_S = 600.0
@@ -551,7 +571,7 @@ class BackfillReceiver:
             if busy:
                 return {"kind": "meta", "ok": False, "error": busy["reason"], "state": busy["state"]}
         tag = self._stream_tag(dest) if dest.exists() else None
-        main_rel = self._main(dest) if tag else None
+        main_rel = self._main(dest) if dest.exists() else None
         self._touch_lock(dest, client)
         self._started[dest] = time.monotonic()
         logger.info("receiving %s from %s%s", dest, client, " (completing the live stream's copy)" if tag else "")
@@ -565,13 +585,17 @@ class BackfillReceiver:
                 return {"kind": "meta", "ok": False, "error": f"unsafe path {rel!r}"}
             target = dest / rel
             if rel == ".zattrs":
-                if target.exists() and not tag and not _same_bytes(target.read_bytes(), data, rel):
+                if (target.exists() and not tag and not _same_bytes(target.read_bytes(), data, rel)
+                        and not _benign_meta_diff(rel, target.read_bytes(), data, main_rel)):
                     return {"kind": "meta", "ok": False, "error": ".zattrs exists and differs", "state": bfill.CONFLICT}
                 self._pending_zattrs[dest] = data   # written last, at commit
                 continue
             if target.exists():
                 if not _same_bytes(target.read_bytes(), data, rel):
                     if not tag:
+                        if _benign_meta_diff(rel, target.read_bytes(), data, main_rel):
+                            bfill.atomic_write(target, data)   # the acquisition's own
+                            continue
                         return {"kind": "meta", "ok": False, "error": f"{rel} exists and differs",
                                 "state": bfill.CONFLICT}
                     # The live stream's copy of this run: its pixel array must mean the same

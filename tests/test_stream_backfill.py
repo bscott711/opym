@@ -492,6 +492,49 @@ def test_the_same_zattrs_with_other_spacing_is_not_a_conflict(world):
     assert bfill.read_marker(there) is not None
 
 
+def _prestream_copy(world):
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
+    there = world.remote / "exp" / "cell_001_GFP_488.ome.zarr"
+    shutil.copytree(src, there)
+    return src, there
+
+
+def test_the_streams_pre_tag_metadata_leftovers_do_not_make_a_conflict(world):
+    """2026-10-25: Argus copies from 23-24 Sept carried an `opym` key in .zattrs and fill_value 0.0
+    on the coordinate array (the acquisition's is NaN); both refused as 'differs'."""
+    src, there = _prestream_copy(world)
+    attrs = json.loads((there / ".zattrs").read_text())
+    attrs["opym"] = {"output_format": "both"}
+    (there / ".zattrs").write_text(json.dumps(attrs))
+    zmeta = json.loads((there / "z" / ".zarray").read_text())
+    zmeta["fill_value"] = 123.0
+    (there / "z" / ".zarray").write_text(json.dumps(zmeta))
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "complete", res
+    assert "opym" not in json.loads((there / ".zattrs").read_text())     # the acquisition's own
+    assert json.loads((there / "z" / ".zarray").read_text()) == json.loads((src / "z" / ".zarray").read_text())
+
+
+def test_a_coordinate_array_of_another_dtype_is_still_a_conflict(world):
+    src, there = _prestream_copy(world)
+    zmeta = json.loads((there / "z" / ".zarray").read_text())
+    zmeta["dtype"] = "<f4" if zmeta["dtype"] != "<f4" else "<f8"
+    (there / "z" / ".zarray").write_text(json.dumps(zmeta))
+    snapshot = (there / "z" / ".zarray").read_bytes()
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "refused" and "z/.zarray exists and differs" in res["reason"], res
+    assert (there / "z" / ".zarray").read_bytes() == snapshot
+
+
+def test_an_extra_attribute_other_than_opym_is_still_a_conflict(world):
+    src, there = _prestream_copy(world)
+    attrs = json.loads((there / ".zattrs").read_text())
+    attrs["note"] = "someone else's"
+    (there / ".zattrs").write_text(json.dumps(attrs))
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "refused" and ".zattrs exists and differs" in res["reason"], res
+
+
 def test_a_store_that_is_not_the_streams_with_other_metadata_is_still_refused(world):
     make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
     other = make_store(remote_store(world), written=(0,), seed=7)
