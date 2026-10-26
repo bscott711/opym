@@ -51,9 +51,9 @@ all 13 volumes verified by readback.
 
 ```bash
 # unit lives in bioimaging/deploy/; not enabled by default
-cp ~/projects/bioimaging/deploy/opym-receive-backfill.service ~/.config/systemd/user/
+cp ~/projects/science/bioimaging/deploy/opym-receive-backfill.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now opym-receive-backfill
-tail -f ~/projects/bioimaging/logs/opym-receive-backfill.log
+tail -f ~/projects/science/bioimaging/logs/opym-receive-backfill.log
 ```
 It binds 127.0.0.1:5556 only, at `Nice=15` / idle I/O class. Edit `OPYM_BACKFILL_RAW_ROOTS` to change where stores may land.
 
