@@ -87,6 +87,21 @@ def _same_bytes(have: bytes, data: bytes, rel: str) -> bool:
         return False
 
 
+def _coordinate_chunk(dest: Path, rel: str, main_rel: str | None, files: list[dict]) -> bool:
+    """`rel` is a data chunk of a coordinate array (not the pixel array) whose layout the sender's
+    `.zarray` matches. The live stream wrote its own z values (zero-based, the acquisition's are
+    centred); the acquisition's replace them at commit, once the pixels have been read back."""
+    parent = Path(rel).parent.as_posix()
+    if main_rel is None or parent in (".", main_rel) or parent.startswith(f"{main_rel}/") or Path(rel).name.startswith("."):
+        return False
+    sent = next((f["data"] for f in files if f["rel"] == f"{parent}/.zarray"), None)
+    try:
+        mine, theirs = json.loads((dest / parent / ".zarray").read_text()), json.loads(sent)
+    except (OSError, ValueError, TypeError):
+        return False
+    return all(mine.get(k) == theirs.get(k) for k in _PIXEL_KEYS)
+
+
 def _benign_meta_diff(rel: str, have: bytes, data: bytes, main_rel: str | None) -> bool:
     """Differences the live stream left in its pre-tag copies (23-24 Sept) that do not touch pixels:
     an `opym` key in `.zattrs`, a missing `_ARRAY_DIMENSIONS` in an array's `.zattrs`, and
@@ -169,6 +184,7 @@ class BackfillReceiver:
         self.runs = RunRecords(Path(runs_dir) if runs_dir else default_runs_dir(self.raw_roots))
         self.host = socket.gethostname()
         self._pending_zattrs: dict[Path, bytes] = {}
+        self._pending_chunks: dict[Path, dict[str, bytes]] = {}   # coordinate chunks, replaced at commit
         self._arrays: dict[Path, zarr.Array] = {}
         self._main_rel_cache: dict[Path, str] = {}
         self._ctx = zmq.Context.instance()
@@ -594,6 +610,9 @@ class BackfillReceiver:
             if target.exists():
                 if not _same_bytes(target.read_bytes(), data, rel):
                     if not tag:
+                        if _coordinate_chunk(dest, rel, main_rel, header.get("files", [])):
+                            self._pending_chunks.setdefault(dest, {})[rel] = data
+                            continue
                         if _benign_meta_diff(rel, target.read_bytes(), data, main_rel):
                             bfill.atomic_write(target, data)   # the acquisition's own
                             continue
@@ -720,6 +739,9 @@ class BackfillReceiver:
             except ValueError:
                 pass
             adopted = adopted or {"session_id": tag["session_id"], "replaced": []}
+        replaced = self._pending_chunks.pop(dest, {})
+        for rel, data in replaced.items():
+            bfill.atomic_write(dest / rel, data)
         if zattrs is not None:
             bfill.atomic_write(dest / ".zattrs", zattrs)
 
@@ -742,6 +764,8 @@ class BackfillReceiver:
         if header.get("renamed_from"):
             # A different run under a name Argus already holds: sent as `<base>_pc<N>_...`.
             marker["renamed_from"] = header["renamed_from"]
+        if replaced:
+            marker["coordinate_chunks_replaced"] = sorted(replaced)
         if run_id:
             marker["run_id"] = run_id
         bfill.atomic_write(dest / bfill.MARKER_NAME, json.dumps(marker, indent=1).encode())
