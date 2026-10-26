@@ -478,6 +478,20 @@ def test_a_stream_copy_with_a_different_pixel_layout_is_still_a_conflict(world):
     assert res["result"] == "refused" and "different pixel array" in res["reason"]
 
 
+def test_the_same_zattrs_with_other_spacing_is_not_a_conflict(world):
+    """2026-10-25: 10 stores on Argus held the acquisition's `.zattrs` written compact; the PC's is
+    indented. Same document, same pixels: the copy must be verified, not refused."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
+    there = world.remote / "exp" / "cell_001_GFP_488.ome.zarr"
+    shutil.copytree(src, there)
+    attrs = json.loads((there / ".zattrs").read_text())
+    (there / ".zattrs").write_text(json.dumps(attrs, separators=(",", ":")))
+    assert (there / ".zattrs").read_bytes() != (src / ".zattrs").read_bytes()
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "complete", res
+    assert bfill.read_marker(there) is not None
+
+
 def test_a_store_that_is_not_the_streams_with_other_metadata_is_still_refused(world):
     make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr", seed=7)
     other = make_store(remote_store(world), written=(0,), seed=7)

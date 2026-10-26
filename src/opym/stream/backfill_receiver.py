@@ -74,6 +74,19 @@ _COUNT_WORKERS = 32
 # What the live stream's store tagging looks like (opym.stream.rawmirror).
 _STREAM_TAG = "opym"
 # Pixel-array .zarray keys that decide what the chunk files mean.
+def _same_bytes(have: bytes, data: bytes, rel: str) -> bool:
+    """Equal on disk, or (for zarr's JSON metadata) the same document written with other spacing:
+    the live stream wrote compact `.zattrs`, the acquisition writes indented ones."""
+    if have == data:
+        return True
+    if Path(rel).name not in (".zattrs", ".zgroup", ".zarray"):
+        return False
+    try:
+        return json.loads(have) == json.loads(data)
+    except ValueError:
+        return False
+
+
 _PIXEL_KEYS = ("shape", "chunks", "dtype", "compressor", "filters", "order", "dimension_separator")
 DEFAULT_SETTLE_S = 900.0
 LOCK_STALE_S = 600.0
@@ -552,12 +565,12 @@ class BackfillReceiver:
                 return {"kind": "meta", "ok": False, "error": f"unsafe path {rel!r}"}
             target = dest / rel
             if rel == ".zattrs":
-                if target.exists() and target.read_bytes() != data and not tag:
+                if target.exists() and not tag and not _same_bytes(target.read_bytes(), data, rel):
                     return {"kind": "meta", "ok": False, "error": ".zattrs exists and differs", "state": bfill.CONFLICT}
                 self._pending_zattrs[dest] = data   # written last, at commit
                 continue
             if target.exists():
-                if target.read_bytes() != data:
+                if not _same_bytes(target.read_bytes(), data, rel):
                     if not tag:
                         return {"kind": "meta", "ok": False, "error": f"{rel} exists and differs",
                                 "state": bfill.CONFLICT}
