@@ -42,7 +42,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from opym import lanes
+from opym import lanes, timeline
 from opym.decon_config import XY_PIXEL_SIZE_UM, deskew_decon_kwargs
 from opym.ome_zarr_writer import (
     ProcessedArrays,
@@ -689,6 +689,12 @@ class ZarrLiveLane(LiveLane):
             )
         except OSError:
             logger.exception("Live lane (zarr): could not update %s progress", store)
+        try:  # the raw stores' real per-volume times, into the store's time axis
+            timeline.sync_processed(store, [Path(p).parent for p in session.raw_arrays])
+        except Exception:  # noqa: BLE001 - times are metadata: never stop processing
+            logger.exception(
+                "Live lane (zarr): could not record acquisition times in %s", store
+            )
 
     def _trim_buffers(self, session: ZarrLiveSession) -> None:
         """Keep uncompressed buffers only for the newest BUFFER_KEEP_T

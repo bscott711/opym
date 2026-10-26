@@ -1269,7 +1269,11 @@ class StreamReceiver:
             return
         else:
             self._live.start_session(
-                session.session_id, frames_dir=session.decon_stage_dir, **common
+                session.session_id,
+                frames_dir=session.decon_stage_dir,
+                raw_stores=[session.channel_store_paths[c] for c in by_cidx],
+                time_interval_s=session.t_interval_s,
+                **common,
             )
         session.live = True
 
@@ -1458,6 +1462,10 @@ class StreamReceiver:
             t_start = time.perf_counter()
             arr = self._raw_array(session, c, asm.volume.shape, dtype.str)
             rawmirror.write_planes(arr, t, z0, slab)
+            if len(asm.z0s) == 0:  # the first slab of a volume carries its time
+                rawmirror.write_epoch(
+                    session.channel_store_paths[c], t, header.get("timestamp")
+                )
             asm.raw_write_s += time.perf_counter() - t_start
         except Exception:
             logger.exception(
@@ -1535,6 +1543,9 @@ class StreamReceiver:
         t_start = time.perf_counter()
         arr = self._raw_array(session, c, shape_zyx, dtype)
         rawmirror.write_timepoint(arr, t, raw)
+        rawmirror.write_epoch(
+            session.channel_store_paths[c], t, header.get("timestamp")
+        )
         self._stage_volume(
             session, t, c, raw, raw_write_s=time.perf_counter() - t_start
         )

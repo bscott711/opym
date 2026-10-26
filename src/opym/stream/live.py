@@ -57,7 +57,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from opym import lanes, ome_zarr_writer
+from opym import lanes, ome_zarr_writer, timeline
 from opym.decon_config import (
     DSR_INTERP_METHOD,
     decon_params_fingerprint,
@@ -165,6 +165,11 @@ class LiveSession:
     with the same name). It then owns the output and the staged frame names;
     this one only waits out its in-flight tickets and discards them."""
 
+    raw_stores: list[Path] = field(default_factory=list)
+    """The acquisition's raw channel stores: the real per-volume times are read here."""
+    time_interval_s: float = 0.0
+    """The acquisition's nominal time step, 0 when the client did not give one."""
+
     @property
     def decon_dir(self) -> Path:
         return self.work_dir / "Decon"
@@ -239,6 +244,8 @@ class LiveLane:
         dest_leaf: Path,
         z_step_um: float,
         channel_labels: list[str] | None = None,
+        raw_stores: list[Path] | None = None,
+        time_interval_s: float | None = None,
     ) -> LiveSession:
         # Create the GPFS leaf before resolving the output path; see module
         # docstring. An unwritable raw root falls back to the mirror, the
@@ -259,6 +266,8 @@ class LiveLane:
             zarr_path=live_viewer_store(Path(dest_leaf)),
             channel_labels=list(channel_labels or [f"C{c}" for c in range(n_channels)]),
             qc_dir=live_qc_dir(Path(dest_leaf)),
+            raw_stores=[Path(p) for p in raw_stores or []],
+            time_interval_s=float(time_interval_s or 0.0),
         )
         for other in self.sessions.values():
             if other.dsr_dir == session.dsr_dir and not other.superseded:
@@ -477,6 +486,7 @@ class LiveLane:
                     shape_zyx=vol.shape,
                     dtype=vol.dtype,
                     channel_labels=session.channel_labels,
+                    time_interval_s=session.time_interval_s or 1.0,
                 )
                 session.zarr_created = True
         ome_zarr_writer.write_timepoint(session.zarr_path, t, c, vol)
@@ -497,6 +507,18 @@ class LiveLane:
         except OSError:
             logger.exception(
                 "Live lane: could not update %s progress", session.zarr_path
+            )
+        self._sync_times(session)
+
+    def _sync_times(self, session: LiveSession) -> None:
+        """Keep the viewer store's time axis in step with the raw stores' real times."""
+        if not session.raw_stores or not session.zarr_created or session.superseded:
+            return
+        try:
+            timeline.sync_processed(session.zarr_path, session.raw_stores)
+        except Exception:  # noqa: BLE001 - times are metadata: never stop processing
+            logger.exception(
+                "Live lane: could not record acquisition times in %s", session.zarr_path
             )
 
     def _write_latest(self, session: LiveSession) -> None:

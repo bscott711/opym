@@ -76,6 +76,7 @@ viewer = [
 # --- Entry Points & URLs ---
 [project.scripts]
 opym = "opym.cli:main"
+opym-add-times = "opym.add_times:main"
 
 # URLs for the PyPI sidebar
 [project.urls]

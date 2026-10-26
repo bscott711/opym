@@ -8,6 +8,13 @@ change behaviour).
 ## [Unreleased]
 
 ### Fixed
+- Processed stores kept a placeholder 1.0 s time axis (or one nominal interval for the whole run) and dropped the real
+  per-volume acquisition times, so viewers could not show real elapsed time. The rig records every volume's time, and the
+  stream receiver's raw mirror threw the FRAME `timestamp` away. Now the receiver writes it to the raw store
+  (`t_epoch_s`, `rawmirror.write_epoch`), and both live lanes copy the raw stores' per-volume times (the rig's own `t`
+  array in ms, or `t_epoch_s`) into the processed store (`opym.timeline`): root `.zattrs["opym_time"]` plus the real
+  median interval on the time axis. Gapvd1_Stim_003, for one, runs at 7.50 s with ±0.4 s jitter, not 1.0 s. The legacy
+  lane also passes the client's `t_interval_s` instead of 1.0.
 - The square-root 8-bit view's ceiling (`vmax`) is fixed per channel and session by the first volume (2^k − 1 ≥ 2× its
   maximum, within [4095, 65535]; `DisplayEncoding.sqrt_for`) instead of 4095: deconvolved data passes 12 bits, and
   Gapvd1_Stim_002 (up to ~8000 counts) had 28% of its projection flattened at the fixed 12-bit ceiling. The server
@@ -22,6 +29,8 @@ change behaviour).
   correctly. `scripts/live_bench/sqrt8_compare.py` shows before | now | 16-bit side by side.
 
 ### Added
+- `opym-add-times` (`opym.add_times`): reads the raw stores' real times and writes them into processed stores that
+  already exist (dry run by default; `--apply` first copies each changed `.zattrs` to `.zattrs.before-times`).
 - SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
   receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with
   per-volume SHA-256 verified by readback before a store is marked complete (`.opym_complete.json`). Never
