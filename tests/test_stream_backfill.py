@@ -534,6 +534,18 @@ def test_other_coordinate_attributes_that_differ_are_still_a_conflict(world):
     assert res["result"] == "refused" and "z/.zattrs exists and differs" in res["reason"], res
 
 
+def test_the_streams_own_z_values_are_replaced_by_the_acquisitions_after_readback(world):
+    """2026-10-25: z/0 on Argus was zero-based (0, 0.5, ...), the acquisition's is centred."""
+    src, there = _prestream_copy(world)
+    z = zarr.open_array(str(there / "z"), mode="r+")
+    z[:] = np.asarray(z[:]) + 27.5
+    assert (there / "z" / "0").read_bytes() != (src / "z" / "0").read_bytes()
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "complete", res
+    assert (there / "z" / "0").read_bytes() == (src / "z" / "0").read_bytes()
+    assert bfill.read_marker(there)["coordinate_chunks_replaced"] == ["z/0"]
+
+
 def test_a_coordinate_array_of_another_dtype_is_still_a_conflict(world):
     src, there = _prestream_copy(world)
     zmeta = json.loads((there / "z" / ".zarray").read_text())
