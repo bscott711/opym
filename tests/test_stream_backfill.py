@@ -515,6 +515,25 @@ def test_the_streams_pre_tag_metadata_leftovers_do_not_make_a_conflict(world):
     assert json.loads((there / "z" / ".zarray").read_text()) == json.loads((src / "z" / ".zarray").read_text())
 
 
+def test_a_coordinate_array_without_its_dimension_hint_is_completed(world):
+    """z/.zattrs on Argus lacked `_ARRAY_DIMENSIONS`, which the acquisition's has."""
+    src, there = _prestream_copy(world)
+    za = there / "z" / ".zattrs"
+    za.write_text(json.dumps({"units": "um"}))
+    (src / "z" / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": ["z"], "units": "um"}))
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "complete", res
+    assert json.loads(za.read_text()) == {"_ARRAY_DIMENSIONS": ["z"], "units": "um"}
+
+
+def test_other_coordinate_attributes_that_differ_are_still_a_conflict(world):
+    src, there = _prestream_copy(world)
+    (src / "z" / ".zattrs").write_text(json.dumps({"units": "um"}))
+    (there / "z" / ".zattrs").write_text(json.dumps({"units": "nm"}))
+    res = leaf_report(world.client().run_once(), src.name)
+    assert res["result"] == "refused" and "z/.zattrs exists and differs" in res["reason"], res
+
+
 def test_a_coordinate_array_of_another_dtype_is_still_a_conflict(world):
     src, there = _prestream_copy(world)
     zmeta = json.loads((there / "z" / ".zarray").read_text())

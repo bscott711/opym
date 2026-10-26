@@ -89,8 +89,8 @@ def _same_bytes(have: bytes, data: bytes, rel: str) -> bool:
 
 def _benign_meta_diff(rel: str, have: bytes, data: bytes, main_rel: str | None) -> bool:
     """Differences the live stream left in its pre-tag copies (23-24 Sept) that do not touch pixels:
-    an `opym` key in `.zattrs`, and `fill_value` of a coordinate array (every chunk of which is
-    compared byte for byte)."""
+    an `opym` key in `.zattrs`, a missing `_ARRAY_DIMENSIONS` in an array's `.zattrs`, and
+    `fill_value` of a coordinate array (every chunk of which is compared byte for byte)."""
     if main_rel is None:
         return False
     try:
@@ -101,7 +101,8 @@ def _benign_meta_diff(rel: str, have: bytes, data: bytes, main_rel: str | None) 
         return False
     name = Path(rel).name
     if name == ".zattrs":
-        return {k: v for k, v in mine.items() if k != "opym"} == {k: v for k, v in theirs.items() if k != "opym"}
+        skip = ("opym",) if rel == ".zattrs" else ("_ARRAY_DIMENSIONS",)
+        return {k: v for k, v in mine.items() if k not in skip} == {k: v for k, v in theirs.items() if k not in skip}
     if name == ".zarray" and rel != f"{main_rel}/.zarray":
         return all(mine.get(k) == theirs.get(k) for k in _PIXEL_KEYS)
     return False
