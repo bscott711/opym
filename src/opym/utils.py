@@ -28,8 +28,8 @@ def mirror_root() -> Path:
 
 
 def resolve_output_base(leaf_dir: Path) -> Path:
-    """Returns `leaf_dir` itself when it's writable -- the normal case, and
-    the one every already-processed dataset was written under -- else a
+    """Returns `leaf_dir` itself when output can go there -- the normal case,
+    and the one every already-processed dataset was written under -- else a
     mirrored location under `mirror_root()` reproducing `leaf_dir`'s full
     absolute path.
 
@@ -41,13 +41,27 @@ def resolve_output_base(leaf_dir: Path) -> Path:
     (bioimaging/CLAUDE.md) for the common case and never relocates output
     for a dataset that already has it written in place.
 
+    A `leaf_dir` that doesn't exist yet is the usual case for a flat
+    acquisition folder (`<day>/<base>_<channel>.ome.zarr`, grouped under the
+    never-created `<day>/<base>`): it counts as writable when its nearest
+    existing ancestor is, so its output is created in place -- where the live
+    lane already puts it (it creates the leaf first). One whose output is
+    already in the mirror stays there, so nothing processed before this rule
+    is relocated or reprocessed.
+
     Reproducing the full path (not a hash) under the mirror root keeps the
     result human-navigable: `<mirror_root>/mmfs1/scratch/jacks.local/.../Cell_1/`.
     """
     leaf_dir = Path(leaf_dir)
     if os.access(leaf_dir, os.W_OK):
         return leaf_dir
-    return mirror_root() / str(leaf_dir.resolve()).lstrip("/")
+    mirrored = mirror_root() / str(leaf_dir.resolve()).lstrip("/")
+    if leaf_dir.exists() or mirrored.exists():
+        return mirrored
+    ancestor = leaf_dir.resolve().parent
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    return leaf_dir if os.access(ancestor, os.W_OK) else mirrored
 
 
 class OutputFormat(str, Enum):
