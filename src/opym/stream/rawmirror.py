@@ -20,10 +20,14 @@ feeds from.
 from __future__ import annotations
 
 import json
+import logging
+import math
 from pathlib import Path
 
 import numpy as np
 import zarr
+
+logger = logging.getLogger(__name__)
 
 _ZATTRS = {
     "multiscales": [
@@ -146,6 +150,8 @@ def create_channel_store(
         )
 
     _write_z_coordinate(store_path / "z", nz, z_step_um)
+    # when each volume was acquired; see write_epoch
+    _epoch_array(store_path, num_timepoints)
 
     # Written last -- see docstring.
     attrs = dict(_ZATTRS)
@@ -174,6 +180,59 @@ def _write_z_coordinate(z_dir: Path, nz: int, z_step_um: float) -> None:
     z_arr = zarr.open(str(z_dir), mode="a", shape=(nz,), dtype="float64")
     z_arr[:] = z_vals
     (z_dir / ".zattrs").write_text(json.dumps({"units": "um"}))
+
+
+EPOCH_ARRAY = "t_epoch_s"
+
+
+def _epoch_array(store_path: Path, n_t: int | None = None) -> zarr.Array:
+    """The per-volume acquisition-time array, created (NaN-filled) if missing.
+
+    One chunk per timepoint: the two channels' frames of a volume are written from
+    different threads, and a shared chunk would let one overwrite the other's value.
+    """
+    path = Path(store_path) / EPOCH_ARRAY
+    if (path / ".zarray").exists():
+        return zarr.open(str(path), mode="a")
+    if n_t is None:
+        n_t = zarr.open(str(Path(store_path) / "p0"), mode="r").shape[0]
+    arr = zarr.open(
+        str(path),
+        mode="a",
+        shape=(int(n_t),),
+        chunks=(1,),
+        dtype="float64",
+        fill_value=float("nan"),
+        compressor=None,
+    )
+    arr.attrs.update(
+        {
+            "_ARRAY_DIMENSIONS": ["t"],
+            "units": "s",
+            "origin": "unix epoch, rig clock: the FRAME timestamp of each volume",
+        }
+    )
+    return arr
+
+
+def write_epoch(store_path: Path, t: int, timestamp) -> None:
+    """Record when volume `t` was acquired (the FRAME `timestamp`, rig clock, unix s).
+
+    `opym.timeline` later turns this into real elapsed time for the processed store.
+    It never raises: a time that cannot be written must not cost its volume.
+    """
+    try:
+        ts = float(timestamp)
+        if not math.isfinite(ts):
+            return
+        _epoch_array(store_path)[int(t)] = ts
+    except Exception:  # noqa: BLE001 - a missing time is not worth a dropped frame
+        logger.debug(
+            "could not record the acquisition time of t=%s in %s",
+            t,
+            store_path,
+            exc_info=True,
+        )
 
 
 def write_timepoint(arr: zarr.Array, t: int, volume_zyx: np.ndarray) -> None:
