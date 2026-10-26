@@ -159,7 +159,7 @@ class DrainPool:
         lost; this receiver process does not currently persist a retry
         queue across restarts (matching the existing RESUME design's own v1
         degradation noted in `opym.stream.protocol`), so a failed drain
-        needs operator attention (check `~/projects/opym_local` receiver
+        needs operator attention (check `~/projects/science/opym_local` receiver
         logs).
         """
         pending_renames: list[tuple[Path, Path]] = []  # (tmp_dest, dest_path)

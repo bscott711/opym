@@ -197,6 +197,14 @@ def status_text(
     done = complete_timepoints(progress) if done is None else done
     n_t = int(progress.get("n_t", 0))
     state = progress.get("state", "running")
+    end = progress.get("end") or {}
+    if state != "running" and end.get("summary"):
+        # Why the stream ended as it did, and what to do (opym.stream.outcome)
+        # -- "failed" alone said nothing about a run that got no data.
+        text = f"{name}: {len(done)}/{n_t} timepoints · {end['summary']}"
+        if end.get("remedy"):
+            text += f"\n{end['remedy']}"
+        return text
     text = f"{name}: {len(done)}/{n_t} timepoints · {state}"
     if state == "running" and done:
         age = (time.time() if now is None else now) - float(
@@ -1025,19 +1033,27 @@ def live_image_class():
                 return _LiveSlicingState(self, data, cache)
 
             def _decoded(self, value):
+                """Codes under the cursor back to counts. napari hands over
+                a scalar, an array, or a (data level, value) tuple whose value
+                is None off the volume (rig 2026-10-24: a scalar-only decode
+                raised on every hover)."""
+                import numpy as np
+
                 encoding = self.display_encoding()
                 if encoding is None or value is None:
                     return value
-                return round(float(encoding.decode(value)), 1)
+                if isinstance(value, tuple):
+                    return (*value[:-1], self._decoded(value[-1]))
+                counts = np.asarray(encoding.decode(value), dtype=np.float64)
+                if counts.ndim == 0:
+                    return round(float(counts), 1)
+                return np.round(counts, 1)
 
             def _get_value(self, position):
                 return self._decoded(super()._get_value(position))
 
             def _get_value_3d(self, *args, **kwargs):
-                value = super()._get_value_3d(*args, **kwargs)
-                if isinstance(value, tuple):
-                    return value[0], self._decoded(value[1])
-                return self._decoded(value)
+                return self._decoded(super()._get_value_3d(*args, **kwargs))
 
             def _update_thumbnail(self) -> None:
                 """napari's, on the decoded counts: its own would clip the

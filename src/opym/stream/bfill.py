@@ -13,6 +13,9 @@ Messages use the same multipart framing as `protocol.py`
   BF_VOLUME     client -> server  one slab of one timepoint (payload, optionally blosc)
   BF_COMMIT     client -> server  per-volume SHA-256 manifest; the server reads every volume back
                                   and only then writes the root `.zattrs` and the completion marker
+  BF_RUN        client -> server  the sender's run record (plan, each store's result, heartbeats,
+                                  the end; see `bfill_run.py`), kept on Argus for the dashboard.
+                                  Only sent to a server that advertises the `run_log` feature.
   BF_ACK        server -> client  every reply; `kind` says which request it answers
 
 A store is complete only when it carries `.opym_complete.json` (see `read_marker`).
@@ -37,13 +40,14 @@ BF_INVENTORY = b"BF_INVENTORY"
 BF_META = b"BF_META"
 BF_VOLUME = b"BF_VOLUME"
 BF_COMMIT = b"BF_COMMIT"
+BF_RUN = b"BF_RUN"
 BF_ACK = b"BF_ACK"
-_VALID = frozenset({BF_INVENTORY, BF_META, BF_VOLUME, BF_COMMIT, BF_ACK})
+_VALID = frozenset({BF_INVENTORY, BF_META, BF_VOLUME, BF_COMMIT, BF_RUN, BF_ACK})
 
 MARKER_NAME = ".opym_complete.json"
 LOCK_NAME = ".opym_backfill.lock"
 MARKER_FORMAT = 1
-FEATURES = ["blosc", "links"]
+FEATURES = ["blosc", "links", "plane_probe", "run_log", "marker_from"]
 
 # Store state words the server returns in an inventory reply.
 ABSENT, PARTIAL, MARKED, BUSY, CONFLICT = "absent", "partial", "marked", "busy", "conflict"
@@ -125,16 +129,22 @@ def main_array_rel(store: Path) -> str | None:
     """Relative path of the store's pixel array: the `.zarray` with the most dimensions
     (then the largest). Everything else in the store is small metadata."""
     best: tuple[tuple[int, int], str] | None = None
-    for z in Path(store).rglob(".zarray"):
+    store = Path(store)
+    for dirpath, dirnames, filenames in os.walk(store):
+        if ".zarray" not in filenames:
+            continue
+        # An array's subdirectories are its chunks: never walk them (a 200-timepoint
+        # store holds ~30,000 chunk files; rglob read them all, store after store).
+        dirnames[:] = []
         try:
-            meta = json.loads(z.read_text())
+            meta = json.loads((Path(dirpath) / ".zarray").read_text())
         except (OSError, ValueError):
             continue
         shape = meta.get("shape", [])
         key = (len(shape), math.prod(shape) if shape else 0)
-        rel = z.parent.relative_to(store).as_posix()
+        rel = Path(dirpath).relative_to(store).as_posix()
         if best is None or key > best[0]:
-            best = (key, "." if rel == "" else rel)
+            best = (key, "." if rel in ("", ".") else rel)
     return best[1] if best else None
 
 
@@ -182,6 +192,19 @@ def chunk_count_for_t(store: Path, main_rel: str, t: int) -> tuple[int, int]:
         return 0, 0
     for root, _dirs, files in os.walk(d):
         for f in files:
+            n += 1
+            sz = os.stat(os.path.join(root, f)).st_size
+            smallest = sz if smallest is None else min(smallest, sz)
+    return n, smallest or 0
+
+
+def chunk_count_for_volume(store: Path, main_rel: str) -> tuple[int, int]:
+    """(chunk files present, smallest chunk file) in a whole array dir, for a 3-D store."""
+    n, smallest = 0, None
+    for root, _dirs, files in os.walk(array_dir(store, main_rel)):
+        for f in files:
+            if f.startswith("."):
+                continue
             n += 1
             sz = os.stat(os.path.join(root, f)).st_size
             smallest = sz if smallest is None else min(smallest, sz)
