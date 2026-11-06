@@ -60,15 +60,19 @@ never rewrites the `.zarray`.
   page-faults. Replaced a MATLAB permute + fwrite, a second permute, the
   C-order chunk gather (a cache miss per voxel) and a GPU round trip:
   ~2.6 s -> ~0.3 s per volume.
-- `opymWriteLiveOutputs(..., leadingIndex, shift)` writes an 8-bit view
-  buffer instead, `min(v >> shift, 255)` (naparym-live's display depth; the
-  stores stay 16-bit): the volume is transposed into a uint16 working buffer
-  kept across calls, then scaled row by row into the map. `run_live_zarr.m`
-  fixes each channel's shift for a session from its first volume and shares
-  it as `display_C<c>.json` beside the buffers. `'prepare'` takes the bit
-  depth as a 4th argument. Measured on the live path (2026-09-27): the
-  published buffer lands as fast as the 16-bit one (0.065 s), and last plane
-  -> painted drops from 0.73 to 0.63 s p50.
+- `opymWriteLiveOutputs(..., leadingIndex, lut)` writes an 8-bit view
+  buffer instead: `lut` is a uint8 vector of 65536 entries giving each count's
+  code (naparym-live's display depth; the stores stay 16-bit). The volume is
+  transposed into a uint16 working buffer kept across calls, then scaled row by
+  row into the map. `run_live_zarr.m` builds the square-root curve
+  `round(255*sqrt(min(v,vmax)/vmax))` for each channel from its first volume
+  (`vmax` = 2^k-1 >= 2x its maximum, within [4095, 65535]) and shares it as
+  `display_C<c>.json` (`{"encoding":"sqrt","vmax":N}`) beside the buffers;
+  naparym-live decodes it on the GPU. A scalar fourth argument is still accepted
+  as a right shift (`min(v >> shift, 255)`) for sessions an older server started.
+  `'prepare'` takes the bit depth as a 4th argument. Measured on the live path
+  (2026-09-27, shift version): the published buffer lands as fast as the 16-bit
+  one (0.065 s), and last plane -> painted drops from 0.73 to 0.63 s p50.
 
 All are checked against zarr-python in `tests/test_cpp_zarr_nd.py`
 (`-m gpu`), and end to end, bit for bit, against the TIFF live path in

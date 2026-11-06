@@ -4,7 +4,8 @@ Lab notebook (before/now, choices with evidence): https://claude.ai/artifact/3Kr
 
 Replaces the post-acquisition Globus web transfer for OME-Zarr acquisitions. The live stream
 (`opym-receive`, port 5555, the live lane) is **not touched**: the backfill is a separate receiver process on its
-own port and service, and it pauses while a live acquisition is running.
+own port and service, and it holds volume writes and commits while a live acquisition holds the lease (inventory and
+small-file requests still run).
 
 Why not Globus: Globus lands a store's ~16,000 small chunk files piecemeal at about 12 MB/s, and nothing tells the
 pipeline when it has finished. On 2026-10-14 the backfill staged stores mid-copy, read unlanded chunks as zeros
@@ -24,14 +25,22 @@ opym-backfill-send  --ssh tunnel 127.0.0.1:5556-->  opym-receive-backfill  --> <
   BF_COMMIT     -> per-volume SHA-256 manifest
 ```
 
+Also: an inventory request can carry a `probe` (one plane's SHA-256, feature `plane_probe`) so the receiver can
+recognise a copy that is already on Argus without reading a whole volume; `BF_RUN` mirrors the sender's run record to
+Argus (feature `run_log`).
+
 Real data (2026-10-15, two stores of `20260928-SVO-.../Cell_005`, 13 timepoints): every one of the 1,104 and 972 files
 is **byte-identical** to the source (`diff -rq` finds only the marker), 2.95 GB of volumes crossed as 1.13 GB (blosc),
 all 13 volumes verified by readback.
 
 ### Guarantees
 
-* **Never supersedes or overwrites.** A store whose pixel array (shape, dtype, chunks) differs is `conflict`; any
-  metadata file that exists and differs is a refusal. Nothing is moved to `.superseded/`.
+* **Never supersedes or overwrites pixels.** A store whose pixel array (shape, dtype, chunks, compressor, filters,
+  order, separator) differs is `conflict`. Small metadata files are compared as parsed JSON: a difference is a refusal,
+  except what the live stream is known to have written differently (its `opym` tags, `fill_value` 0.0 on `z`, a missing
+  `_ARRAY_DIMENSIONS`, zero-based `z` values), which the acquisition's own files replace. Chunks already present are
+  never rewritten; the stream's partial copies are completed in place. Coordinate chunks are replaced only after the
+  pixel readback passes. Nothing is moved to `.superseded/`.
 * **Never writes into a store something else is writing.** Modified within `OPYM_BACKFILL_SETTLE_SECONDS` (900) and not
   locked by this PC's sender: `busy`. A lock held by a different sender id also blocks.
 * **Live has priority.** The server holds every volume write and commit while `LIVE_LEASE.json` or `WARM_LEASE.json`
@@ -50,16 +59,20 @@ all 13 volumes verified by readback.
 ## Argus
 
 ```bash
-# unit lives in bioimaging/deploy/; not enabled by default
+# deployed on micro001 as a user unit (enabled); to install elsewhere, the unit lives in bioimaging/deploy/
 cp ~/projects/science/bioimaging/deploy/opym-receive-backfill.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now opym-receive-backfill
 tail -f ~/projects/science/bioimaging/logs/opym-receive-backfill.log
 ```
-It binds 127.0.0.1:5556 only, at `Nice=15` / idle I/O class. Edit `OPYM_BACKFILL_RAW_ROOTS` to change where stores may land.
+It binds `OPYM_BACKFILL_BIND` (default `tcp://127.0.0.1:5556`, loopback only), at `Nice=15` / idle I/O class. Edit
+`OPYM_BACKFILL_RAW_ROOTS` to change where stores may land.
 
 ## Acquisition PC
 
-Same environment as `opym-stream-watch` (opym with `zmq`, `msgpack`, `numcodecs`, `zarr`).
+The command on the acquisition PC is `opym-backfill-send` from the pymmcore-gui install
+(`pymmcore_gui._argus_stream.backfill_send`). opym's own `opym.stream.backfill_client` is a reduced, diverged copy used
+by the tests and for running a sender on Argus; do not use it from Windows (it sends `\mmfs1\...` remote parents and the
+receiver refuses them).
 
 ```bat
 :: one SSH tunnel (about 33-63 MB/s); add more tunnels on other ports for more throughput
@@ -74,7 +87,8 @@ opym-backfill-send --map D:\acquisitions=/mmfs1/scratch/SDSMT.LOCAL/bscott/DataU
 The path below `D:\acquisitions` is kept below the remote root, so a session lands exactly where Globus would have put it.
 Useful flags: `--settle 900` (skip stores written to recently), `--max-mbps`, `--pause-file C:\pause` (create it to
 stop sending), `--order oldest`, repeated `--connect tcp://127.0.0.1:PORT` for several tunnels. Start it as a
-Task Scheduler task at logon; it exits nonzero on nothing and logs one JSON line per folder.
+Task Scheduler task at logon. It always exits 0 (a failed pass is logged and, with `--watch`, retried on the next
+pass) and logs one JSON line per folder.
 
 ## Run records (sidecar)
 

@@ -7,6 +7,29 @@ change behaviour).
 
 ## [Unreleased]
 
+### Added
+- `opym-add-times` (`opym.add_times`): reads the raw stores' real times and writes them into processed stores that
+  already exist (dry run by default; `--apply` first copies each changed `.zattrs` to `.zattrs.before-times`).
+- SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
+  receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with
+  per-volume SHA-256 verified by readback before a store is marked complete (`.opym_complete.json`). Never
+  supersedes existing data, never writes into a store something else is writing, and holds writes while a live
+  acquisition holds the lease. See the entries below for the later work.
+- `decon_sweep_driver.m` (out-of-band decon trials) takes per-variant `psf_paths` (one PSF per channel), `stage_dir`,
+  `edge_erosion`, `interp_method` and `pad_z`. `pad_z` mirror-pads the scan axis before decon and crops back before DSR, so the
+  FFT does not wrap the slab faces and the DSR input shape equals production's. The production services do not use it.
+- `StatusRegistry` counts consecutive failures per stage
+  (`stage_status.consecutive_failures`, migrated in place), with
+  `gave_up_datasets()` and `clear_gave_up()`, so the backfill can stop
+  retrying stages that fail every time.
+- SSH backfill, later work (`docs/SSH_BACKFILL.md`): the sender writes a run record before sending (plan, each store's result, a heartbeat every 60 s) and mirrors it to Argus (`<raw root>/.opym_backfill/runs/`, shown in opym-dashboard); `--resume`, a second try for refused stores, and `<run>_pc<N>_<channel>` names when the acquisition software reused a run name (#62). Every copy the live stream or Globus brought in is hashed on the PC and read back on Argus before it earns the completion marker; `--no-verify` skips it; a mismatch is refused and never overwritten (#64). One copy of everything: the stream's partial copies are completed in place and data already elsewhere under the raw roots is not sent again (#57, #60); single volumes the stream wrote as 4-D are checked pixel for pixel (#60, #67); probes compare one plane (`plane_probe`) (#61).
+- Receiver heartbeat (`HEARTBEAT`, feature `heartbeat`): a client with a fresh heartbeat keeps its session open up to 60 minutes without new data; a `closed` reply tells a client its session was closed as idle so it stops resyncing; `CLIENT_LOG` (feature `client_log`) appends the rig's own stream log to `OPYM_STREAM_CLIENT_LOG_DIR`; every end carries a worded reason and remedy in `stream_status.json`, `.live_status.json` and `.opym_live.json` (#55).
+
+### Changed
+- `zarr` is pinned `<3` with a Python-version split (`>=2.18.7` on 3.11+, the 2.18.3 line on 3.10) so the lock does not pair it with numcodecs 0.16 (#54).
+- Repositories now live under `~/projects/science/`; unit templates, scripts and docs follow. No behaviour change (#73).
+- Docs: added `CLAUDE.md`, `docs/ROADMAP.md` and `docs/review/2026-11-review.md`; README, SSH backfill, protocol and live-view docs brought up to date with the code (2026-11 review).
+
 ### Fixed
 - Processed stores kept a placeholder 1.0 s time axis (or one nominal interval for the whole run) and dropped the real
   per-volume acquisition times, so viewers could not show real elapsed time. The rig records every volume's time, and the
@@ -27,32 +50,16 @@ change behaviour).
   `255 << shift` (7% of WT_Stim_001's projection). The default contrast top is now the 99.9th percentile of the
   Z-MIP rather than of all voxels. Sessions an older server started keep their recorded shift and still display
   correctly. `scripts/live_bench/sqrt8_compare.py` shows before | now | 16-bit side by side.
-
-### Added
-- `opym-add-times` (`opym.add_times`): reads the raw stores' real times and writes them into processed stores that
-  already exist (dry run by default; `--apply` first copies each changed `.zattrs` to `.zattrs.before-times`).
-- SSH backfill (`opym.stream.bfill`, `backfill_receiver`, `backfill_client`; `docs/SSH_BACKFILL.md`): a separate
-  receiver and sender that move finished OME-Zarr acquisitions from the acquisition PC to Argus, resumable, with
-  per-volume SHA-256 verified by readback before a store is marked complete (`.opym_complete.json`). Never
-  supersedes existing data, never writes into a store something else is writing, and holds writes while a live
-  acquisition holds the lease. The live receiver is unchanged.
-
-### Fixed
 - `opym-serve` survives a reboot: the Matlab launch sources Lmod
   (`/etc/profile.d/modules.sh`) itself when `module` or `MODULEPATH` is
   missing. After the 2026-10-01 reboot every launch failed with
   "module: command not found" (rc 127) until a manual restart. rc 127 is
   now logged loudly and reported as `last_exit_code` / `launch_env_broken`
   in `supervisor_status.json`.
-
-### Added
-- `decon_sweep_driver.m` (out-of-band decon trials) takes per-variant `psf_paths` (one PSF per channel), `stage_dir`,
-  `edge_erosion`, `interp_method` and `pad_z`. `pad_z` mirror-pads the scan axis before decon and crops back before DSR, so the
-  FFT does not wrap the slab faces and the DSR input shape equals production's. The production services do not use it.
-- `StatusRegistry` counts consecutive failures per stage
-  (`stage_status.consecutive_failures`, migrated in place), with
-  `gave_up_datasets()` and `clear_gave_up()`, so the backfill can stop
-  retrying stages that fail every time.
+- Receiver: only new data counts as activity, so a client resending unACKed slabs no longer holds a session (and the live lease, and the backfill) open forever (#52). A live lane that cannot start (for example `OPYM_DECON_PSF` on an unmounted GPFS) no longer kills the receiver; the session continues without a live view (#53). Durations under two minutes read in seconds (#55).
+- Discovery keeps walking below a folder that holds zarr stores, so acquisitions landed beside a store were no longer hidden (the dashboard showed nothing after 2026-10-14), and `mNG_488nm`-style channel labels group with their dataset (#51).
+- A flat acquisition folder's output (decon_stage, viewer, ...) goes in place next to the raw data instead of the output mirror (#54).
+- Backfill receiver: a copy cut off before its pixel array's metadata is finished instead of called a conflict (#65); a repeated metadata or commit request gets the first reply and cannot remove a finished store's marker (#66); a 3-D volume counts as held only when every chunk is on disk (#68); the same zarr JSON written with other spacing, the stream's pre-tag leftovers (`opym` key, `fill_value` 0.0 on `z`), a missing `_ARRAY_DIMENSIONS`, and the stream's zero-based `z` values are no longer conflicts; the acquisition's coordinate values replace the stream's after the pixel readback passes (#69-#72). Inventory finds a store's pixel array without walking its chunks (24 s to 1 ms) and counts chunks in parallel (#58, #59).
 
 ## [0.4.0] - 2026-09-30
 

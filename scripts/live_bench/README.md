@@ -14,13 +14,13 @@ scripts/live_bench/viewer.sh start        # naparym-live [TEST] on DCV :2
 # either: a replay from the PC (pymmcore-gui, pacing from the MDA save's frame times)
 #   uv run python -m pymmcore_gui._argus_stream.replay "S:\...\Cell_001_GFP_488.ome.zarr" --timepoints 10 --name lv_pc10
 # or: from Argus, paced like the rig (488 stack, gap, 561 stack)
-PYTHONPATH=src ../../bioimaging/.venv/bin/python scripts/live_bench/local_replay.py lv_local10 --timepoints 10
+PYTHONPATH=src ../bioimaging/.venv/bin/python scripts/live_bench/local_replay.py lv_local10 --timepoints 10
 scripts/live_bench/viewer.sh shot lv_local10_end
 scripts/live_bench/collect.sh lv_local10  # report, per-timepoint CSV, bit-identical check
 scripts/live_bench/stack.sh down && scripts/live_bench/stack.sh clean
 ```
 
-Results land in `~/projects/bioimaging/logs/live-view-2026-09-26/<run>/`:
+Results land in `~/projects/science/bioimaging/logs/live-view-2026-09-26/<run>/`:
 `report.txt` (`opym-live-trace` per hop), `summary.json`, `timeline.csv`,
 `verify.json`, the raw traces and GPU profiles, and screenshots.
 
@@ -46,6 +46,8 @@ action and every (t, c) bit-identical, processed and archived (`collect.sh`).
   the rest, and by the texture path it took. `LB_BITS=8|16`,
   `LB_VRAM_GB=0|N|auto`, `LB_VRAM_RESERVE_GB`; `OPYM_VIEW_RESIDENT=0` turns off
   the off-screen draw that places cached textures in VRAM.
+- `sqrt8_compare.py [STORE] --t T [--out F] [--quit]` shows before (right shift) | now
+  (square-root) | 16-bit side by side, to judge the 8-bit encoding by eye.
 - `bitdepth_compare.py [STORE] --t T` opens one timepoint as 16-bit | 8-bit |
   8-bit wide, side by side with one camera, to judge the 8-bit display by eye.
 - `LB_VIEW_BITS=8|16 stack.sh receiver` picks the view buffers' bit depth;
