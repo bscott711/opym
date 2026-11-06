@@ -66,18 +66,23 @@ from opym.decon_config import (
 )
 from opym.petakit import submit_live_frames_job
 from opym.stream import qcproj, trace
+
+# The names and the status readers live in live_status (light, for consumers);
+# re-exported here for the old import path.
+from opym.stream.live_status import (  # noqa: F401
+    HEARTBEAT_S,
+    LIVE_LATEST_NAME,
+    LIVE_STATUS_NAME,
+    LIVE_STATUS_STALE_S,
+    QC_LATEST_NAME,
+    live_status_is_fresh,
+    read_live_status,
+)
 from opym.utils import resolve_output_base
 
 logger = logging.getLogger(__name__)
 
-LIVE_STATUS_NAME = ".live_status.json"
-LIVE_LATEST_NAME = "live_latest.json"
-# A "running" status older than this is treated as abandoned (receiver
-# crashed): the backfill then reprocesses the dataset in batch.
-LIVE_STATUS_STALE_S = 300.0
-HEARTBEAT_S = 30.0
 MAX_ATTEMPTS = 2
-QC_LATEST_NAME = "qc_latest.json"
 # Raw volumes waiting for projection (~150 MB each at production size).
 MAX_QC_PENDING = 4
 
@@ -109,18 +114,6 @@ def channel_label(name: str) -> str:
     if len(parts) >= 2 and parts[-1].isdigit():
         return f"{parts[-2]} {parts[-1]}"
     return name
-
-
-def read_live_status(dsr_dir: Path) -> dict | None:
-    try:
-        return json.loads((Path(dsr_dir) / LIVE_STATUS_NAME).read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def live_status_is_fresh(status: dict, now: float | None = None) -> bool:
-    now = time.time() if now is None else now
-    return now - float(status.get("updated_at", 0)) <= LIVE_STATUS_STALE_S
 
 
 @dataclass
