@@ -254,7 +254,7 @@ header = {"reason": "complete"}  # or "client_abort", or "paused"
 `"paused"` means the client stopped streaming mid-run because it couldn't
 reach Argus for longer than its RAM buffer holds. The partial copy is kept on
 the staging root for the usual retention but **not** copied to `raw_root`, so
-the run's full local save can be sent there by Globus instead.
+the run's full local save can be sent there afterwards with `opym-backfill-send` (or by Globus).
 
 The receiver confirms the end with one last `ACK` carrying `"ended": true`
 (and the final `through_frame_index`), so a client can wait for it instead of
@@ -279,7 +279,7 @@ header = {"through_frame_index": 33, "server_time_s": 1755000000.456}
 ```
 
 `features` lists what this receiver supports beyond the base protocol:
-`"slabs"`, `"blosc"`, `"links"` and `"resume"`. A client uses a feature only
+`"slabs"`, `"blosc"`, `"links"`, `"resume"`, `"heartbeat"` and `"client_log"`. A client uses a feature only
 after an ACK has advertised it.
 
 `unknown_session: true` means the receiver has no open session with this

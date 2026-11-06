@@ -6,7 +6,7 @@ rotate and (optionally) deconvolution jobs to PetaKit5D running on GPUs, and can
 receive an acquisition **as it is being recorded**, process it one timepoint at a
 time, and show it live in napari.
 
-It has three parts:
+It has four parts:
 
 1. **Interactive notebook and CLI:** pick ROIs on a maximum-intensity projection,
    then crop and split one file or a whole directory (`opym`).
@@ -15,6 +15,8 @@ It has three parts:
 3. **Streaming and the live lane:** a receiver for frames streamed from the
    acquisition PC, per-timepoint decon + deskew/rotate, a processed OME-Zarr
    store, and a live viewer (`opym-receive`, `naparym-live`).
+4. **SSH backfill:** move finished OME-Zarr acquisitions from the acquisition PC
+   to Argus, verified by readback (`opym-backfill-send`, `opym-receive-backfill`).
 
 Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
@@ -45,7 +47,8 @@ newer.
 
 The `viewer` extra adds `ipywidgets`, `matplotlib`, `ipyfilechooser` and
 `ipython`. `opym` imports `ipywidgets` when it loads, so install it even if you
-only use the command line. Use `".[viewer,dev]"` to also get the test and lint
+only use the command line. The interactive ROI selector in Workflow 1 also needs
+the `ipympl` backend, which the extra does not install. Use `".[viewer,dev]"` to also get the test and lint
 tools.
 
 The GPU pipeline additionally needs MATLAB with the PetaKit5D source on a machine
@@ -63,9 +66,12 @@ neither is installed by this package.
 | `naparym-live` | `opym.live_view:main` | Follow a live acquisition in napari. |
 | `opym-live-trace` | `opym.stream.trace_report:main` | Where each timepoint spent its time, per hop. |
 | `opym-stream-watch` | `opym.stream.client:main` | Stream a local zarr store (acquisition-PC side). |
+| `opym-add-times` | `opym.add_times:main` | Write real per-volume acquisition times into existing processed stores (dry run unless `--apply`). |
+| `opym-receive-backfill` | `opym.stream.backfill_receiver:main` | Receive finished OME-Zarr acquisitions from the acquisition PC over SSH, verified by readback (see [docs/SSH_BACKFILL.md](docs/SSH_BACKFILL.md)). |
+| `opym-backfill-send` | `opym.stream.backfill_client:main` | Send finished acquisitions to `opym-receive-backfill`. The rig runs the copy that ships with pymmcore-gui. |
 
-Only `opym` is declared in this package's `pyproject.toml`. The other commands
-are declared by the companion `bioimaging` project, which installs `opym` as a
+This package declares `opym` and `opym-add-times`. The other commands are
+declared by the companion `bioimaging` project, which installs `opym` as a
 dependency and also provides the bulk backfill driver. The companion also
 installs its own command named `opym`, so where both are installed, run this
 package's CLI as `python -m opym.cli`. Every command above can likewise be run
@@ -83,7 +89,9 @@ notebook to find the correct cropping coordinates.
     jupyter lab
     ```
 
-2. Open the `OPM_Cropping_Refactored.ipynb` notebook (in `Notebooks/`).
+2. Open the `OPM_Cropping_Refactored.ipynb` notebook (in `Notebooks/`). The
+   interactive ROI selector needs the `ipympl` Matplotlib backend:
+   `uv pip install ipympl`.
 
 3. **Cell 0 & 1:** Select your base OME-TIF file (e.g., `..._Pos0.ome.tif`) and run
    the cells to generate a Max Intensity Projection (MIP).
@@ -239,6 +247,26 @@ store and streams each completed timepoint (default `--connect` is
 `tcp://127.0.0.1:5555`). Custom clients can reuse
 `opym.stream.client.StreamSender`, which needs no MATLAB or GPU dependencies.
 
+## SSH backfill of finished acquisitions
+
+`opym-backfill-send` (acquisition PC) and `opym-receive-backfill` (Argus, port
+5556, loopback) move finished OME-Zarr acquisitions to Argus: resumable, every
+volume verified by SHA-256 readback, and a store only counts as complete when
+`.opym_complete.json` exists. It never overwrites and holds writes while a live
+acquisition holds the lease. See [docs/SSH_BACKFILL.md](docs/SSH_BACKFILL.md).
+
+## Acquisition times
+
+The receiver records each volume's acquisition time in the raw store
+(`t_epoch_s`); processed stores carry real times in the root
+`.zattrs["opym_time"]` and the real median interval on the time axis.
+`opym-add-times PATH...` patches stores that already exist (dry run unless
+`--apply`; each changed `.zattrs` is first copied to `.zattrs.before-times`).
+
+**Known gap (2026-11):** the rig's sender currently puts milliseconds since the
+start of the run in the FRAME `timestamp`, not epoch seconds, so streamed stores
+do not yet get real times. See [docs/ROADMAP.md](docs/ROADMAP.md) item 1.
+
 ## The processed OME-Zarr store
 
 With `OPYM_LIVE_FORMAT=zarr` the live lane writes one **processed store** per
@@ -274,8 +302,9 @@ Without `OPYM_LIVE_FORMAT=zarr` the receiver uses the earlier TIFF-based live la
   opens that store once. Any finished dataset's `viewer/*_dsr.ome.zarr` works.
 * Each channel is shown as soon as it is processed, at full resolution, from
   memory-mapped view buffers written by the GPU server. The display is 8-bit by
-  default (`--bits 16` for the stored 16-bit values); the stored data is always
-  16-bit.
+  default (square-root encoded and decoded back to counts on the GPU, so contrast
+  limits are in counts; `--bits 16` for the stored 16-bit values); the stored data
+  is always 16-bit.
 * When live QC is running, each timepoint's cell box is drawn coloured by its
   verdict.
 * Options: `--no-follow`, `--poll SECONDS`, `--title TEXT`, `--cache-gb GB`
@@ -303,8 +332,14 @@ Read by opym's Python code (defaults in brackets):
 | `OPYM_STREAM_DIRECT_BIND` | Extra direct endpoint, e.g. `tcp://<ip>:5556`. |
 | `OPYM_STREAM_ALLOW_IPS` | Comma-separated client IPs allowed on the direct endpoint. |
 | `OPYM_STREAM_RAW_ROOTS` | Comma-separated folders the direct endpoint may write under. |
+| `OPYM_STREAM_CLIENT_LOG_DIR` | Where the rig's own stream log (`CLIENT_LOG`) is appended, one file per day [`<jobs dir>/client_logs`]. |
 | `OPYM_BACKFILL_REGISTRY_PATH` | Backfill status registry (SQLite). A run moved aside by the receiver is forgotten there. |
-| `OPYM_OUTPUT_MIRROR_ROOT` | Where output is redirected when a raw directory is not writable. |
+| `OPYM_BACKFILL_RAW_ROOTS` | Colon-separated folders `opym-receive-backfill` may write under (required). |
+| `OPYM_BACKFILL_BIND` | Backfill receiver endpoint [`tcp://127.0.0.1:5556`]. |
+| `OPYM_BACKFILL_SETTLE_SECONDS` | A store written to this recently by something else is left alone [`900`]. |
+| `OPYM_BACKFILL_RUNS_DIR` | Backfill run records [`<first raw root>/.opym_backfill/runs`]. |
+| `OPYM_OUTPUT_MIRROR_ROOT` | Where output is redirected when a raw directory is not writable [`/mmfs2/scratch/SDSMT.LOCAL/bscott/opym_backfill/outputs`]. |
+| `OPYM_VIEW_RESIDENT` | `0` turns off the off-screen draw that places cached textures in VRAM [`1`]. |
 | `OPYM_SERVE_SERVERS` | GPU servers as `id:gpu,id:gpu` [`1:0,2:1`]. |
 | `OPYM_SERVE_HANG_MIN` | Minutes without output before a backfill claim is flagged hung [`60`]. |
 | `OPYM_SERVE_KILL_HUNG` | Kill a flagged server and requeue its ticket [`1`]. |
@@ -316,7 +351,11 @@ Read by opym's Python code (defaults in brackets):
 Read by the MATLAB PetaKit5D server: `PETAKIT_ROOT` (the PetaKit5D install),
 `OPYM_PYTHON` (the Python interpreter MATLAB calls back into; falls back to
 `python` on the path), and `PETAKIT_JOBS_DIR`. The supervisor sets the per-server
-`PETAKIT_SERVER_ID`, `PETAKIT_GPU_ID`, `PETAKIT_CPUS` and `PETAKIT_IDLE_TIMEOUT`.
+`PETAKIT_SERVER_ID`, `PETAKIT_GPU_ID` (always 1: the server sees one GPU through
+`CUDA_VISIBLE_DEVICES`), `PETAKIT_CPUS` (fixed at 10) and `PETAKIT_IDLE_TIMEOUT`
+(3600 s under `opym-serve`). `PETAKIT_MAX_GPU_PIPELINE_JOBS` (default 1) caps
+concurrent GPU pipeline jobs per server. The bulk backfill unit in `bioimaging`
+also sets `OPYM_ZARR_DEFAULT_Z_STEP` and `OPYM_BACKFILL_MAX_INFLIGHT`.
 
 ## Development
 
@@ -325,6 +364,17 @@ uv pip install -e ".[viewer,dev]"
 pytest -m "not gpu"     # GPU tests also skip themselves without MATLAB and a GPU
 just format             # ruff format + ruff check --fix
 ```
+
+Run the tests from the repository root only, and never export
+`OPYM_STREAM_STAGE_ROOT`, `OPYM_LIVE_VIEW_ROOT` or `PETAKIT_JOBS_DIR` pointing at
+production while testing. See [CLAUDE.md](CLAUDE.md) for the gotchas, the
+[2026-11 review](docs/review/2026-11-review.md) and the [roadmap](docs/ROADMAP.md).
+
+`Notebooks/` holds the Jupyter notebooks. `OPM_Cropping_Refactored.ipynb` is the
+one Workflow 1 describes. `OPM_Interactive_Petakit_Tuner.ipynb` calls a function
+that no longer exists (`opym.run_llsm_petakit_processing`), and
+`OPM_Average_PSF.ipynb` is a small stub beside `Average_PSF.ipynb`; both are
+marked for review.
 
 `scripts/live_bench/` runs an isolated copy of the live stack (its own queues,
 port and server names) to measure the live view end to end and to inject faults;

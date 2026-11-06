@@ -155,9 +155,11 @@ steady one does.
 |---|---|
 | A link drops | The client resends what that link carried on the others. |
 | The receiver restarts mid-run | The client resumes the session (`resume_through`). The live lane picks up where it was: volumes already on disk count as received, a half-received one is finished from the planes already written, and processed ones aren't redone. Tested: receiver SIGKILLed mid-run, back in 10 s, 60/60 volumes bit-identical, 30/30 processed live. |
-| The PC can't reach Argus for longer than its RAM buffer | The run is marked "paused"; the full local save goes to GPFS by Globus instead. |
+| The PC can't reach Argus for longer than its RAM buffer | The run is marked "paused" and its full local save is sent later with `opym-backfill-send`. |
 | SESSION_END | Confirmed by an "ended" ACK, so a run never waits out the receiver's idle timeout. |
 | A live ticket fails | Retried once, then that timepoint is left to the batch backfill. |
+| A live lane cannot start (PSF missing, GPFS unmounted) | The error is logged with its traceback; the session continues without a live view, and the batch backfill deconvolves it later (opym#53). |
+| A client stops sending but keeps resending old slabs | Only new data keeps a session open; with a fresh heartbeat it is kept up to 60 min, then closed as `stalled`; without one, closed as `idle_timeout` after 10 min and later messages are answered `closed` (opym#52, #55). |
 | A MATLAB server dies | The supervisor requeues its ticket on the next pass (2 s) and relaunches it after 15 s. Tested: SIGKILL mid-ticket, no timepoint delayed. |
 | A MATLAB server hangs on a live ticket | Killed 30 s after its claim (`OPYM_SERVE_LIVE_DEADLINE_S`) and the ticket requeued for the other GPU. Tested: SIGSTOP mid-ticket, that one timepoint shown 30 s late, the next on time. Backfill tickets keep the 60 min `OPYM_SERVE_HANG_MIN` check. |
 | Both GPUs are on backfill when a session starts | One backfill server is killed at once and its ticket requeued (not counted against its cap), and its half-written outputs removed; the other finishes its ticket, then takes live work. A PREPARE while the MDA is set up does the first part before the run starts. Tested (R6, a real 6-minute backfill ticket on both GPUs): first timepoint 4.1 s without PREPARE, 0.76 s with; the live queue never above 1; both backfill tickets completed afterwards. |
@@ -172,12 +174,13 @@ Known gaps:
   VRAM.
 - The paused path (the client's buffer overflows while the RAM disk stays
   full) is unit-tested only.
-- `test_deskew_only_regression` fails: its no-decon peaks don't match the
-  decon-included golden, and its own golden was never committed.
+- `test_deskew_only_regression` cannot pass until its own golden
+  (`tests/fixtures/golden/deskew_only_synthetic_golden.npy`) is generated and
+  committed; its first run writes the file and skips.
 
 ## Measuring it
 
-`opym-live-trace [--session ID | --base NAME] [--jobs DIR] [--out DIR]` joins the receiver's and
+`opym-live-trace [--session ID | --base NAME] [--jobs DIR] [--out DIR] [--json]` joins the receiver's and
 lane's trace (`profiling/live_trace.jsonl`), the GPU servers' profiles
 (`profiling/S<id>.jsonl`) and naparym-live's events
 (`profiling/live_view.jsonl`) into p50/p95 per hop.
