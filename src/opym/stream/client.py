@@ -38,7 +38,11 @@ import zmq
 from numcodecs import blosc as _blosc
 
 from opym.discovery import find_channel_zarr_stores, parse_zarr_group_prefix
-from opym.metadata import parse_zarr_z_step_from_store
+from opym.metadata import (
+    GUESSED_Z_STEP_UM,
+    parse_zarr_z_step_from_store,
+    zarr_fallback_z_step,
+)
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -323,7 +327,9 @@ def watch_and_stream(
         # each store's own declared shape instead -- only z_step_um has one
         # reliable source (the first store's own "z" coordinate array).
         first_store = next(iter(local_store_paths.values()))
-        z_step_um = parse_zarr_z_step_from_store(first_store) or 0.3
+        z_step_um = parse_zarr_z_step_from_store(first_store) or zarr_fallback_z_step(
+            fallback=GUESSED_Z_STEP_UM
+        )
 
     channels = sorted(local_store_paths)
     states: dict[int, ChannelWatchState] = {}

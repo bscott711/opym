@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from opym.stream.bfill_run import DONE_RESULTS
+
 logger = logging.getLogger(__name__)
 
 RUNS_DIR_ENV = "OPYM_BACKFILL_RUNS_DIR"
@@ -25,10 +27,71 @@ STALE_S = 600.0
 SWEEP_S = 60.0
 _RUN_ID = re.compile(r"^[\w.\-]{1,120}$")
 
+RUN_STATES = ("planning", "running", "complete", "failed", "interrupted")
+# Where the receiver keeps the records on Argus (`default_runs_dir` of its first raw
+# root); readers (opym-dashboard) use this when `OPYM_BACKFILL_RUNS_DIR` is not set.
+ARGUS_RUNS_DIR = "/mmfs1/scratch/jacks.local/microscopy/.opym_backfill/runs"
+
+# The sender's per-store `action` vocabulary (backfill_client decides it, a run record
+# carries it in `plan[].action`) and `stores[key].result` vocabulary, as readers group
+# them.
+# Stores that send pixels:
+SENDING = frozenset(
+    {"send", "complete stream copy", "complete elsewhere", "send renamed"}
+)
+# Already on Argus by another route: every volume compared with the PC, nothing sent.
+CHECKING = frozenset({"verify", "verify elsewhere"})
+WORK = SENDING | CHECKING
+# Results after which a store needs nothing more (the sender's own set).
+DONE = DONE_RESULTS
+# Results a person has to look at.
+ATTENTION = frozenset({"refused", "conflict", "busy", "no pixel data"})
+
 
 def default_runs_dir(raw_roots: list[Path]) -> Path:
     env = os.environ.get(RUNS_DIR_ENV)
     return Path(env) if env else Path(raw_roots[0]) / ".opym_backfill" / "runs"
+
+
+def runs_dir() -> Path:
+    """Where a READER finds the records: ``OPYM_BACKFILL_RUNS_DIR``, else
+    `ARGUS_RUNS_DIR`."""
+    return Path(os.environ.get(RUNS_DIR_ENV) or ARGUS_RUNS_DIR)
+
+
+def read_run(path: Path | str) -> dict[str, Any] | None:
+    """One run record, or None if it is unreadable or not a JSON object."""
+    try:
+        doc = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def last_seen(doc: dict[str, Any]) -> float:
+    """When the receiver last heard from the run (epoch s; 0 if never)."""
+    return float(doc.get("argus_last_seen") or doc.get("updated_at") or 0)
+
+
+def is_stale(doc: dict[str, Any], now: float | None = None) -> bool:
+    """A run still marked planning/running that has stopped reporting for `STALE_S`:
+    the receiver's sweep marks it `interrupted`; a reader shows it so at once."""
+    now = time.time() if now is None else now
+    running = doc.get("state") in ("planning", "running")
+    return running and now - last_seen(doc) > STALE_S
+
+
+def recent_runs(
+    limit: int = 5, directory: Path | str | None = None
+) -> list[dict[str, Any]]:
+    """The newest `limit` readable run records, newest first (run ids start with their
+    start time). An absent directory is no runs."""
+    d = Path(directory) if directory is not None else runs_dir()
+    try:
+        paths = sorted(d.glob("*.json"), key=lambda p: p.name, reverse=True)[:limit]
+    except OSError:
+        return []
+    return [doc for doc in (read_run(p) for p in paths) if doc]
 
 
 class RunRecords:
@@ -150,8 +213,8 @@ class RunRecords:
                     self._docs.pop(run_id, None)  # finished: no need to keep it in memory
                     continue
                 self._docs[run_id] = doc
-                seen = float(doc.get("argus_last_seen") or doc.get("updated_at") or 0)
-                if now - seen > STALE_S:
+                seen = last_seen(doc)
+                if is_stale(doc, now):
                     doc["state"] = "interrupted"
                     doc["interrupted_at"] = seen
                     doc["interrupted_during"] = doc.get("current")

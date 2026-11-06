@@ -5,17 +5,21 @@ Lightweight SQLite status registry for the bulk no-decon backfill
 only per-dataset `_processing_log.json` files, too slow to re-scan across
 GPFS for a live dashboard across ~150-300 datasets.
 
-This module is the *writer* side, used by the bioimaging-side bulk driver.
-The standalone `opym-dashboard` repo is the *reader* side and deliberately
-does not import this module (or anything else under `opym.*` -- see that
-repo's README) to avoid dragging napari/ipywidgets/torch into a small
-always-on web service. The SQLite schema below is the contract between the
-two; keep both sides in sync if it ever changes.
+`StatusRegistry` is the *writer* side, used by the bioimaging-side bulk
+driver. `RegistryReader` (below) is the one *read-only* side: opym-dashboard,
+opym-viewer and CORE import it instead of each carrying its own copy of the
+schema and queries. This module needs only the standard library, so those
+small always-on services can import it without the heavy `opym` extras.
+The SQLite schema below is the contract; the reader opens the file
+`mode=ro` and never creates or migrates anything.
 """
 
 from __future__ import annotations
 
+import base64
+import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +81,57 @@ STAGES = ("roi_detect", "crop_zarr", "crop_tiff", "deskew", "mip_encode")
 # recheck every pass (no multi-GB re-read) and self-heals automatically
 # once the missing metadata arrives -- not made sticky the way those are.
 SIGNAL_FLAGS = ("ok", "dud", "unknown", "corrupt", "partial", "dead", "blocked")
+
+# `stage_status.status` values a writer produces ('pending' only through
+# `reset_stage`: a stage to run again, its `output_path` kept).
+STAGE_STATUSES = ("pending", "running", "done", "failed")
+
+# What a dataset reads as overall (`overall_status`). 'acquiring' is not in
+# the registry: the reader's caller passes the live lane's `acquiring()` map.
+OVERALL_STATUSES = (
+    "acquiring",
+    "blocked",
+    "failed",
+    "done",
+    "reprocessing",
+    "running",
+    "in_progress",
+    "pending",
+)
+
+REGISTRY_PATH_ENV = "OPYM_BACKFILL_REGISTRY_PATH"
+DEFAULT_REGISTRY_PATH = (
+    "/mmfs2/scratch/SDSMT.LOCAL/bscott/opym_backfill/registry.sqlite3"
+)
+
+# Every column a registry row carries once migrated (original schema first,
+# then `_NEW_*_COLUMNS` order). A registry created before a migration has fewer;
+# the reader returns whatever the file has.
+DATASET_COLUMNS = (
+    "dataset_key",
+    "root",
+    "leaf_dir",
+    "master_file",
+    "has_legacy_decon",
+    "discovered_at",
+    "signal_flag",
+    "expected_timepoints",
+    "actual_timepoints",
+    "decon_psf",
+    "decon_params",
+    "master_file_fingerprint",
+)
+STAGE_COLUMNS = (
+    "dataset_key",
+    "stage",
+    "status",
+    "started_at",
+    "finished_at",
+    "output_path",
+    "ticket_path",
+    "error_message",
+    "consecutive_failures",
+)
 
 
 # Columns added after the original schema shipped -- `CREATE TABLE IF NOT
@@ -478,3 +533,330 @@ class StatusRegistry:
             cur.execute("SELECT * FROM datasets")
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Read-only side: the one reader of `registry.sqlite3` for every consumer
+# (opym-dashboard, opym-viewer, CORE). Nothing here writes, creates a schema,
+# or migrates; a missing file reads as an empty registry.
+# ---------------------------------------------------------------------------
+
+
+def registry_path() -> Path:
+    """The registry file: `OPYM_BACKFILL_REGISTRY_PATH`, else the production default."""
+    return Path(os.environ.get(REGISTRY_PATH_ENV) or DEFAULT_REGISTRY_PATH)
+
+
+def encode_key(dataset_key: str) -> str:
+    """A dataset_key (an absolute filesystem path, possibly with spaces or other
+    special characters) as one URL path segment. Deliberately base64 (not
+    percent-encoding): uvicorn/Starlette decode %2F to '/' before route matching,
+    which splits a percent-encoded path into several segments and 404s a
+    single-segment route parameter. Base64url's alphabet never produces '/'."""
+    return base64.urlsafe_b64encode(dataset_key.encode()).decode().rstrip("=")
+
+
+def decode_key(url_key: str) -> str:
+    """Inverse of `encode_key`."""
+    padded = url_key + "=" * (-len(url_key) % 4)
+    return base64.urlsafe_b64decode(padded.encode()).decode()
+
+
+@contextmanager
+def connect_ro(
+    path: Path | str | None = None, *, timeout: float = 10.0
+) -> Iterator[sqlite3.Connection | None]:
+    """A read-only sqlite3 connection (rows are `sqlite3.Row`), or None when the
+    file does not exist yet (e.g. before the first discovery pass) -- callers
+    render an empty state rather than crash. Works on any of the backfill's
+    sqlite files (`registry`, `triage`, `auto_triage`); it never creates one."""
+    path = Path(path) if path is not None else registry_path()
+    if not path.exists():
+        yield None
+        return
+    # as_uri() percent-encodes '?', '#', '%' and spaces, which a bare
+    # f"file:{path}" would corrupt.
+    uri = f"{path.absolute().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def path_context(leaf_dir: str, root: str, max_segments: int = 4) -> str:
+    """The path segment(s) between `root` and the leaf directory, capped to the
+    last `max_segments`. `root` is identical across every dataset of one upload
+    and the leaf name is shown elsewhere, so the segments in between are what
+    tell datasets apart."""
+    leaf = Path(leaf_dir)
+    try:
+        rel_parts = leaf.relative_to(root).parts[:-1]
+    except ValueError:
+        rel_parts = leaf.parts[:-1]
+    if not rel_parts:
+        return ""
+    truncated = rel_parts[-max_segments:]
+    prefix = ".../" if len(truncated) < len(rel_parts) else ""
+    return prefix + "/".join(truncated)
+
+
+def mip_encode_is_current(stages: dict[str, dict | None]) -> bool:
+    """True when `mip_encode` is done AND was made from the current upstream
+    output. A `done` row alone is not enough: when the backfill re-submits a
+    dataset (e.g. a decon parameter change) the upstream stages go back to
+    `running` while the previous pass's `mip_encode: done` row -- and its movies
+    on disk -- are still there. Every other stage must be settled and must not
+    have (re)started after the MIPs were encoded. Timestamps are all
+    `datetime.isoformat()` in UTC, so they compare correctly as strings."""
+    mip = stages.get("mip_encode")
+    if not mip or mip["status"] != "done" or not mip.get("finished_at"):
+        return False
+    for name, s in stages.items():
+        if name == "mip_encode" or s is None:
+            continue
+        if s["status"] in ("running", "pending"):
+            return False
+        if (s.get("started_at") or "") > mip["finished_at"]:
+            return False
+    return True
+
+
+def overall_status(
+    stages: dict[str, dict | None], signal_flag: str | None = None
+) -> str:
+    """One word for a dataset from its stage rows (`{stage: row or None}`), one
+    of `OVERALL_STATUSES` (never 'acquiring': that comes from the live lane).
+
+    * 'blocked' beats 'failed': it marks a deliberate guard (no z-step derivable
+      yet) working as intended, not a bug -- see `SIGNAL_FLAGS`.
+    * 'done' only when `mip_encode` is current (`mip_encode_is_current`).
+    * 'reprocessing': earlier output exists but is being redone -- a stale
+      `done`, or a `pending` row the backfill reset (it keeps `output_path` for
+      exactly this). The MIP browser still shows the old movies for these.
+    * 'pending' is a dataset with NO stage rows at all; a stage row that is
+      'pending' without an `output_path` reads as 'in_progress'.
+    """
+    statuses = [s["status"] for s in stages.values() if s is not None]
+    if signal_flag == "blocked" and any(s == "failed" for s in statuses):
+        return "blocked"
+    if any(s == "failed" for s in statuses):
+        return "failed"
+    if mip_encode_is_current(stages):
+        return "done"
+    mip = stages.get("mip_encode")
+    if mip and (mip["status"] == "done" or mip.get("output_path")):
+        return "reprocessing"
+    if any(s == "running" for s in statuses):
+        return "running"
+    if statuses:
+        return "in_progress"
+    return "pending"
+
+
+# SQLite's default limit on `?` parameters is 999 (older builds)
+_SQL_VARIABLE_CHUNK = 500
+
+
+class RegistryReader:
+    """Read-only view of `registry.sqlite3`. Cheap to construct (nothing is
+    opened until the first query); close it, or use it as a context manager.
+
+    A missing file is an empty registry (every query returns `[]`/`{}`/None), and
+    a file that appears later is picked up on the next query. Rows come back as
+    plain dicts with every column the file has.
+    """
+
+    def __init__(self, path: Path | str | None = None, *, timeout: float = 10.0):
+        self.path = Path(path) if path is not None else registry_path()
+        self._timeout = timeout
+        self._conn: sqlite3.Connection | None = None
+
+    @property
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> RegistryReader:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def _connection(self) -> sqlite3.Connection | None:
+        if self._conn is None:
+            if not self.path.exists():
+                return None
+            uri = f"{self.path.absolute().as_uri()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, timeout=self._timeout)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def _query(self, sql: str, params: tuple | list = ()) -> list[dict]:
+        conn = self._connection()
+        if conn is None:
+            return []
+        return [dict(r) for r in conn.execute(sql, params)]
+
+    def _select_in(self, table: str, keys: list[str]) -> list[dict]:
+        out: list[dict] = []
+        for i in range(0, len(keys), _SQL_VARIABLE_CHUNK):
+            part = keys[i : i + _SQL_VARIABLE_CHUNK]
+            marks = ",".join("?" * len(part))
+            sql = f"SELECT * FROM {table} WHERE dataset_key IN ({marks})"
+            out.extend(self._query(sql, part))
+        return out
+
+    # -- plain rows -------------------------------------------------------
+
+    def datasets(self, keys: list[str] | None = None) -> list[dict]:
+        """The `datasets` rows (all, or only `keys`), every column the file has
+        -- including the triage/signal columns `signal_flag`,
+        `expected_timepoints`, `actual_timepoints`, `decon_psf`, `decon_params`
+        and `master_file_fingerprint`."""
+        if keys is None:
+            return self._query("SELECT * FROM datasets")
+        return self._select_in("datasets", list(dict.fromkeys(keys)))
+
+    def stage_rows(self, keys: list[str] | None = None) -> list[dict]:
+        """The `stage_status` rows (all, or only those of datasets `keys`)."""
+        if keys is None:
+            return self._query("SELECT * FROM stage_status")
+        return self._select_in("stage_status", list(dict.fromkeys(keys)))
+
+    def stages_by_key(
+        self, keys: list[str] | None = None
+    ) -> dict[str, dict[str, dict]]:
+        """`{dataset_key: {stage: row}}`."""
+        out: dict[str, dict[str, dict]] = {}
+        for r in self.stage_rows(keys):
+            out.setdefault(r["dataset_key"], {})[r["stage"]] = r
+        return out
+
+    def get_dataset(self, dataset_key: str) -> dict | None:
+        rows = self._query(
+            "SELECT * FROM datasets WHERE dataset_key = ?", (dataset_key,)
+        )
+        return rows[0] if rows else None
+
+    def get_stage(self, dataset_key: str, stage: str) -> dict | None:
+        rows = self._query(
+            "SELECT * FROM stage_status WHERE dataset_key = ? AND stage = ?",
+            (dataset_key, stage),
+        )
+        return rows[0] if rows else None
+
+    def leaf_dir(self, dataset_key: str) -> str | None:
+        """Just a dataset's `leaf_dir`: one indexed lookup, where `dashboard_rows`
+        builds every row. For hot paths (one request per image)."""
+        rows = self._query(
+            "SELECT leaf_dir FROM datasets WHERE dataset_key = ?", (dataset_key,)
+        )
+        return rows[0]["leaf_dir"] if rows else None
+
+    def done_stage_output(self, dataset_key: str, stage: str) -> str | None:
+        """`output_path` of a stage that is `done` (None if not done or no path)."""
+        rows = self._query(
+            "SELECT output_path FROM stage_status "
+            "WHERE dataset_key = ? AND stage = ? AND status = 'done'",
+            (dataset_key, stage),
+        )
+        return (rows[0]["output_path"] or None) if rows else None
+
+    # -- the dashboard's view ---------------------------------------------
+
+    def dashboard_rows(
+        self, live: dict[str, dict] | None = None, keys: list[str] | None = None
+    ) -> list[dict]:
+        """One row per dataset (newest `discovered_at` first) with a nested
+        `stages` dict keyed by every name in `STAGES` (None where there is no
+        row), a derived `overall_status`, `path_context`, and `live`. `live` is the
+        live lane's `{leaf_dir: {...}}` map: those rows read "acquiring" and carry
+        it as `live`. `keys` restricts it to those datasets without reading the
+        rest: a request for one card must not cost as much as the whole page.
+        """
+        live = live or {}
+        stages_by_key = self.stages_by_key(keys)
+        rows = []
+        for ds in self.datasets(keys):
+            have = stages_by_key.get(ds["dataset_key"], {})
+            stages = {s: have.get(s) for s in STAGES}
+            now_live = live.get(ds["leaf_dir"])
+            rows.append(
+                {
+                    **ds,
+                    "stages": stages,
+                    "overall_status": "acquiring"
+                    if now_live
+                    else overall_status(stages, ds.get("signal_flag")),
+                    "path_context": path_context(ds["leaf_dir"], ds["root"]),
+                    "live": now_live,
+                }
+            )
+        rows.sort(key=lambda r: r["discovered_at"], reverse=True)
+        return rows
+
+    def find_dashboard_row(
+        self, dataset_key: str, live: dict[str, dict] | None = None
+    ) -> dict | None:
+        rows = self.dashboard_rows(live, keys=[dataset_key])
+        return rows[0] if rows else None
+
+    def change_version(self) -> str:
+        """The newest timestamp anywhere in the registry (UTC `isoformat()`, so
+        strings compare). Every write that changes what a page shows stamps one
+        (a new dataset, a stage starting or finishing); pages poll with the
+        version they were rendered at."""
+        rows = self._query(
+            """SELECT max(v) AS v FROM (
+                   SELECT max(discovered_at) AS v FROM datasets
+                   UNION ALL SELECT max(started_at) FROM stage_status
+                   UNION ALL SELECT max(finished_at) FROM stage_status)"""
+        )
+        return (rows[0]["v"] if rows else None) or ""
+
+    def changed_keys(self, since: str) -> set[str]:
+        """Datasets discovered, or with a stage started or finished, after `since`."""
+        return {
+            r["dataset_key"]
+            for r in self._query(
+                """SELECT dataset_key FROM datasets WHERE discovered_at > ?
+                   UNION SELECT dataset_key FROM stage_status
+                   WHERE started_at > ? OR finished_at > ?""",
+                (since, since, since),
+            )
+        }
+
+    # -- the downstream readers' view (CORE: locate processed volumes) ------
+
+    def deskewed_datasets(self) -> list[dict]:
+        """`[{dataset_key, dsr_dir}]` for datasets whose `deskew` stage is `done`
+        and recorded an `output_path`. The recorded path is the authority on where
+        the output went (in place, or in the mirror when the source was read-only)."""
+        rows = self._query(
+            """SELECT d.dataset_key, deskew.output_path AS dsr_dir
+               FROM datasets d
+               JOIN stage_status deskew
+                   ON deskew.dataset_key = d.dataset_key
+                   AND deskew.stage = 'deskew' AND deskew.status = 'done'"""
+        )
+        return [r for r in rows if r["dsr_dir"]]
+
+    def mip_done_datasets(self) -> list[dict]:
+        """`[{dataset_key, leaf_dir, dsr_dir}]` for datasets whose `mip_encode`
+        stage is `done`; `dsr_dir` is the `deskew` stage's recorded `output_path`
+        (the folder containing `MIPs/`), None if it has no deskew row."""
+        return self._query(
+            """SELECT d.dataset_key, d.leaf_dir, deskew.output_path AS dsr_dir
+               FROM datasets d
+               JOIN stage_status mip
+                   ON mip.dataset_key = d.dataset_key
+                   AND mip.stage = 'mip_encode' AND mip.status = 'done'
+               LEFT JOIN stage_status deskew
+                   ON deskew.dataset_key = d.dataset_key AND deskew.stage = 'deskew'"""
+        )

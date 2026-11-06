@@ -6,13 +6,50 @@ Handles Micro-Manager metadata parsing and processing log generation.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, overload
 
 from .utils import DerivedPaths, OutputFormat
+
+# --- Z-step defaults: the one place they are named (microns) ------------------
+# Neither value is measured; both are the long-standing defaults, unchanged.
+# LEGACY: `parse_z_step`'s default when a legacy OME-TIF acquisition's
+# AcqSettings.txt carries no step (and what `batch.py` falls back to).
+LEGACY_DEFAULT_Z_STEP_UM = 1.0
+# GUESSED: the fallback for zarr-precropped / streamed acquisitions whose store has
+# no `z` coordinate array. A guess that is wrong for every dataset in the corpus
+# (they are 0.1 or 0.5), so the backfill refuses it unless asked (below).
+GUESSED_Z_STEP_UM = 0.3
+# The backfill's own override, by name: use this step when a store has no `z` array
+# but the real step is known (e.g. from sibling acquisitions in the session).
+ZARR_DEFAULT_Z_STEP_ENV = "OPYM_ZARR_DEFAULT_Z_STEP"
+# Accept GUESSED_Z_STEP_UM knowingly, rather than defer the dataset.
+ZARR_ALLOW_DEFAULT_Z_STEP_ENV = "OPYM_ZARR_ALLOW_DEFAULT_Z_STEP"
+
+
+def zarr_fallback_z_step(
+    environ: Mapping[str, str] | None = None, *, fallback: float | None = None
+) -> float | None:
+    """The z step to use when a zarr store has no measured one, per the environment.
+
+    Exactly bioimaging's rule: a non-empty ``OPYM_ZARR_DEFAULT_Z_STEP`` wins
+    (``float()`` of it; garbage raises ValueError, as it always did); else any
+    non-empty ``OPYM_ZARR_ALLOW_DEFAULT_Z_STEP`` (even "0") means
+    `GUESSED_Z_STEP_UM`; else ``fallback``. The backfill passes the default
+    ``fallback=None`` -- "refuse to guess, defer the dataset"; the stream client
+    passes ``fallback=GUESSED_Z_STEP_UM`` because a live session cannot wait.
+    """
+    env = os.environ if environ is None else environ
+    explicit = env.get(ZARR_DEFAULT_Z_STEP_ENV)
+    if explicit:
+        return float(explicit)
+    if env.get(ZARR_ALLOW_DEFAULT_Z_STEP_ENV):
+        return GUESSED_Z_STEP_UM
+    return fallback
 
 
 def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
@@ -40,7 +77,9 @@ def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
         return {}
 
 
-def parse_z_step(metadata_file: Path, default_z_step: float = 1.0) -> float:
+def parse_z_step(
+    metadata_file: Path, default_z_step: float = LEGACY_DEFAULT_Z_STEP_UM
+) -> float:
     """
     Parses the 'AcqSettings.txt' file to extract the Z-step size.
 
@@ -109,7 +148,9 @@ def parse_mda_settings(mda_settings_file: Path) -> dict[str, Any]:
         return {}
 
 
-def parse_zarr_z_step(mda_settings_file: Path, default_z_step: float = 0.3) -> float:
+def parse_zarr_z_step(
+    mda_settings_file: Path, default_z_step: float = GUESSED_Z_STEP_UM
+) -> float:
     """Reads `z_plan.step` (microns) from `MDA_settings.yaml`."""
     z_plan = parse_mda_settings(mda_settings_file).get("z_plan") or {}
     step = z_plan.get("step")
@@ -213,7 +254,7 @@ def parse_zarr_z_step_from_store(store: Path) -> float | None:
 def resolve_zarr_z_step(
     stores: Sequence[Path],
     mda_settings_file: Path,
-    default_z_step: float | None = 0.3,
+    default_z_step: float | None = GUESSED_Z_STEP_UM,
 ) -> tuple[float | None, str]:
     """Z step for a zarr-precropped dataset, plus where it came from.
 

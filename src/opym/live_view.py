@@ -48,9 +48,22 @@ import time
 from pathlib import Path
 
 from opym import lanes
+
+# The sqrt rule, the palette and the live pointer names have one home each
+# (opym.display, opym.stream.live_status); names re-exported for the old path.
+from opym.display import (  # noqa: F401
+    SQRT_VMAX,
+    DisplayEncoding,
+    napari_colormap_name,
+)
 from opym.ome_zarr_writer import complete_timepoints, image_group, read_progress
 from opym.stream import trace
-from opym.stream.live_zarr import buffer_name, parse_buffer_name
+from opym.stream.live_status import (  # noqa: F401
+    LIVE_LATEST_NAME,
+    QC_LOG_NAME,
+    buffer_name,
+    parse_buffer_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +75,7 @@ _NAPARI_DEDUP_SUFFIX = re.compile(r" \[\d+\]$")
 # Reading a progress file and listing a RAM-disk directory is cheap; a slow
 # poll was up to 2 s of the live view's lag.
 POLL_S = 0.1
-LIVE_LATEST_NAME = "live_latest.json"
-QC_LOG_NAME = "live_qc.jsonl"
 QC_COLORS = {"ok": "lime", "warn": "orange", "act": "red", "no_cell": "gray"}
-# omero hex colour -> napari colormap name (see ome_zarr_writer.CHANNEL_COLORS).
-# FF3D3D is the red that stores written before 2026-09-26 name for channel 1:
-# shown in magenta too.
-_COLORMAPS = {
-    "00FF00": "green",
-    "FF00FF": "magenta",
-    "FF3D3D": "magenta",
-    "00B3FF": "cyan",
-    "FFC400": "yellow",
-}
 _READ_POOL = None
 _LIVE_IMAGE = None
 # View buffers a channel keeps mapped (each timepoint is mapped once for its
@@ -152,7 +153,7 @@ _DECODED_INTERPOLATED_LOOKUP = """
 # first volume's 99.9th voxel percentile, which flattened every count above
 # 255 << shift: 7% of WT_Stim_001's projection, 28% of Gapvd1_Stim_002's.
 # The stores stay 16-bit; only what the viewer holds and uploads changes.
-SQRT_VMAX = 4095
+# (SQRT_VMAX, the floor of that range, is opym.display's.)
 # The default contrast top: this percentile of the newest volume's Z-MIP --
 # a MIP render shows projections, and the voxel percentile it replaced (most
 # voxels are background) left 16% of that cell's projection white.
@@ -262,95 +263,6 @@ def read_volume(arr, t: int, c: int, *, background: bool = False):
 
     list(_read_pool(background).map(read, range(0, out.shape[0], cz)))
     return out
-
-
-class DisplayEncoding:
-    """How a channel's 8-bit volumes hold its counts: v ~= vmax * (code /
-    255) ** power. `sqrt()` (power 2) is what servers and viewers write now;
-    `linear(shift)` (power 1, vmax = 255 << shift) reads an older server's
-    shifted buffers. Recorded per channel in the buffer dir as
-    display_C<c>.json (`record`, `from_record`)."""
-
-    def __init__(self, power: int, vmax: float, shift: int | None = None) -> None:
-        self.power = power
-        self.vmax = float(vmax)
-        self.shift = shift
-        self._lut = None
-
-    @classmethod
-    def sqrt(cls, vmax: float = SQRT_VMAX) -> DisplayEncoding:
-        return cls(2, vmax)
-
-    @classmethod
-    def sqrt_for(cls, vol) -> DisplayEncoding:
-        """The square-root curve for a channel whose first volume is `vol`:
-        vmax = 2^k - 1 >= 2 * its maximum, within [SQRT_VMAX, 65535]. As
-        run_live_zarr.m's displayLut picks it."""
-        import numpy as np
-
-        top = 2 * int(np.max(vol)) + 1 if np.size(vol) else 0
-        return cls.sqrt(
-            min(65535, max(SQRT_VMAX, 2 ** math.ceil(math.log2(max(top, 1))) - 1))
-        )
-
-    @classmethod
-    def linear(cls, shift: int) -> DisplayEncoding:
-        return cls(1, 255 << shift, shift=shift)
-
-    @classmethod
-    def from_record(cls, rec) -> DisplayEncoding | None:
-        """From a display_C<c>.json record; None if it names neither."""
-        try:
-            if rec.get("encoding") == "sqrt":
-                return cls(2, float(rec["vmax"]))
-            if "shift" in rec:
-                return cls.linear(int(rec["shift"]))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
-        return None
-
-    def record(self) -> dict:
-        if self.power == 2:
-            return {"encoding": "sqrt", "vmax": self.vmax}
-        return {"shift": self.shift}
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, DisplayEncoding) and (self.power, self.vmax) == (
-            other.power,
-            other.vmax,
-        )
-
-    def __hash__(self) -> int:
-        return hash((self.power, self.vmax))
-
-    def __repr__(self) -> str:
-        return f"DisplayEncoding(power={self.power}, vmax={self.vmax:g})"
-
-    def lut(self):
-        """Every uint16 count's code (65536 uint8), built once."""
-        import numpy as np
-
-        if self._lut is None:
-            v = np.arange(65536, dtype=np.float64)
-            if self.power == 2:
-                code = np.rint(255 * np.sqrt(np.minimum(v, self.vmax) / self.vmax))
-            else:
-                code = np.minimum(np.arange(65536) >> self.shift, 255)
-            self._lut = code.astype(np.uint8)
-        return self._lut
-
-    def decode(self, codes):
-        """Codes back to counts (float32), as the GPU decodes them."""
-        import numpy as np
-
-        n = np.asarray(codes, dtype=np.float32) / np.float32(255)
-        return (n**self.power * np.float32(self.vmax)).astype(np.float32)
-
-    def texture_clim(self, clim) -> tuple[float, float]:
-        """Contrast limits in counts as the 8-bit texture's own clim: the
-        GPU normalizes that by 255 and compares it with the decoded value,
-        v / vmax."""
-        return (float(clim[0]) * 255 / self.vmax, float(clim[1]) * 255 / self.vmax)
 
 
 def to_8bit(vol, encoding: DisplayEncoding, *, background: bool = False):
@@ -1925,7 +1837,7 @@ class LiveFollower:
             name=self._label(src.c),
             scale=self._scale,
             visible=False,
-            colormap=_COLORMAPS.get(color, "gray"),
+            colormap=napari_colormap_name(color),
             blending="additive",
             contrast_limits=[0, src.encoding.vmax if src.bits == 8 else 300],
             vram=self.vram,
