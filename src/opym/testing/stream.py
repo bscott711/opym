@@ -79,11 +79,29 @@ FRAME_HEADER_HEX = bytes.fromhex(
     "41dab3f000900000"
 )
 
+# --- session ends and the receiver's health file (opym.stream.protocol / outcome) ---
+
+# SESSION_END ``reason`` words, in the order of ``SessionEndReason``; "stalled" is
+# the receiver's own (the client kept reporting in but sent no data).
+SESSION_END_REASONS = (
+    "complete",
+    "idle_timeout",
+    "client_abort",
+    "paused",
+    "client_error",
+    "stalled",
+)
+HEALTH_NAME = "stream_health.json"
+HEALTH_EVERY_S = 5.0
+HEALTH_STALE_S = 60.0
+
 # --- the backfill wire (opym.stream.bfill) ------------------------------------------
 
 MARKER_NAME = ".opym_complete.json"
 LOCK_NAME = ".opym_backfill.lock"
 MARKER_FORMAT = 1
+DEFAULT_SETTLE_S = 900.0
+LOCK_STALE_S = 600.0
 BF_FEATURES = ["blosc", "links", "plane_probe", "run_log", "marker_from"]
 
 _LEAF = "/mmfs1/x/20261023"

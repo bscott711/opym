@@ -18,7 +18,23 @@ import os
 from pathlib import Path
 from typing import Any
 
+from opym import lanes
+from opym.stream.protocol import (
+    REASON_CLIENT_ABORT,
+    REASON_CLIENT_ERROR,
+    REASON_IDLE_TIMEOUT,
+    REASON_PAUSED,
+    REASON_STALLED,
+)
+
 STATUS_NAME = "stream_status.json"
+
+# The receiver's live health record (`<jobs>/stream_health.json`): rewritten
+# every HEALTH_EVERY_S while it runs; a reader treats one older than
+# HEALTH_STALE_S as the receiver being down.
+HEALTH_NAME = "stream_health.json"
+HEALTH_EVERY_S = 5.0
+HEALTH_STALE_S = 60.0
 
 COMPLETE = "complete"
 PARTIAL = "partial"
@@ -83,19 +99,19 @@ def summarize(
     remedy = REMEDY_RESEND
     if outcome == COMPLETE:
         summary, remedy = f"complete: {of}", ""
-    elif reason == "paused":
+    elif reason == REASON_PAUSED:
         summary = (
             f"paused by the microscope PC: it could not reach Argus for "
             f"longer than its buffer holds ({of})"
         )
-    elif reason == "idle_timeout":
+    elif reason == REASON_IDLE_TIMEOUT:
         summary = f"stream stalled: {detail or 'no new data for 10 min'} ({of})"
-    elif reason == "stalled":
+    elif reason == REASON_STALLED:
         summary = f"stream stalled: {detail} ({of})"
-    elif reason == "client_abort":
+    elif reason == REASON_CLIENT_ABORT:
         summary = f"stopped on the microscope (run canceled or app closed): {of}"
         remedy = REMEDY_IF_LONGER
-    elif reason == "client_error":
+    elif reason == REASON_CLIENT_ERROR:
         summary = f"the microscope PC's stream sender failed: {detail} ({of})"
     else:  # "complete" from a client whose run came in short
         summary = f"the microscope reported the run finished, but only {of}"
@@ -128,3 +144,22 @@ def read_status(leaf_dir: Path) -> dict[str, Any] | None:
         return json.loads((Path(leaf_dir) / STATUS_NAME).read_text())
     except (OSError, ValueError):
         return None
+
+
+def health_path(jobs: Path | str | None = None) -> Path:
+    """`<jobs>/stream_health.json`; `jobs` defaults to `lanes.jobs_dir()`
+    (so `PETAKIT_JOBS_DIR` is honoured)."""
+    return (Path(jobs) if jobs is not None else lanes.jobs_dir()) / HEALTH_NAME
+
+
+def read_health(path: Path | str | None = None) -> dict[str, Any] | None:
+    """The receiver's health record, or None if it is missing or unreadable.
+
+    Staleness is the caller's call: compare the record's `updated_at` (epoch
+    seconds) against `HEALTH_STALE_S`.
+    """
+    try:
+        rec = json.loads(Path(path or health_path()).read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None

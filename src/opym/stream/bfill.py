@@ -46,6 +46,10 @@ _VALID = frozenset({BF_INVENTORY, BF_META, BF_VOLUME, BF_COMMIT, BF_RUN, BF_ACK}
 MARKER_NAME = ".opym_complete.json"
 LOCK_NAME = ".opym_backfill.lock"
 MARKER_FORMAT = 1
+# A transfer with no new bytes for this long counts as settled, and a store lock
+# older than LOCK_STALE_S is taken over (backfill_receiver's defaults).
+DEFAULT_SETTLE_S = 900.0
+LOCK_STALE_S = 600.0
 FEATURES = ["blosc", "links", "plane_probe", "run_log", "marker_from"]
 
 # Store state words the server returns in an inventory reply.

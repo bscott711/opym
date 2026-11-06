@@ -170,6 +170,10 @@ from opym.stream.protocol import (
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
+    REASON_COMPLETE,
+    REASON_IDLE_TIMEOUT,
+    REASON_PAUSED,
+    REASON_STALLED,
     SERVER_FEATURES,
     frame_epoch,
     pack_message,
@@ -195,7 +199,7 @@ HEARTBEAT_FRESH_SEC = 30.0
 STALL_MAX_SEC = 3600.0
 _STALL_WARN_EVERY_S = 300.0
 # stream_health.json (see `_write_health`) is rewritten this often.
-_HEALTH_EVERY_S = 5.0
+_HEALTH_EVERY_S = outcome.HEALTH_EVERY_S
 _RECENT_ENDS_KEPT = 20
 # Where CLIENT_LOG lines go; default `<jobs dir>/client_logs`.
 _CLIENT_LOG_DIR_ENV_VAR = "OPYM_STREAM_CLIENT_LOG_DIR"
@@ -1697,7 +1701,7 @@ class StreamReceiver:
             return
         self._finalize_session(
             session,
-            reason=str(header.get("reason", "complete")),
+            reason=str(header.get("reason", REASON_COMPLETE)),
             detail=str(header.get("detail", "") or ""),
         )
 
@@ -1743,7 +1747,7 @@ class StreamReceiver:
         # SESSION_END landed.
         self._send_ack(session, ended=True)
 
-        if reason == "paused":
+        if reason == REASON_PAUSED:
             self._retain_paused(session)
         elif session.write_root != session.raw_root:
             # Staging was active for this session -- hand its completed
@@ -1902,13 +1906,13 @@ class StreamReceiver:
                     )
                 continue
             if alive:
-                reason = "stalled"
+                reason = REASON_STALLED
                 detail = (
                     f"the microscope PC kept reporting in but sent no new data "
                     f"for {outcome.span(quiet)} ({client or 'no details'})"
                 )
             elif hb is not None:
-                reason = "idle_timeout"
+                reason = REASON_IDLE_TIMEOUT
                 detail = (
                     f"the microscope PC went silent: no data for "
                     f"{outcome.span(quiet)} and no heartbeat for "
@@ -1916,7 +1920,7 @@ class StreamReceiver:
                     + (f"; it last reported {client}" if client else "")
                 )
             else:
-                reason = "idle_timeout"
+                reason = REASON_IDLE_TIMEOUT
                 detail = f"no new data from the microscope PC for {outcome.span(quiet)}"
             self._idle_closed[session.session_id] = now
             self._finalize_session(session, reason=reason, detail=detail)
@@ -2051,7 +2055,7 @@ class StreamReceiver:
             "recent_ends": self._recent_ends,
         }
         try:
-            path = lanes.jobs_dir() / "stream_health.json"
+            path = outcome.health_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f".stream_health.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(record, indent=1))

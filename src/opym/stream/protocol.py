@@ -346,6 +346,22 @@ _VALID_TYPES = frozenset(
 #   host             str    -- OPTIONAL, the client's host name
 
 
+# Why a session ended (SESSION_END ``reason``, and the receiver's own ends).
+# ``REASON_STALLED`` is the receiver's alone: the client kept reporting in but
+# sent no data. Clients only ever send the other five.
+REASON_COMPLETE = "complete"
+REASON_IDLE_TIMEOUT = "idle_timeout"
+REASON_CLIENT_ABORT = "client_abort"
+REASON_PAUSED = "paused"
+REASON_CLIENT_ERROR = "client_error"
+REASON_STALLED = "stalled"
+
+SessionEndReason = Literal[
+    "complete", "idle_timeout", "client_abort", "paused", "client_error", "stalled"
+]
+"""Every reason a session can end with (the six ``REASON_*`` strings)."""
+
+
 OutputFormat = Literal["tiff", "ome-zarr", "both"]
 """Format the processed (DSR) result is kept in on Argus.
 
@@ -473,9 +489,9 @@ class SessionEndHeader(_SessionEndOptional):
     # "paused": this run stopped streaming mid-way (Argus unreachable longer
     # than the send buffer holds); Argus won't keep its partial copy.
     # "client_error": this app's sender failed (``detail`` says how).
-    reason: Literal[
-        "complete", "idle_timeout", "client_abort", "paused", "client_error"
-    ]
+    # A client sends one of the first five ``SessionEndReason`` values;
+    # "stalled" is only ever the receiver's own.
+    reason: SessionEndReason
 
 
 class _AckOptional(TypedDict, total=False):
