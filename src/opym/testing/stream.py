@@ -23,7 +23,7 @@ BF_SESSION_ID = "rig-1"
 
 # --- FRAME header time: what the receiver makes of each -----------------------------
 
-EPOCH_S = 1_792_000_000.5  # 2026-10-21, the rig's clock
+EPOCH_S = 1_792_000_000.5  # 2026-10-14 17:46 UTC, the rig's clock
 
 
 def rig_frame_header(timestamp: float, acq_first_s: float | None = EPOCH_S) -> dict:

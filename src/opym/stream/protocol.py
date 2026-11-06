@@ -36,6 +36,7 @@ additional length-prefixing is needed anywhere in this protocol.
 from __future__ import annotations
 
 import math
+import numbers
 from typing import Any, Literal, TypedDict
 
 # --- Wire constants -------------------------------------------------------
@@ -598,8 +599,11 @@ EPOCH_MAX_S = 1e11
 
 
 def epoch_s_or_none(value: object) -> float | None:
-    """``value`` as a float if finite and inside the epoch-seconds window, else None."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """``value`` as a float if finite and inside the epoch-seconds window, else None.
+
+    Accepts Python and numpy int/float scalars (numpy registers them as Real).
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return None
     v = float(value)
     return v if math.isfinite(v) and EPOCH_MIN_S <= v < EPOCH_MAX_S else None

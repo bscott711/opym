@@ -123,7 +123,16 @@ def test_no_tunnel_means_a_plain_message_not_a_hang(
 
     monkeypatch.setattr(bs, "TUNNEL_UP_TIMEOUT_S", 0.3)
     code = bs.main(
-        ["--map", f"{tmp_path}=/remote", "--ssh-host", "Argus", "--local-port", "1"],
+        [
+            "--map",
+            f"{tmp_path}=/remote",
+            "--ssh-host",
+            "Argus",
+            "--local-port",
+            "1",
+            "--priority",
+            "normal",
+        ],
         tunnel_factory=_DeadTunnel,
         defaults=bs.SenderDefaults(links=4),
     )
@@ -151,7 +160,10 @@ def test_without_a_tunnel_factory_the_endpoint_is_the_default_one(
             pass
 
     monkeypatch.setattr(bs, "BackfillClient", _Client)
-    assert bs.main(["--map", f"{tmp_path}=/remote", "--dry-run"]) == 0
+    assert (
+        bs.main(["--map", f"{tmp_path}=/remote", "--dry-run", "--priority", "normal"])
+        == 0
+    )
     assert seen["connect"] == [bs.DEFAULT_CONNECT] == ["tcp://127.0.0.1:5556"]
     assert seen["window"] == 4  # one link
 

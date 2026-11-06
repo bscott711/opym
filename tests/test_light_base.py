@@ -37,6 +37,14 @@ LIGHT_MODULES = [
     "opym.lanes",
     "opym.decon_config",
     "opym.ome_zarr_writer",
+    "opym.display",
+    "opym.store",
+    "opym.stream.live_status",
+    "opym.testing",
+    "opym.testing.display",
+    "opym.testing.store",
+    "opym.testing.readers",
+    "opym.testing.stream",
 ]
 
 HEAVY = [

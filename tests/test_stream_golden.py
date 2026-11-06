@@ -131,3 +131,13 @@ def test_store_names():
         assert bfill.valid_store_name(name), name
     for name in golden.INVALID_STORE_NAMES:
         assert not bfill.valid_store_name(name), name
+
+
+@pytest.mark.parametrize(
+    "scalar", [np.float32(1.792e9), np.float64(1.792e9), np.int64(1_792_000_000)]
+)
+def test_numpy_scalars_are_times_too(scalar):
+    assert protocol.epoch_s_or_none(scalar) == float(scalar)
+    assert protocol.frame_epoch({"timestamp": scalar}) == (float(scalar), "timestamp")
+    assert protocol.epoch_s_or_none(np.float32(3408.0)) is None
+    assert protocol.epoch_s_or_none(np.bool_(True)) is None
