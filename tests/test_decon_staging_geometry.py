@@ -71,15 +71,18 @@ def test_staged_matches_orient_zyx_for_dsr():
 
 
 def test_rot90_and_zxy_differ_by_an_ny_flip():
-    """The staging convention is a MIRROR of the deskew-only zarr convention.
+    """The staging (rot90) convention is the CANONICAL one; `zxy` is not.
 
-    The no-decon zarr path reaches PetaKit5D via `inputAxisOrder='zxy'`,
-    which is a pure transpose. Staging instead applies rot90, matching the
-    legacy OME-TIFF cropper -- and, critically, matching the rot90 the
-    measured PSF itself carries (psf_tools/extract_bead_psf.py). The two
-    differ by a flip of the coverslip axis, so DSR_decon output is a lateral
-    mirror of DSR_nodecon output. That is a deliberate, documented choice;
-    this test exists so it can never become an accident.
+    `inputAxisOrder='zxy'` (`zarr_input=True`) is a pure transpose. Staging
+    instead applies rot90, matching the legacy OME-TIFF cropper, the live
+    lane and -- critically -- the rot90 the measured PSF itself carries
+    (psf_tools/extract_bead_psf.py). The two differ by a flip of the
+    coverslip axis, so `zxy` output is a lateral (y) mirror of the
+    canonical one. The mirror is real. Decided 2026-11-05: rot90 is correct.
+    Production deskew-only zarr datasets now stage rot90 too (bioimaging
+    backfill/pipeline.py, `zarr_input=False`), so `zxy` is no longer used by
+    the backfill. This test pins the difference so it cannot become an
+    accident again.
     """
     vol = np.arange(7 * 5 * 11).reshape(7, 5, 11)
     zxy = vol.transpose(2, 1, 0)
