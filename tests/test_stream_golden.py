@@ -156,11 +156,16 @@ def test_session_end_reasons_are_one_set_of_words():
     )
     assert reasons == golden.SESSION_END_REASONS
     assert typing.get_args(protocol.SessionEndReason) == golden.SESSION_END_REASONS
-    # the end record says something different for each, never the "complete" fallback
+    # every word reaches its own branch of the end record (a stall, whether the
+    # client went silent or kept reporting in, reads the same), none the fallback
     summaries = {
-        r: outcome.summarize(r, {(0, 0)}, 3, 1, detail="why")["summary"] for r in reasons
+        r: outcome.summarize(r, {(0, 0)}, 3, 1, detail="why")["summary"]
+        for r in reasons
     }
-    assert len(set(summaries.values())) == len(reasons)
+    assert summaries[protocol.REASON_IDLE_TIMEOUT] == summaries[protocol.REASON_STALLED]
+    assert len(set(summaries.values())) == len(reasons) - 1
+    assert "only" in summaries[protocol.REASON_COMPLETE]  # the short-run fallback
+    assert all("only" not in v for k, v in summaries.items() if k != "complete")
 
 
 def test_stream_health_names_and_path(tmp_path, monkeypatch):
