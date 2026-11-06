@@ -32,10 +32,12 @@ do not overlap.
 - Decision: the trust model for ING-F5 (loopback on a shared host vs direct endpoint) sets its priority.
 
 ## 3. Handedness decision, then consistency
-- What: the user picks the canonical handedness using a known asymmetric structure or the rig geometry. Then align
-  the no-decon zarr path (flip, or stage like the decon path) and stamp the choice in `.zattrs`.
-- Why: PROC-F1. `DSR_nodecon` is a y-mirror of every decon and live product.
-- Depends on: an open user decision. Reprocessing of the roughly 44 no-decon zarr datasets follows the decision.
+- Decided 2026-11-05 (user): canonical = rot90 (decon, live, measured PSF, TIFF cropper). Done: bioimaging PR #39 makes
+  the deskew-only zarr path stage rot90 TIFFs like decon (`zarr_input=False`), so new output matches.
+- Open: (a) the roughly 44 datasets processed deskew-only 2026-09-24..28 (`zarr_mirror/DSR_nodecon`) are still the old
+  mirrored handedness and have NOT been re-run; the user decides whether to re-run them, and we delete nothing.
+  (b) Stamp the convention in store `.zattrs`.
+- Why: PROC-F1. Until (a) is done those `DSR_nodecon` outputs are a y-mirror of every decon and live product.
 
 ## 4. Test isolation and view eviction safety
 - What: autouse conftest isolation for `OPYM_LIVE_VIEW_ROOT` and `OPYM_STREAM_STAGE_ROOT`; a state check in

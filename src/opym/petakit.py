@@ -392,6 +392,13 @@ def submit_remote_deskew_job(
     #     'xzy' -> [2,3,1] -> (490, 1458, 41)   ny=490   shears the wrong axis
     #     'zxy' -> [3,2,1] -> (1458, 490, 41)   ny=1458  correct
     # Pinned by tests/test_zarr_deskew_geometry.py.
+    #
+    # Handedness: zarr_input=True ('zxy', a pure transpose) yields the
+    # Y-MIRROR of the canonical rot90 convention (measured PSF, TIFF cropper,
+    # decon, live lane; pinned by tests/test_decon_staging_geometry.py).
+    # Decided 2026-11-05: rot90 is canonical. The bioimaging backfill no
+    # longer uses zarr_input=True: it stages rot90 TIFFs for every zarr
+    # dataset and submits with zarr_input=False ('yxz', no permute).
     input_axis_order = "zxy" if zarr_input else "yxz"
     # The DSR result is (y, x, z) either way and is written out as TIFF.
     output_axis_order = "yxz"

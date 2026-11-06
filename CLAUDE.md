@@ -40,8 +40,11 @@ Review and plan: [docs/review/2026-11-review.md](docs/review/2026-11-review.md),
   and `bfill.py` must match pymmcore-gui's `_bfill.py`.
 - Times: the rig sends ms since run start, not epoch seconds, so streamed stores have no real times yet (ING-F1).
   `opym-add-times` is dry run unless `--apply`.
-- Handedness: `DSR_nodecon` (plain transpose) is a y-mirror of decon and live output (PROC-F1). Undecided; do not
-  move masks between them.
+- Handedness: decided 2026-11-05, canonical = rot90 (decon, live, measured PSF, TIFF cropper). `zarr_input=True`
+  (`zxy`) is its y-mirror and the backfill no longer uses it (bioimaging PR #39: deskew-only stages rot90 too). The
+  roughly 44 zarr datasets processed deskew-only 2026-09-24..28 are still the old mirrored handedness and have NOT been
+  re-run (user decides; no deletions by us): do not move masks from those to other products. Stamping the convention
+  in store `.zattrs` is still open (PROC-F1).
 - sqrt8 contract with naparym-live: 8-bit view buffers hold `round(255*sqrt(v/vmax))`, `vmax` = 2^k-1 fixed per
   channel and session by the first volume; encode (MATLAB LUT), decode (GPU shader) and `DisplayEncoding` must agree.
 - The receiver's idle-close text ("closed on Argus ...", `receiver._IDLE_CLOSED_REASON`) is string-matched by the rig;
