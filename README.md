@@ -74,7 +74,10 @@ This package declares `opym` and `opym-add-times`. The other commands are
 declared by the companion `bioimaging` project, which installs `opym` as a
 dependency and also provides the bulk backfill driver. The companion also
 installs its own command named `opym`, so where both are installed, run this
-package's CLI as `python -m opym.cli`. Every command above can likewise be run
+package's CLI as `python -m opym.cli`. Which `opym` is on PATH depends on
+install order: in the production bioimaging venv it is this package's
+`opym.cli` since the 0.5.0 install on 2026-11-05, and a reinstall of
+bioimaging flips it (CL-08). Every command above can likewise be run
 from a plain checkout as `python -m <module>`, for example
 `python -m opym.stream.receiver`.
 
@@ -245,7 +248,8 @@ an SSH port forward. An optional direct endpoint
 is a ready-made client for the acquisition PC. It polls a local pymmcore MDA zarr
 store and streams each completed timepoint (default `--connect` is
 `tcp://127.0.0.1:5555`). Custom clients can reuse
-`opym.stream.client.StreamSender`, which needs no MATLAB or GPU dependencies.
+`opym.stream.client.StreamSender`, which needs no MATLAB or GPU dependencies
+(the rig GUI does not; see docs/STREAMING_PROTOCOL.md).
 
 ## SSH backfill of finished acquisitions
 

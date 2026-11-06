@@ -49,6 +49,9 @@ Review and plan: [docs/review/2026-11-review.md](docs/review/2026-11-review.md),
   channel and session by the first volume; encode (MATLAB LUT), decode (GPU shader) and `DisplayEncoding` must agree.
 - The receiver's idle-close text ("closed on Argus ...", `receiver._IDLE_CLOSED_REASON`) is string-matched by the rig;
   do not reword it.
+- opym's contracts are hand-mirrored in 9 repos (rig `_argus_stream`, dashboard, opym-viewer, CORE, cell-cinema,
+  chimerax-ngff, argus-desktop, channelaligner, bioimaging): before changing protocol, bfill, layout-3, `opym_time`,
+  registry or colours, check docs/review/2026-11-duplication.md.
 - Do not delete datasets under `/mmfs1` or `/mmfs2` (the PI decides). Tests and scripts must not write there.
 - Do not run `launch_petakit_servers.sh` (starts unsupervised servers on the production queue).
 

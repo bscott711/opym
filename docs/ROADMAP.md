@@ -1,6 +1,6 @@
 # opym roadmap
 
-Ordered from the 2026-11 review ([docs/review/2026-11-review.md](review/2026-11-review.md)); finding ids refer to it.
+Ordered from the 2026-11 review ([docs/review/2026-11-review.md](review/2026-11-review.md)); finding ids refer to it, and DUP-ids refer to the duplication audit ([docs/review/2026-11-duplication.md](review/2026-11-duplication.md)).
 Scope: S one file or two, low risk; M several files in one subsystem; L several files or repos, or touches live
 behaviour. Items 1 to 8 are in priority order, but items without a dependency can run in parallel when their files
 do not overlap.
@@ -15,11 +15,13 @@ do not overlap.
 | 6 | Backfill sender single source, orphan sweep, other BF P2s | L (cross-repo) | none | none |
 | 7 | Processing P2s | M | 3 for the dz and handedness items | none |
 | 8 | Release hygiene | M | 1 to 7 for the 0.5.0 cut | a clean release |
+| 9 | Consolidation: contract tests and duplicate names | M (cross-repo, tests and names only) | none | safe edits to any mirrored contract |
 
 ## 1. Real acquisition times end to end
 - What: the receiver takes the epoch from `acq_first_s` (+ `clock_offset_s`), or the sender sends epoch seconds in
   `timestamp`; refuse values below 1e9 with a log line. Add a contract test that feeds the real sender's FRAME header.
-  `opym-add-times` derives relative seconds from the ms values already stored.
+  `opym-add-times` derives relative seconds from the ms values already stored. cell-cinema's `rawtimes.py` copy reads
+  the same fields (DUP-16).
 - Why: ING-F1, PROC-F8. The rig sends ms since run start; 0 of 432 processed stores carry real times.
 - Unblocks: cell-cinema real time stamps; the acquisition-times claims in the grant evidence.
 - Decision: none. The origin of existing ms values is unknown, so existing stores get relative time only.
@@ -52,7 +54,7 @@ do not overlap.
 - Depends on: 2 and 4 (same files, safer tests).
 
 ## 6. Backfill sender single source and orphan sweep
-- What: one tested home for the sender (BF-02); sweep partial outputs when reclaiming orphans (BF-01); then the BF
+- What: one tested home for the sender (BF-02, see DUP-13); sweep partial outputs when reclaiming orphans (BF-01); then the BF
   P2s: marker removal before validation (BF-03), repair of mismatched copies (BF-04), give-up policy (BF-05),
   per-lane orphan reclaim (BF-06, 07), supervisor tick off the GPFS walk (BF-08), consolidation gap (BF-09), channel
   regex (BF-10).
@@ -78,3 +80,11 @@ do not overlap.
 - Fix or retire `Notebooks/OPM_Interactive_Petakit_Tuner.ipynb` (calls `opym.run_llsm_petakit_processing`, removed).
 - `pyproject.toml` description is stale (D08); `scipy` is imported but not declared.
 - Stale source docstrings (ING-F15) and the Globus wording in the `receiver.py` log text (D16).
+
+## 9. Consolidation (from docs/review/2026-11-duplication.md)
+- What (recommendation numbers): 2 contract tests per mirror (golden vectors, golden layout-3 store, timeline vector,
+  registry); 3 rename bioimaging's `opym` script; 4 `FF3D3D` remap and one palette; 5 opym-viewer
+  `resolve_output_base` and display rule; 7 one z-step reader and one constants home; 8 retire `PSFAverager` and the Gaussian PSF script.
+- Why: opym's contracts are hand-mirrored in 9 other repos and guarded by comments only (DUP-03, DUP-04, DUP-10 to DUP-17); the
+  duplicate names (DUP-05, DUP-13) are a hazard on every reinstall.
+- Decision: user decisions (a) rename `opym_local`, (c) opym-viewer display rule, (e) remap or rewrite old red stores.
