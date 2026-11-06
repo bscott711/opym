@@ -27,6 +27,7 @@ import math
 import os
 import re
 import statistics
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -51,26 +52,118 @@ def _known(v: float, i: int, raw: str) -> bool:
     return not (i > 0 and v == 0.0)  # unwritten ms entries are 0
 
 
-def read_raw_times(raw_store) -> list | None:
+class ArrayNeedsZarrError(ValueError):
+    """A 1-D array that the zarr-free reader refuses (compressed, filtered, not
+    little-endian float64, zarr v3...) and no ``zarr`` is installed to read it."""
+
+
+def read_f8_array(array_dir) -> list | None:
+    """A 1-D little-endian float64 zarr v2 array read WITHOUT zarr, or None if
+    there is no such array (no ``.zarray`` and no ``zarr.json``).
+
+    Light services (the dashboard) and ChimeraX read the rig's ``t`` and the
+    receiver's ``t_epoch_s`` arrays this way: both are written uncompressed, one
+    chunk file per ``chunks`` values. Missing or partly written chunks read as the
+    array's fill value (NaN for ``t_epoch_s``, 0.0 for ``t``), exactly as zarr
+    would. Anything else raises `ArrayNeedsZarrError` naming why: a compressed
+    array is never guessed at.
+    """
+    array_dir = Path(array_dir)
+    zarray = array_dir / ".zarray"
+    if not zarray.is_file():
+        if (array_dir / "zarr.json").is_file():
+            raise ArrayNeedsZarrError(
+                f"{array_dir}: zarr v3 array, reading it needs zarr"
+            )
+        return None
+    try:
+        meta = json.loads(zarray.read_text())
+    except (OSError, ValueError) as e:
+        raise ArrayNeedsZarrError(f"{array_dir}: unreadable .zarray ({e})") from None
+    if meta.get("compressor") or meta.get("filters"):
+        raise ArrayNeedsZarrError(
+            f"{array_dir}: compressed array (compressor={meta.get('compressor')!r}, "
+            f"filters={meta.get('filters')!r}), reading it needs zarr"
+        )
+    shape, chunks = meta.get("shape") or [], meta.get("chunks") or []
+    sep = meta.get("dimension_separator", ".")
+    if (
+        meta.get("dtype") != "<f8"
+        or len(shape) != 1
+        or len(chunks) != 1
+        or sep not in (".", "/")
+    ):
+        raise ArrayNeedsZarrError(
+            f"{array_dir}: not a 1-D little-endian float64 v2 array "
+            f"(dtype={meta.get('dtype')!r}, shape={shape!r}), reading it needs zarr"
+        )
+    n, chunk = int(shape[0]), int(chunks[0])
+    if chunk < 1:
+        raise ArrayNeedsZarrError(f"{array_dir}: bad chunk size {chunk}")
+    fill_value = meta.get("fill_value")
+    fill = float("nan") if fill_value in ("NaN", None) else float(fill_value)
+    out: list = []
+    for i in range(math.ceil(n / chunk)):
+        want = min(chunk, n - i * chunk)
+        try:
+            raw = (array_dir / str(i)).read_bytes()
+        except OSError:
+            out += [fill] * want
+            continue
+        if len(raw) < 8 * chunk:  # partly written: whole chunks are stored padded
+            out += [fill] * want
+            continue
+        out += list(struct.unpack(f"<{chunk}d", raw[: 8 * chunk]))[:want]
+    return out
+
+
+def read_1d(array_dir, *, use_zarr: bool = True) -> list | None:
+    """The values of a small 1-D float array: the zarr-free reader first, ``zarr``
+    when the array is one it refuses and zarr is installed. None: no such array.
+    Raises `ArrayNeedsZarrError` when the array needs zarr and zarr is absent
+    (or ``use_zarr`` is False); an array zarr cannot read is None.
+    """
+    array_dir = Path(array_dir)
+    try:
+        return read_f8_array(array_dir)
+    except ArrayNeedsZarrError as refusal:
+        if not use_zarr:
+            raise
+        try:
+            import zarr
+        except ImportError:
+            raise refusal from None
+        try:
+            vals = np.asarray(zarr.open(str(array_dir), mode="r")[:])
+            return [float(v) for v in vals.ravel()]
+        except Exception:  # noqa: BLE001 - an unreadable array is "no times"
+            return None
+
+
+def read_raw_times(raw_store, *, strict: bool = True) -> list | None:
     """Seconds of each timepoint in the raw store's own origin (None: not yet known).
 
-    Returns None if the store has no times at all.
+    Returns None if the store has no times at all. Works without zarr for the
+    stores the rig and the receiver write (see `read_f8_array`); a compressed one
+    uses zarr when installed, else raises `ArrayNeedsZarrError` -- or, with
+    ``strict=False``, reads as "no times" (a page that must render anyway).
     """
-    import zarr
-
-    try:
-        grp = zarr.open_group(str(raw_store), mode="r")
-    except Exception:  # noqa: BLE001 - not a zarr group, or unreadable: no times
-        return None
+    raw_store = Path(raw_store)
     for name, scale in ((RAW_MS, 1e-3), (RAW_EPOCH, 1.0)):
-        if name in grp:
-            vals = np.asarray(grp[name][:], dtype=float).ravel()
-            out = [
-                round(float(v) * scale, 4) if _known(float(v), i, name) else None
-                for i, v in enumerate(vals)
-            ]
-            if any(v is not None for v in out):
-                return out
+        try:
+            vals = read_1d(raw_store / name)
+        except ArrayNeedsZarrError:
+            if strict:
+                raise
+            continue
+        if vals is None:
+            continue
+        out = [
+            round(float(v) * scale, 4) if _known(float(v), i, name) else None
+            for i, v in enumerate(vals)
+        ]
+        if any(v is not None for v in out):
+            return out
     return None
 
 
@@ -106,13 +199,54 @@ def interval_s(times: list) -> float | None:
     return round(statistics.median(steps), 4) if steps else None
 
 
-def from_raw_stores(raw_stores) -> list | None:
+def nominal_times(n_frames: int, step_s: float) -> list:
+    """``n_frames`` evenly spaced times from the store's declared time-axis step.
+
+    Nominal, not measured: a measured time (the ``opym_time`` record, the raw
+    store) always beats it, and callers label the source ``"nominal"``.
+    """
+    return [round(i * float(step_s), 4) for i in range(int(n_frames))]
+
+
+def from_raw_stores(raw_stores, *, strict: bool = True) -> list | None:
     """Times (seconds since the first volume) from whichever raw stores have them."""
-    lists = [t for t in (read_raw_times(s) for s in raw_stores) if t]
+    lists = [t for t in (read_raw_times(s, strict=strict) for s in raw_stores) if t]
     if not lists:
         return None
     times = relative(combine(lists))
     return times if any(v is not None for v in times) else None
+
+
+def resolve_times(
+    attrs: dict | None,
+    raw_stores=(),
+    *,
+    n_frames: int | None = None,
+    axis_step_s: float | None = None,
+    strict: bool = False,
+) -> tuple[list | None, str | None]:
+    """``(times_s, source)`` for a processed store, first that exists:
+
+    1. the store's ``opym_time`` record (``attrs`` = its root attributes):
+       source ``"store:<record source>"``;
+    2. the raw stores' own measured per-volume times: ``"raw"``;
+    3. the store's declared time-axis step (``axis_step_s``) times the frame
+       number, ``n_frames`` long: ``"nominal"``.
+
+    ``(None, None)`` when nothing is known (the page then shows no time stamp).
+    ``strict=False`` (default, for pages that must render): a raw store that needs
+    zarr when none is installed counts as having no times; pass True to raise
+    `ArrayNeedsZarrError` instead.
+    """
+    rec = (attrs or {}).get(ATTR)
+    if isinstance(rec, dict) and rec.get("times_s"):
+        return rec["times_s"], "store:" + str(rec.get("source") or ATTR)
+    raw = from_raw_stores([Path(s) for s in raw_stores], strict=strict)
+    if raw is not None:
+        return raw, "raw"
+    if axis_step_s is not None and axis_step_s > 0 and n_frames:
+        return nominal_times(n_frames, axis_step_s), "nominal"
+    return None, None
 
 
 # -- the processed store ------------------------------------------------------------
