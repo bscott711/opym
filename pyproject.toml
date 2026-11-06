@@ -88,6 +88,10 @@ Bug-Tracker = "https://github.com/bscott711/opym/issues" # Example URL
 [tool.hatch.build.targets.wheel]
 packages = ["src/opym"]
 
+[tool.pytest.ini_options]
+# A bare `pytest` at the repo root must not collect stray root scripts.
+testpaths = ["tests"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 88

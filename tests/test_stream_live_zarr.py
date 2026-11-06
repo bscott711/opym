@@ -385,6 +385,36 @@ def test_ram_disk_pressure_evicts_only_finished_view_stores(tmp_path, psf):
     assert stale.exists() and running.view_dir.exists()
 
 
+def test_evict_views_spares_unfinished_sessions(tmp_path, psf):
+    """LIVE-07: a new session's start must not delete the RAM store of an
+    unfinished session (a crash's leftover) -- only finished ones go, and the
+    newest other one stays regardless."""
+    lane, _ = _lane(tmp_path, psf)
+    root = live_zarr.view_root()
+
+    def view(name, state, age):
+        d = root / name
+        store = d / "x_dsr.ome.zarr"
+        store.mkdir(parents=True)
+        if state is not None:
+            w.write_progress(store, n_t=1, n_c=1, done=[], state=state)
+        t = time.time() - age
+        os.utime(d, (t, t))
+        return d
+
+    newest = view("newest", "complete", 10)
+    crashed = view("crashed", "running", 200)
+    no_state = view("no_state", None, 300)
+    finished = view("finished", "complete", 400)
+    failed = view("failed", "failed", 500)
+    active = view("active", "running", 1)
+    lane._evict_views(keep={"active"})
+    assert newest.exists()  # the newest other one is kept
+    assert crashed.exists() and no_state.exists()  # unfinished: never removed
+    assert active.exists()
+    assert not finished.exists() and not failed.exists()
+
+
 def test_only_the_newest_timepoints_keep_uncompressed_buffers(tmp_path, psf):
     lane, jobs = _lane(tmp_path, psf)
     n_t = BUFFER_KEEP_T + 2
