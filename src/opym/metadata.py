@@ -12,8 +12,6 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, overload
 
-import yaml
-
 from .utils import DerivedPaths, OutputFormat
 
 
@@ -101,6 +99,8 @@ def parse_mda_settings(mda_settings_file: Path) -> dict[str, Any]:
     alongside per-channel pre-cropped `*.ome.zarr` stores instead of a single
     raw OME-TIF (see `opym.discovery.KIND_ZARR_PRECROPPED`).
     """
+    import yaml  # lazy: only this reader needs pyyaml (the [server] extra)
+
     try:
         with mda_settings_file.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
