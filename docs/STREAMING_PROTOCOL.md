@@ -4,7 +4,7 @@ This is the handoff spec for whoever implements the Windows/Python
 acquisition-side client. The receiver (`opym-receive`, implemented in
 `opym.stream.receiver.StreamReceiver`) is the counterpart on Argus. The
 canonical machine-readable version of everything below is
-`opym_local/src/opym/stream/protocol.py` — if this doc and that file ever
+`src/opym/stream/protocol.py` (repo `bscott711/opym`) — if this doc and that file ever
 disagree, the code wins.
 
 A reference sender (`opym.stream.client.StreamSender`, the DEALER-socket
@@ -17,6 +17,12 @@ scratch. The watcher polls a local pymmcore MDA zarr store for newly
 completed timepoints; a future in-process `frameReady` hook would share the
 same `StreamSender` for lower latency, pushing volumes straight from
 memory instead of polling disk.
+
+The rig GUI does NOT reuse `StreamSender`. It carries a hand-ported,
+behaviour-identical copy of `protocol.py` (`pymmcore_gui/_argus_stream/_protocol.py`)
+and its own multi-link sender (`_session.py`); change both together. The one
+known wire mismatch is the FRAME `timestamp`: the rig sends ms since run start,
+not epoch seconds (review ING-F1).
 
 ## Why this exists
 
@@ -250,6 +256,9 @@ About 16 MB per slab keeps the per-message overhead negligible.
 ```python
 header = {"reason": "complete"}  # or "client_abort", or "paused"
 ```
+
+All reasons: `complete`, `idle_timeout`, `client_abort`, `paused`,
+`client_error` (sent by the client) and `stalled` (set by the server).
 
 `"paused"` means the client stopped streaming mid-run because it couldn't
 reach Argus for longer than its RAM buffer holds. The partial copy is kept on
