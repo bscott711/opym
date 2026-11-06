@@ -37,20 +37,23 @@ from pathlib import Path
 
 import numpy as np
 
-# DSR resamples onto an isotropic grid whose spacing is the lateral pixel size.
-DSR_VOXEL_UM = 0.136
-# napari opens a pyramid lazily; a single full-resolution level per timepoint
-# is slow to pan. Three levels cost ~14% extra storage.
-PYRAMID_LEVELS = 3
-# Distinct, colour-blind-safe-ish emission colours; index = channel number.
-# The second is magenta, not red: two-colour composites are green/magenta.
-CHANNEL_COLORS = ("00FF00", "FF00FF", "00B3FF", "FFC400")
-PROGRESS_NAME = ".opym_live.json"
-# The processed store (bioformats2raw layout 3); see the module docstring.
-BF2RAW_LAYOUT = 3
-DSR_SERIES = "0"
-MIP_SERIES = "1"
-CHUNKS_ZYX = (64, 256, 256)
+# The layout's names and the zarr-free readers live in `opym.store`, the palette
+# in `opym.display` (light, for consumers); re-exported here under the old names.
+from opym.display import CHANNEL_COLORS, default_channel_color  # noqa: F401
+from opym.store import (  # noqa: F401
+    BF2RAW_LAYOUT,
+    CHUNKS_ZYX,
+    DSR_SERIES,
+    DSR_VOXEL_UM,
+    LAYOUT_KEY,
+    MIP_SERIES,
+    PROGRESS_NAME,
+    PYRAMID_LEVELS,
+    complete_timepoints,
+    image_group,
+    is_processed_store,
+    read_progress,
+)
 
 
 def downsample2(vol: np.ndarray, threads: int = 4) -> np.ndarray:
@@ -138,7 +141,7 @@ def _omero(name: str, n_c: int, labels: list[str]):
         "channels": [
             {
                 "label": labels[c] if c < len(labels) else f"C{c}",
-                "color": CHANNEL_COLORS[c % len(CHANNEL_COLORS)],
+                "color": default_channel_color(c),
                 "active": True,
                 "window": {"start": 0, "end": 300, "min": 0, "max": 65535},
             }
@@ -226,7 +229,7 @@ def create_processed_store(
     labels = channel_labels or [f"C{c}" for c in range(n_c)]
     compressor = Blosc(cname="lz4", clevel=5, shuffle=Blosc.SHUFFLE)
     root = zarr.open_group(str(out_path), mode="w")
-    root.attrs["bioformats2raw.layout"] = BF2RAW_LAYOUT
+    root.attrs[LAYOUT_KEY] = BF2RAW_LAYOUT
 
     def array(group, path, shape):
         group.create_dataset(
@@ -281,20 +284,6 @@ def create_processed_store(
     return processed_arrays(out_path, levels)
 
 
-def image_group(store: Path, series: str = DSR_SERIES, mode: str = "r"):
-    """The zarr group holding `series`' multiscales: the numbered series
-    group of a processed (bioformats2raw) store, or the root of a legacy
-    one, which only has the DSR image."""
-    import zarr
-
-    root = zarr.open_group(str(store), mode=mode)
-    if "bioformats2raw.layout" in root.attrs:
-        return root[series]
-    if series != DSR_SERIES:
-        raise KeyError(f"{store} is a legacy store; it has no series {series!r}")
-    return root
-
-
 def write_timepoint(out_path: Path, t: int, c: int, vol: np.ndarray) -> None:
     """Write one (t, c) volume into every pyramid level. Safe to call from
     several threads for different (t, c): each writes its own chunks."""
@@ -307,13 +296,6 @@ def write_timepoint(out_path: Path, t: int, c: int, vol: np.ndarray) -> None:
         lvl += 1
         if str(lvl) in root:
             vol = downsample2(vol)
-
-
-def read_progress(out_path: Path) -> dict | None:
-    try:
-        return json.loads((Path(out_path) / PROGRESS_NAME).read_text())
-    except (OSError, ValueError):
-        return None
 
 
 def write_progress(
@@ -341,29 +323,6 @@ def write_progress(
         record["end"] = end
     tmp.write_text(json.dumps(record))
     os.replace(tmp, path)
-
-
-def complete_timepoints(progress: dict | None) -> list[int]:
-    """Timepoints with every channel written, ascending."""
-    if not progress:
-        return []
-    n_c = int(progress.get("n_c", 0))
-    per_t: dict[int, set[int]] = {}
-    for t, c in progress.get("done", []):
-        per_t.setdefault(int(t), set()).add(int(c))
-    return sorted(t for t, cs in per_t.items() if len(cs) >= n_c)
-
-
-def is_processed_store(path: Path | str | None) -> bool:
-    """A processed (bioformats2raw layout) store, as the one-format live
-    lane writes -- as opposed to a legacy store or anything else."""
-    if path is None:
-        return False
-    try:
-        attrs = json.loads((Path(path) / ".zattrs").read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(attrs, dict) and "bioformats2raw.layout" in attrs
 
 
 def mip_stacks(store: Path) -> dict[int, np.ndarray]:

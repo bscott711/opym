@@ -32,6 +32,8 @@ import re
 import time
 from pathlib import Path
 
+from opym.display import CHANNEL_COLORS
+
 
 def consolidate_to_ome_zarr(
     decon_dir: Path,
@@ -202,9 +204,7 @@ def consolidate_to_ome_zarr(
         "omero": {
             "channels": [
                 {"label": name, "active": True, "color": col}
-                for name, col in zip(
-                    ch_labels, ["00FF00", "FF00FF", "0000FF", "FF0000"]
-                )
+                for name, col in zip(ch_labels, CHANNEL_COLORS)
             ]
         },
     }, indent=2))

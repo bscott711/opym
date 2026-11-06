@@ -54,11 +54,15 @@ from opym.ome_zarr_writer import (
 from opym.petakit import live_zarr_parameters, submit_live_zarr_job
 from opym.stream import trace
 from opym.stream.live import (
-    LIVE_LATEST_NAME,
     LiveLane,
     live_dsr_dir,
     live_qc_dir,
     live_viewer_store,
+)
+from opym.stream.live_status import (  # noqa: F401
+    LIVE_LATEST_NAME,
+    buffer_name,
+    parse_buffer_name,
 )
 from opym.utils import dsr_shape_zyx
 
@@ -181,21 +185,6 @@ def psf_cache_dir(
         sort_keys=True,
     )
     return Path(jobs) / PSF_CACHE_DIR / hashlib.sha1(key.encode()).hexdigest()[:16]
-
-
-def buffer_name(t: int, c: int) -> str:
-    """A (t, c) view buffer's file name (naparym-live reads the same)."""
-    return f"T{t:04d}_C{c}.npy"
-
-
-def parse_buffer_name(name: str) -> tuple[int, int] | None:
-    if not (name.startswith("T") and name.endswith(".npy") and "_C" in name):
-        return None
-    try:
-        t, c = name[1:-4].split("_C")
-        return int(t), int(c)
-    except ValueError:
-        return None
 
 
 def live_format() -> str:
