@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from pathlib import Path
 
 import numpy as np
 import zarr
+
+from .protocol import epoch_s_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -216,14 +217,18 @@ def _epoch_array(store_path: Path, n_t: int | None = None) -> zarr.Array:
 
 
 def write_epoch(store_path: Path, t: int, timestamp) -> None:
-    """Record when volume `t` was acquired (the FRAME `timestamp`, rig clock, unix s).
+    """Record when volume `t` was acquired (epoch seconds, rig clock).
 
+    Callers pass `protocol.frame_epoch_s(header)`, not the raw FRAME `timestamp`: an
+    old rig sends milliseconds since the run started, which is not a time of day.
+    Anything outside the epoch-seconds window (or None) is not written here either,
+    so the array only ever holds real times and the volume stays "unknown" (NaN).
     `opym.timeline` later turns this into real elapsed time for the processed store.
     It never raises: a time that cannot be written must not cost its volume.
     """
     try:
-        ts = float(timestamp)
-        if not math.isfinite(ts):
+        ts = epoch_s_or_none(timestamp)
+        if ts is None:
             return
         _epoch_array(store_path)[int(t)] = ts
     except Exception:  # noqa: BLE001 - a missing time is not worth a dropped frame
