@@ -33,7 +33,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import msgpack
 import numpy as np
 
 BF_INVENTORY = b"BF_INVENTORY"
@@ -57,6 +56,8 @@ _SAFE_PART = re.compile(r"^[\w.+\- ]+$")
 
 
 def pack(msg_type: bytes, session_id: str, header: dict[str, Any], payload: bytes | None = None) -> list[bytes]:
+    import msgpack  # lazy: module import is numpy-only; needs the [stream] extra
+
     if msg_type not in _VALID:
         raise ValueError(f"unknown backfill message type {msg_type!r}")
     parts = [msg_type, session_id.encode("utf-8"), msgpack.packb(header, use_bin_type=True)]
@@ -66,6 +67,8 @@ def pack(msg_type: bytes, session_id: str, header: dict[str, Any], payload: byte
 
 
 def unpack(parts: list[bytes]) -> tuple[bytes, str, dict[str, Any], bytes | None]:
+    import msgpack  # lazy, see pack
+
     if len(parts) not in (3, 4):
         raise ValueError(f"expected 3 or 4 message parts, got {len(parts)}")
     msg_type, sid, header, *rest = parts

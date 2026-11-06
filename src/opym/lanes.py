@@ -27,7 +27,6 @@ setup never touches production's queues.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
@@ -148,6 +147,8 @@ def backfill_admission(cap: int | None, jobs: Path | None = None) -> Iterator[bo
     exclusive lock across processes until the block exits. Queue the ticket
     inside the block so parallel backfill workers can't all see room at once
     and overshoot the cap together."""
+    import fcntl  # POSIX only; lazy so this module imports on Windows
+
     base = jobs or jobs_dir()
     base.mkdir(parents=True, exist_ok=True)
     with open(base / ".backfill_admission.lock", "a") as fh:

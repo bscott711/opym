@@ -37,8 +37,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import msgpack
-
 MSG_SESSION_START = b"SESSION_START"
 MSG_FRAME = b"FRAME"
 MSG_SESSION_END = b"SESSION_END"
@@ -326,6 +324,8 @@ def pack_message(
     `payload` should be given (and non-None) only for MSG_FRAME -- every
     other message type is header-only.
     """
+    import msgpack  # lazy: the module imports with numpy only; packing needs [stream]
+
     if msg_type not in _VALID_TYPES:
         raise ValueError(f"Unknown message type: {msg_type!r}")
     parts = [
@@ -347,6 +347,8 @@ def unpack_message(
     identity frame (pyzmq's `router.recv_multipart()` prepends one -- the
     caller strips `parts[0]` before calling this).
     """
+    import msgpack  # lazy, see pack_message
+
     if len(parts) not in (3, 4):
         raise ValueError(f"Expected 3 or 4 message parts, got {len(parts)}")
     msg_type, session_id_bytes, header_bytes, *rest = parts

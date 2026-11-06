@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 [project]
 name = "opym"
 version = "0.5.0"
-description = "A pre-processor for OPM data to crop and split channels for pypetakit5d."
+description = "OPM processing library: deskew/decon, stream receiver, backfill, live view, and the shared contracts its consumers import."
 readme = "README.md"
 license = { file = "LICENSE" }
 
@@ -34,17 +34,38 @@ keywords = [
     "pypetakit",
 ]
 
+# Light base (docs/adr/0001-light-base.md): numpy only, so the contract modules import in any
+# runtime (ChimeraX, pvpython, the rig PC, a viewer) with no heavy stack. Everything else is an extra.
 dependencies = [
     "numpy",
-    "tifffile",
+]
+
+[project.optional-dependencies]
+# Stream wire client/receiver pieces (protocol packing, zmq transport, zarr store reads).
+# Install with `uv pip install opym[stream]`.
+stream = [
+    "msgpack",
+    "pyzmq",
     # 2.18.3 is the last zarr 2 for Python 3.10, and it imports numcodecs.blosc.cbuffer_sizes, which
     # numcodecs 0.16 removed; without the split the lock pairs it with numcodecs 0.16 on 3.11+.
     # 2.18.7 caps numcodecs itself.
     "zarr<3; python_version < '3.11'",
     "zarr>=2.18.7,<3; python_version >= '3.11'",
+    "numcodecs",
+]
+
+# Everything the processing server runs (bioimaging): a superset of the base list before the
+# light-base split, plus scipy (imported in 4 files, was undeclared) and numcodecs.
+# Install with `uv pip install opym[server]`.
+server = [
+    "tifffile",
+    "zarr<3; python_version < '3.11'",
+    "zarr>=2.18.7,<3; python_version >= '3.11'",
+    "numcodecs",
     "tqdm",
     "scikit-image",
     "scikit-learn",
+    "scipy",
     "PyPetaKit5D",
     "imagecodecs",
     "pyyaml",
@@ -54,16 +75,6 @@ dependencies = [
     "ome-types>=0.6",
 ]
 
-[project.optional-dependencies]
-# Install with `uv pip install -e .[dev]`
-dev = [
-    "bandit",
-    "mypy",
-    "pre-commit",
-    "pytest",
-    "ruff",
-]
-
 # Dependencies for the optional Jupyter viewers
 # Install with `uv pip install -e .[viewer]`
 viewer = [
@@ -71,6 +82,20 @@ viewer = [
     "matplotlib",
     "ipyfilechooser",
     "ipython",
+]
+
+# server + viewer
+all = [
+    "opym[server,viewer]",
+]
+
+# Install with `uv pip install -e .[dev]`
+dev = [
+    "bandit",
+    "mypy",
+    "pre-commit",
+    "pytest",
+    "ruff",
 ]
 
 # --- Entry Points & URLs ---
