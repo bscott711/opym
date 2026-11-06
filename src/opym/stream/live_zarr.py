@@ -99,6 +99,16 @@ PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
 
 
+def _view_dir_finished(d: Path) -> bool:
+    """True when `d` holds at least one store and every store is "complete"
+    or "failed" (the lane closed them, so their GPFS archive is complete). A
+    store still "running" may belong to a session a restarted receiver will
+    resume."""
+    stores = [p for p in d.iterdir() if p.name.endswith(".ome.zarr")]
+    states = [(read_progress(st) or {}).get("state") for st in stores]
+    return bool(states) and all(st in ("complete", "failed") for st in states)
+
+
 def evict_finished_views(jobs: Path, running: set[str] = frozenset()) -> int:
     """For RAM-disk pressure: remove the view directory of every session not
     in `running` whose stores are finished (the lane closed them, so their
@@ -117,9 +127,7 @@ def evict_finished_views(jobs: Path, running: set[str] = frozenset()) -> int:
     for d in root.iterdir():
         if not d.is_dir() or d.name in running or d.name == latest_id:
             continue
-        stores = [p for p in d.iterdir() if p.name.endswith(".ome.zarr")]
-        states = [(read_progress(st) or {}).get("state") for st in stores]
-        if not states or any(st not in ("complete", "failed") for st in states):
+        if not _view_dir_finished(d):
             continue
         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
         shutil.rmtree(d, ignore_errors=True)
@@ -709,13 +717,18 @@ class ZarrLiveLane(LiveLane):
 
     def _evict_views(self, keep: set[str]) -> None:
         """Remove the view directories of sessions this lane isn't running,
-        except the newest finished one (still worth looking at)."""
+        except the newest one (still worth looking at) and any whose stores
+        are not finished: after a crash, an unfinished session's RAM store may
+        be the only copy until a restarted receiver resumes it."""
         root = view_root()
         if not root.is_dir():
             return
         others = [d for d in root.iterdir() if d.is_dir() and d.name not in keep]
         others.sort(key=lambda d: d.stat().st_mtime, reverse=True)
         for d in others[1:]:
+            if not _view_dir_finished(d):
+                logger.info("Keeping unfinished view store %s", d.name)
+                continue
             shutil.rmtree(d, ignore_errors=True)
 
     def evict_finished_views(self) -> int:
