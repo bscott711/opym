@@ -7,6 +7,13 @@ change behaviour).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-05
+
+The headline of this release is the **SSH backfill** (finished acquisitions moved from the acquisition PC to Argus, verified
+byte for byte), **real per-volume acquisition times** carried into processed stores, the **sqrt 8-bit live view**, a more robust
+stream receiver, and the **2026-11 code review** (`docs/review/2026-11-review.md`, `docs/ROADMAP.md`). Known open item: the rig
+sends acquisition times as milliseconds since run start, so processed stores still lack real times (ROADMAP item 1).
+
 ### Added
 - `opym-add-times` (`opym.add_times`): reads the raw stores' real times and writes them into processed stores that
   already exist (dry run by default; `--apply` first copies each changed `.zattrs` to `.zattrs.before-times`).
@@ -26,6 +33,9 @@ change behaviour).
 - Receiver heartbeat (`HEARTBEAT`, feature `heartbeat`): a client with a fresh heartbeat keeps its session open up to 60 minutes without new data; a `closed` reply tells a client its session was closed as idle so it stops resyncing; `CLIENT_LOG` (feature `client_log`) appends the rig's own stream log to `OPYM_STREAM_CLIENT_LOG_DIR`; every end carries a worded reason and remedy in `stream_status.json`, `.live_status.json` and `.opym_live.json` (#55).
 
 ### Changed
+- Orientation is settled (2026-11-05): the canonical processed-store handedness is the rot90 one used by decon, the live lane, the measured PSF and the
+  legacy TIFF cropper. `zarr_input=True` (`inputAxisOrder='zxy'`, a pure transpose) is its y-mirror and the backfill no longer uses it: deskew-only zarr
+  datasets stage the same rot90 TIFFs as decon (bioimaging #39; docs and test in #76). Existing production output was already decon'd.
 - `zarr` is pinned `<3` with a Python-version split (`>=2.18.7` on 3.11+, the 2.18.3 line on 3.10) so the lock does not pair it with numcodecs 0.16 (#54).
 - Repositories now live under `~/projects/science/`; unit templates, scripts and docs follow. No behaviour change (#73).
 - Docs: added `CLAUDE.md`, `docs/ROADMAP.md` and `docs/review/2026-11-review.md`; README, SSH backfill, protocol and live-view docs brought up to date with the code (2026-11 review).
