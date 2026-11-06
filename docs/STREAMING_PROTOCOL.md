@@ -18,11 +18,19 @@ completed timepoints; a future in-process `frameReady` hook would share the
 same `StreamSender` for lower latency, pushing volumes straight from
 memory instead of polling disk.
 
-The rig GUI does NOT reuse `StreamSender`. It carries a hand-ported,
-behaviour-identical copy of `protocol.py` (`pymmcore_gui/_argus_stream/_protocol.py`)
-and its own multi-link sender (`_session.py`); change both together. The one
-known wire mismatch is the FRAME `timestamp`: the rig sends ms since run start,
-not epoch seconds (review ING-F1).
+The rig GUI does NOT reuse `StreamSender`. It has its own multi-link sender
+(`pymmcore_gui/_argus_stream/_session.py`). Its message packing and header types are
+moving to an import of `opym.stream.protocol` (until the rig runs that, it carries a
+hand-ported copy, `_protocol.py`: change both together).
+
+**Wire constants.** The ports (stream 5555, backfill 5556, linkbench 5599), the idle
+timeout, the `rejected` text of a session closed as idle (its first words,
+`closed on Argus`, are string-matched by the rig, so they must not be reworded) and
+the ACK `features` list are defined once, in `src/opym/stream/protocol.py`
+(`DEFAULT_BIND_ADDR`, `BACKFILL_BIND_ADDR`, `LINKBENCH_BIND_ADDR`, `IDLE_TIMEOUT_SEC`,
+`IDLE_CLOSED_PREFIX`, `IDLE_CLOSED_REASON`, `SERVER_FEATURES`). The same module holds
+the header types (`SessionStartHeader`, `FrameHeader`, ...) and the golden vectors both
+ends are tested against are in `opym.testing.stream`.
 
 ## Why this exists
 
@@ -205,6 +213,18 @@ header = {
 }
 payload = volume.tobytes()      # C-contiguous (Z, Y, X)
 ```
+
+`timestamp` is **epoch seconds** on the client's clock (the rig sends the time its
+first plane of the volume was acquired). The acquisition PC used to send milliseconds since the
+run started here (`3408`, `13259`, ... ten seconds apart), which is not a time of day
+(review ING-F1). Receivers therefore accept the old form: a `timestamp` outside
+`[1e9, 1e11)` seconds is not trusted, and the header's `acq_first_s` (epoch seconds of
+the first plane, sent by every rig since 2026-09-25) is used instead
+(`protocol.frame_epoch_s`; one INFO line per session when this fallback is used, one
+WARNING per session if neither field is a usable time, in which case the volume's time
+stays unknown). Every combination of old and new sender and receiver works; the
+rollout order is still **receiver first, then the rig**. Volumes already stored with
+millisecond values keep relative time only.
 
 `t`/`c` are your acquisition's own indices, not send order — frames may
 arrive in any `(t, c)` order (e.g. the two cameras finishing a Z-stack at

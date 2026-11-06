@@ -35,7 +35,35 @@ additional length-prefixing is needed anywhere in this protocol.
 
 from __future__ import annotations
 
-from typing import Any
+import math
+import numbers
+from typing import Any, Literal, TypedDict
+
+# --- Wire constants -------------------------------------------------------
+#
+# The addresses, limits and texts both ends of the wire depend on. The
+# receivers (opym.stream.receiver, backfill_receiver, linkbench) and the
+# acquisition-side senders all take them from here. All three bind loopback;
+# a client reaches them through an SSH tunnel.
+
+STREAM_PORT = 5555  # opym-receive: the live frame stream
+BACKFILL_PORT = 5556  # opym-receive-backfill: finished OME-Zarr stores
+LINKBENCH_PORT = 5599  # opym.stream.linkbench: the link throughput sink
+DEFAULT_BIND_ADDR = f"tcp://127.0.0.1:{STREAM_PORT}"
+BACKFILL_BIND_ADDR = f"tcp://127.0.0.1:{BACKFILL_PORT}"
+LINKBENCH_BIND_ADDR = f"tcp://127.0.0.1:{LINKBENCH_PORT}"
+
+# A session with no new data for this long is closed (unless its client
+# heartbeats; see receiver.STALL_MAX_SEC).
+IDLE_TIMEOUT_SEC = 600.0
+# The `rejected` text of an ACK that says a session was closed for good. The
+# rig matches IDLE_CLOSED_PREFIX as a string to tell "closed, stop" from
+# "rejected, retry": rewording the start of this text turns "closed" into
+# endless retries.
+IDLE_CLOSED_PREFIX = "closed on Argus"
+IDLE_CLOSED_REASON = "closed on Argus after 10 min with no new data; not resuming it"
+# Advertised in every ACK; clients only use a feature once they've seen it.
+SERVER_FEATURES = ["slabs", "blosc", "links", "resume", "heartbeat", "client_log"]
 
 MSG_SESSION_START = b"SESSION_START"
 MSG_FRAME = b"FRAME"
@@ -133,10 +161,11 @@ _VALID_TYPES = frozenset(
 # every frame is ALSO pre-staged as a decon-ready TIFF
 # (opym.utils.write_decon_staged_tiff) so the batch pass's own staging
 # step is a no-op by the time it runs -- purely a latency optimization,
-# not a correctness dependency; a client sending sheet_angle_deg,
-# xy_pixel_size, t_interval_s, psf_paths, etc. is harmless (ignored) but
-# no longer required, since STREAMING_PROTOCOL.md's worked example still
-# shows them for provenance/logging purposes.
+# not a correctness dependency. A client sending sheet_angle_deg,
+# xy_pixel_size, psf_paths, etc. is harmless (ignored) and not required;
+# STREAMING_PROTOCOL.md's worked example still shows them for provenance.
+# t_interval_s IS read (receiver.py, _handle_session_start): it is the
+# nominal time step handed to the live view lane.
 #
 # --- FRAME header fields -------------------------------------------------
 #
@@ -150,7 +179,11 @@ _VALID_TYPES = frozenset(
 #                               client, stable across reconnects. Used only
 #                               for ACK/RESUME bookkeeping, never for
 #                               staging/output naming.
-#   timestamp        float  -- acquisition epoch seconds
+#   timestamp        float  -- acquisition epoch seconds (when the volume's
+#                               first plane was acquired). A value outside
+#                               [1e9, 1e11) is not accepted as a time; the
+#                               receiver uses acq_first_s instead
+#                               (frame_epoch_s below).
 #   camera_id        str | int | None
 #   shape_zyx        [int, int, int]  -- redundant with SESSION_START but
 #                               makes each frame self-describing.
@@ -311,6 +344,300 @@ _VALID_TYPES = frozenset(
 #
 #   lines            [str]  -- formatted log lines, oldest first
 #   host             str    -- OPTIONAL, the client's host name
+
+
+OutputFormat = Literal["tiff", "ome-zarr", "both"]
+"""Format the processed (DSR) result is kept in on Argus.
+
+Matches ``opym.stream.rawmirror.OUTPUT_FORMATS``: ``"tiff"`` keeps the
+OME-TIFF frames (ChimeraX), ``"ome-zarr"`` replaces them with one OME-Zarr
+(napari), ``"both"`` keeps both.
+"""
+
+
+class _SessionStartOptional(TypedDict, total=False):
+    # Server -> client message types this client understands beyond ACK.
+    # ["qc"] asks for MSG_QC; a receiver without live QC just never sends it.
+    accepts: list[str]
+    # Only when re-opening a session Argus answered ``unknown_session`` for
+    # (it restarted or timed the session out): every frame_index up to this
+    # was already ACKed. Needs the "resume" feature.
+    resume_through: int
+
+
+class SessionStartHeader(_SessionStartOptional):
+    """``SESSION_START`` header -- sent once, before any ``FRAME`` message.
+
+    Fields match ``opym.stream.receiver.StreamReceiver._handle_session_start``
+    (Argus side, canonical -- read directly from Argus, not from this
+    file's own history). The receiver writes each channel straight into a
+    raw OME-Zarr mirror store under ``raw_root`` (``opym.stream.rawmirror``);
+    it does not submit a processing ticket itself, and does not read decon
+    parameters (PSF, wiener_alpha, edge_erosion, rl_method, iterations) from
+    this handshake at all -- those are resolved entirely server-side from
+    the ``OPYM_DECON_PSF`` env var, same as a batch/Globus-landed dataset.
+    An earlier draft of this header targeted a since-rewritten receiver that
+    took an ``output_dir`` and consumed PSF paths directly; sending that
+    shape to the current receiver has ``raw_root`` missing, which the
+    receiver rejects outright (every frame silently dropped as an unknown
+    session) -- see ``opym.stream.protocol``'s own module docstring for the
+    field-by-field spec this must keep matching.
+    """
+
+    base_name: str
+    raw_root: str
+    dtype: str
+    shape_zyx: list[int]
+    num_timepoints: int
+    channels: list[int]
+    channel_names: list[str]
+    z_step_um: float
+    xy_pixel_size: float
+    t_interval_s: float
+    output_format: OutputFormat
+
+
+class _FrameTraceFields(TypedDict, total=False):
+    # Latency trace (opym.stream.trace on Argus). Epoch seconds on THIS
+    # machine's clock; Argus converts them with clock_offset_s.
+    acq_first_s: float
+    acq_last_s: float
+    queued_s: float
+    sent_s: float
+    clock_offset_s: float
+
+
+class _FrameSlabFields(TypedDict, total=False):
+    # Only once an ACK advertised "slabs": this FRAME carries planes
+    # [z0, z0 + shape_zyx[0]) of an nz-plane volume.
+    z0: int
+    nz: int
+
+
+class _FrameCodecFields(TypedDict, total=False):
+    # Only once an ACK advertised "blosc": "blosc" means the payload is one
+    # blosc frame of the raw bytes (lz4 + bitshuffle). shape_zyx and dtype
+    # always describe the decoded data.
+    codec: str
+
+
+class FrameHeader(_FrameTraceFields, _FrameSlabFields, _FrameCodecFields):
+    """``FRAME`` header -- one per acquired volume, sent alongside its bytes.
+
+    ``t``/``c`` are this volume's own acquisition indices, not send order --
+    frames may arrive in any ``(t, c)`` order and the receiver stages/tickets
+    by those indices, not by arrival order. ``frame_index`` is unrelated: a
+    monotonic counter assigned once per real acquired volume (not per send
+    attempt), used only for ``ACK``/``RESUME`` bookkeeping.
+    """
+
+    t: int
+    c: int
+    frame_index: int
+    timestamp: float
+    camera_id: str | int | None
+    shape_zyx: list[int]
+    dtype: str
+
+
+class QCHeader(TypedDict, total=False):
+    """``QC`` header -- server -> client, only if ``accepts`` has ``"qc"``.
+
+    The Argus live QC service's verdict on one timepoint, forwarded as it
+    wrote it (``opym.stream.protocol`` documents the fields). Advisory only:
+    nothing on Argus waits for a reply. There are two per timepoint:
+    ``stage == "raw"`` about a second after the frames land (coverage, drift,
+    focus, signal), then ``"dsr"`` once deskewed (adds the cell's box).
+    Unknown fields must be ignored; new ones may be added.
+    """
+
+    seq: int
+    session_id: str
+    t: int
+    stage: str
+    verdict: Literal["ok", "warn", "act", "no_cell"]
+    flags: list[str]
+    advice: list[dict[str, Any]]
+    metrics: dict[str, Any]
+
+
+class _SessionEndOptional(TypedDict, total=False):
+    # Why, in words: shown with the run's end on Argus (naparym-live, the
+    # dashboard). Set for "client_error" and "paused".
+    detail: str
+
+
+class SessionEndHeader(_SessionEndOptional):
+    """``SESSION_END`` header."""
+
+    # "paused": this run stopped streaming mid-way (Argus unreachable longer
+    # than the send buffer holds); Argus won't keep its partial copy.
+    # "client_error": this app's sender failed (``detail`` says how).
+    reason: Literal[
+        "complete", "idle_timeout", "client_abort", "paused", "client_error"
+    ]
+
+
+class _AckOptional(TypedDict, total=False):
+    # Argus's clock when it sent the ACK: lets the client estimate its clock
+    # offset for the FRAME trace fields.
+    server_time_s: float
+    # What this receiver supports beyond the base protocol: "slabs",
+    # "blosc", "links", "resume", "heartbeat", "client_log".
+    features: list[str]
+    # Argus has no open session with this id: re-send SESSION_START with
+    # resume_through, then everything unACKed.
+    unknown_session: bool
+    # The final ACK, sent once Argus has closed the session: it confirms
+    # SESSION_END.
+    ended: bool
+    # Argus dropped frames it couldn't stage (its RAM disk was below its
+    # floor) and has room again: resend everything unACKed now.
+    resend: bool
+    # Sent with unknown_session when Argus turned the SESSION_START down
+    # (e.g. its RAM disk is short): why, for the status label. The client
+    # keeps retrying with backoff; space may come back once a drain ends.
+    rejected: str
+    # With unknown_session: Argus closed this session for good (no new data
+    # for its idle timeout) and won't resume it. Retrying is pointless; the
+    # run stops streaming and its local save is the copy to send.
+    closed: bool
+
+
+class AckHeader(_AckOptional):
+    """``ACK`` header -- server -> client, unsolicited, not per-frame.
+
+    ``through_frame_index`` is the highest ``frame_index`` such that every
+    frame in ``[0, through_frame_index]`` has been durably staged *and*
+    ticketed on the Argus side. ``-1`` means nothing processed yet.
+    """
+
+    through_frame_index: int
+
+
+class ResumeHeader(TypedDict):
+    """``RESUME`` header -- client -> server, right after reconnecting.
+
+    No fields required: ``session_id`` in the message envelope is enough for
+    the server to look up (or fail to find) this session's state.
+    """
+
+
+class _PrepareOptional(TypedDict, total=False):
+    dtype: str
+    num_timepoints: int
+    channel_names: list[str]
+
+
+class PrepareHeader(_PrepareOptional):
+    """``PREPARE`` header -- client -> server, while an MDA is being set up.
+
+    Argus warms a GPU server for this plan so the run's first timepoint costs
+    what the others do. Sent on a connection of its own with a fresh id (no
+    session is opened, nothing answers); send it again when the plan
+    changes. The warm-up holds for ~10 min after the last one (see
+    ``opym.stream.protocol`` and ``opym.lanes.WARM_LEASE_MAX_AGE_S``).
+    """
+
+    shape_zyx: list[int]
+    z_step_um: float
+
+
+class HeartbeatHeader(TypedDict, total=False):
+    """``HEARTBEAT`` header -- client -> server every few seconds.
+
+    Only once an ACK advertised ``"heartbeat"``. Tells Argus this app is
+    alive even while nothing new reaches it (a slow time-lapse, or a link
+    that can't carry data), and what it holds: Argus then keeps the session
+    open, and says why when it does close it.
+    """
+
+    state: Literal["acquiring", "finishing"]
+    links_up: int
+    links_total: int
+    unacked_bytes: int
+    unacked_volumes: int
+    submitted: int
+    acked_through: int
+    stalled_s: float
+    last_error: str
+
+
+class ClientLogHeader(TypedDict, total=False):
+    """``CLIENT_LOG`` header -- this app's own stream log lines.
+
+    Appended to the day's rig log on Argus (once an ACK advertised
+    ``"client_log"``).
+    """
+
+    lines: list[str]
+    host: str
+
+
+MessageHeader = (
+    SessionStartHeader
+    | FrameHeader
+    | SessionEndHeader
+    | AckHeader
+    | ResumeHeader
+    | QCHeader
+    | PrepareHeader
+    | HeartbeatHeader
+    | ClientLogHeader
+)
+
+
+# --- FRAME time -------------------------------------------------------------
+
+# A FRAME `timestamp` must be epoch seconds. This window is the same one
+# opym.timeline uses to tell a real time from a missing one (1e9 s is
+# 2001-09-09). Its top rejects epoch milliseconds (1.8e12 today); the bottom
+# rejects "milliseconds since the run started" (a run would have to last 11.6
+# days to reach 1e9 ms) and 0.0.
+EPOCH_MIN_S = 1e9
+EPOCH_MAX_S = 1e11
+
+
+def epoch_s_or_none(value: object) -> float | None:
+    """``value`` as a float if finite and inside the epoch-seconds window, else None.
+
+    Accepts Python and numpy int/float scalars (numpy registers them as Real).
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    v = float(value)
+    return v if math.isfinite(v) and EPOCH_MIN_S <= v < EPOCH_MAX_S else None
+
+
+def frame_epoch(header: dict[str, Any]) -> tuple[float | None, str]:
+    """The acquisition time of a FRAME's volume, and where it came from.
+
+    Returns ``(epoch_s, source)`` with source ``"timestamp"``,
+    ``"acq_first_s"`` or ``"none"``. Receivers use the source to log once per
+    session when the fallback is in use.
+    """
+    ts = epoch_s_or_none(header.get("timestamp"))
+    if ts is not None:
+        return ts, "timestamp"
+    first = epoch_s_or_none(header.get("acq_first_s"))
+    if first is not None:
+        return first, "acq_first_s"
+    return None, "none"
+
+
+def frame_epoch_s(header: dict[str, Any]) -> float | None:
+    """The FRAME's acquisition time in epoch seconds, or None.
+
+    ``timestamp`` is epoch seconds (STREAMING_PROTOCOL.md). The acquisition
+    PC used to send milliseconds since the run started there (always 0.0 in
+    some paths), which are not a time of day. A value outside
+    [EPOCH_MIN_S, EPOCH_MAX_S) is therefore not trusted: the header's
+    ``acq_first_s`` (epoch seconds of the volume's first plane, sent by every
+    rig since 2026-09-25) is used instead, and if that is unusable too the
+    result is None and the caller records no time. Both new and old senders
+    work with both new and old receivers.
+    """
+    return frame_epoch(header)[0]
 
 
 def pack_message(

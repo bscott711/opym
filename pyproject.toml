@@ -100,8 +100,18 @@ dev = [
 
 # --- Entry Points & URLs ---
 [project.scripts]
+# The console scripts of the processing server and the stream/backfill tools live here, in
+# the library that holds their code. bioimaging declares only its own (opym-backfill,
+# opym-storage-triage). These need the extras that go with them: [stream] for the senders
+# and clients, [server] for the receivers and the GPU worker.
 opym = "opym.cli:main"
 opym-add-times = "opym.add_times:main"
+opym-backfill-send = "opym.stream.backfill_client:main"
+opym-stream-watch = "opym.stream.client:main"
+opym-receive = "opym.stream.receiver:main"
+opym-receive-backfill = "opym.stream.backfill_receiver:main"
+opym-serve = "opym.local_gpu_worker:main"
+opym-live-trace = "opym.stream.trace_report:main"
 
 # URLs for the PyPI sidebar
 [project.urls]

@@ -158,6 +158,9 @@ from opym.stream import drain, live, live_zarr, outcome, rawmirror, trace
 from opym.stream.live import LiveLane
 from opym.stream.live_zarr import ZarrLiveLane
 from opym.stream.protocol import (
+    DEFAULT_BIND_ADDR,
+    IDLE_CLOSED_REASON,
+    IDLE_TIMEOUT_SEC,
     MSG_ACK,
     MSG_CLIENT_LOG,
     MSG_FRAME,
@@ -167,6 +170,8 @@ from opym.stream.protocol import (
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
+    SERVER_FEATURES,
+    frame_epoch,
     pack_message,
     unpack_message,
 )
@@ -174,14 +179,14 @@ from opym.utils import write_decon_staged_tiff
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BIND_ADDR = "tcp://127.0.0.1:5555"
+# DEFAULT_BIND_ADDR, IDLE_TIMEOUT_SEC and SERVER_FEATURES are wire constants: they
+# live in protocol.py and are importable from here under the same names.
 ACK_EVERY_N_FRAMES = 10
 ACK_EVERY_SEC = 2.0
-IDLE_TIMEOUT_SEC = 600.0
 # A session closed as idle is not resumed for this long (see
 # _handle_session_start); then the id is forgotten.
 _IDLE_CLOSED_FORGET_S = 24 * 3600.0
-_IDLE_CLOSED_REASON = "closed on Argus after 10 min with no new data; not resuming it"
+_IDLE_CLOSED_REASON = IDLE_CLOSED_REASON  # the rig string-matches its start
 # A heartbeat this recent means the client is alive (it sends one every 5 s).
 HEARTBEAT_FRESH_SEC = 30.0
 # A session whose client keeps heartbeating but sends no new data is closed
@@ -244,8 +249,6 @@ _RAW_ROOTS_ENV_VAR = "OPYM_STREAM_RAW_ROOTS"
 # Setting a ZAP domain is what makes libzmq consult the authenticator (here:
 # the IP allowlist) for NULL-mechanism connections at all.
 _ZAP_DOMAIN = b"opym-direct"
-# Advertised in every ACK; clients only use a feature once they've seen it.
-SERVER_FEATURES = ["slabs", "blosc", "links", "resume", "heartbeat", "client_log"]
 # Unknown-session replies to FRAMEs are rate-limited per session: a client
 # resending hundreds of MB of slabs would otherwise get one per slab.
 _UNKNOWN_NOTICE_EVERY_S = 2.0
@@ -450,6 +453,10 @@ class SessionState:
     client_status: dict[str, Any] = field(default_factory=dict)
     """The last HEARTBEAT's fields (see protocol.py)."""
     stall_warned_at: float = 0.0
+    time_fallback_logged: bool = False
+    """Logged once that FRAME timestamps are not epoch seconds (acq_first_s is used)."""
+    time_missing_logged: bool = False
+    """Logged once that a FRAME has no usable time at all."""
 
     @property
     def leaf_dir(self) -> Path:
@@ -1464,7 +1471,7 @@ class StreamReceiver:
             rawmirror.write_planes(arr, t, z0, slab)
             if len(asm.z0s) == 0:  # the first slab of a volume carries its time
                 rawmirror.write_epoch(
-                    session.channel_store_paths[c], t, header.get("timestamp")
+                    session.channel_store_paths[c], t, self._frame_time(session, header)
                 )
             asm.raw_write_s += time.perf_counter() - t_start
         except Exception:
@@ -1532,6 +1539,34 @@ class StreamReceiver:
             session.channel_arrays[c] = arr
         return arr
 
+    @staticmethod
+    def _frame_time(session: SessionState, header: dict[str, Any]) -> float | None:
+        """The FRAME's acquisition time in epoch seconds (protocol.frame_epoch_s).
+
+        An old rig sends milliseconds since the run started in `timestamp`; its
+        `acq_first_s` is used instead (one INFO per session). If neither is a
+        usable time, None (one WARNING per session) and the volume's time stays unknown.
+        """
+        epoch, source = frame_epoch(header)
+        if source == "acq_first_s" and not session.time_fallback_logged:
+            session.time_fallback_logged = True
+            logger.info(
+                "Session %s: FRAME timestamp %r is not epoch seconds; using "
+                "acq_first_s (an acquisition PC older than the epoch-seconds fix).",
+                session.session_id,
+                header.get("timestamp"),
+            )
+        elif source == "none" and not session.time_missing_logged:
+            session.time_missing_logged = True
+            logger.warning(
+                "Session %s: FRAME timestamp %r and acq_first_s %r are not epoch "
+                "seconds; the acquisition times of this session stay unknown.",
+                session.session_id,
+                header.get("timestamp"),
+                header.get("acq_first_s"),
+            )
+        return epoch
+
     def _stage_frame(
         self, session: SessionState, header: dict[str, Any], payload: bytes
     ) -> None:
@@ -1544,7 +1579,7 @@ class StreamReceiver:
         arr = self._raw_array(session, c, shape_zyx, dtype)
         rawmirror.write_timepoint(arr, t, raw)
         rawmirror.write_epoch(
-            session.channel_store_paths[c], t, header.get("timestamp")
+            session.channel_store_paths[c], t, self._frame_time(session, header)
         )
         self._stage_volume(
             session, t, c, raw, raw_write_s=time.perf_counter() - t_start
