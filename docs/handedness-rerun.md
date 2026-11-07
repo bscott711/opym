@@ -46,11 +46,10 @@ lister below produces the real count.
 
 The lister and step 3 import `RegistryReader` and `registry_path` from `opym.registry`.
 They exist from opym PR #81 (in `32dccb1`, which this runbook was written against). The
-opym installed in production today is `ae1846e`: its `opym.registry` has only
-`StatusRegistry`, so both commands exit with an ImportError (nothing is written). Run
-them either after opym is deployed, or before that from a worktree of opym at
-`origin/main` with `PYTHONPATH=<worktree>/src` set (the lister's `sys.path[0]` is
-`scripts/`, which does not include `src`). Run step 3 only after the deploy, so the reset
+opym installed in production is `b9189d2` (deployed 2026-11-07, see the ROADMAP header), which has them. Before that
+deploy production ran `ae1846e`, whose `opym.registry` had only `StatusRegistry`, so both commands exited with an
+ImportError (nothing is written). From a worktree of opym at `origin/main`, set
+`PYTHONPATH=<worktree>/src` (the lister's `sys.path[0]` is `scripts/`, which does not include `src`). Step 3
 goes through the same opym the service runs.
 
 ## 3a. Step 0: what the registry says (decides which path you are on)
@@ -59,7 +58,7 @@ The lister is a dry run (registry opened `mode=ro`, `os.stat` on five paths per
 row, no directory walk, refuses any write-looking flag):
 
 ```
-cd <a worktree of opym at origin/main>      # not the production checkout until opym is deployed
+cd <a worktree of opym at origin/main>      # a worktree, not the production checkout
 export PYTHONPATH=$PWD/src                  # makes the worktree's opym win over the installed one
 PY=~/projects/science/bioimaging/.venv/bin/python
 $PY scripts/handedness_rerun_candidates.py                          # table
