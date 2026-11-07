@@ -56,7 +56,7 @@ before; deploy order is in the consumers' READMEs and [ADR 0001](adr/0001-light-
   (b) Stamp the convention in store `.zattrs`.
 - Why: PROC-F1. Until (a) is done those `DSR_nodecon` outputs are a y-mirror of every decon and live product.
 - Status: 3a and 3b are the user's. The prepared re-run steps and a read-only lister are in
-  [docs/handedness-rerun.md](handedness-rerun.md) (created by a separate task of the same run).
+  [docs/handedness-rerun.md](handedness-rerun.md).
 
 ## 4. Test isolation and view eviction safety
 - Status: DONE (#79): the conftest redirects the four production paths into a per-session tmp dir and fails the session if one
@@ -108,11 +108,11 @@ before; deploy order is in the consumers' READMEs and [ADR 0001](adr/0001-light-
   |---|---|---|---|---|
   | `ae1846e` (before the run) | 547 | 497 | 25 files | 158 in 19 files |
   | `origin/main` `32dccb1` (end of the run) | 439 | 377 | 24 files | 173 in 20 files |
-  | after the hygiene change | 386 (377 E501, 8 UP038, 1 UP027) | 377 | 24 files | 173 in 20 files |
+  | after the hygiene change | 386 (377 E501, 8 UP038, 1 UP027) | 377 | 24 files | 134 in 12 files |
 
   So the debt predates the run (the review's 547 is reproduced at `ae1846e`) and the ruff total fell during it (547 to 439, E501
   497 to 377; the cause was not examined). The mypy counts used bioimaging's venv for third-party types, so they are not comparable with the review's 197, which
-  used the pre-commit hook environment; they rose from 158 to 173 over the run (not broken down). The hygiene change fixed every
+  used the pre-commit hook environment; they rose from 158 to 173 over the run (not broken down), then fell to 134 after the type-only fixes in the hygiene change. The hygiene change fixed every
   import-order, whitespace and similar finding (I001, W293, W291, UP015, F841 in `profile_report.py`) and set ruff `src` so the
   0.5.5 pin no longer reports opym as third-party. What is left is E501, `ruff format` drift, UP038/UP027 (rules removed in
   current ruff) and mypy; no mass reformat.

@@ -26,10 +26,10 @@ store, stream wire and sender, gaps).
 | DUP-10 | replaced | pymmcore-gui `_protocol.py` deleted; `_session.py` imports `opym.stream.protocol` | opym #83, pymmcore-gui #65 |
 | DUP-11 | replaced | FRAME time is epoch seconds (`frame_epoch_s`), old ms form accepted via `acq_first_s`; not yet on the rig, existing stores keep relative time only | opym #83, pymmcore-gui #65 |
 | DUP-12 | replaced | pymmcore-gui `_bfill.py` and `_bfill_run.py` deleted, `opym.stream.bfill` / `bfill_run` imported | opym #83, pymmcore-gui #65 |
-| DUP-13 | replaced | the rig's sender became `opym.stream.backfill_client`; pymmcore-gui keeps a 55-line wrapper; one `opym-backfill-send` script | opym #83, pymmcore-gui #65, bioimaging #44 |
+| DUP-13 | replaced | the rig's sender became `opym.stream.backfill_client`; pymmcore-gui keeps a 53-line wrapper; one `opym-backfill-send` script | opym #83, pymmcore-gui #65, bioimaging #44 |
 | DUP-14 | `downsample2` replaced; linkbench halves kept | channelaligner imports `opym.ome_zarr_writer.downsample2`; the rig client and opym sink of the link benchmark are complementary halves, not copies | channelaligner #3 |
 | DUP-15 | replaced | CORE's layout-3 reader copy deleted for `opym.store`; its fixtures come from `opym.testing.store`, a real writer-built store | CORE #26 |
-| DUP-16 | replaced, ~10 lines of glue kept | cell-cinema reads times through `opym.timeline` with a `reader=` hook; the glue stays because ChimeraX has no zarr and the rig's `t` array is blosc-compressed | cell-cinema #14, opym #85 |
+| DUP-16 | replaced, a 42-line reader shim kept | cell-cinema reads times through `opym.timeline` with a `reader=` hook; the glue stays because ChimeraX has no zarr and the rig's `t` array is blosc-compressed | cell-cinema #14, opym #85 |
 | DUP-17 | replaced | the legacy `FF3D3D` red is remapped to magenta in the reader (`normalize_color`), one palette in `opym.display`; no store rewritten (decision (e)). chimerax-ngff and cell-cinema stay LINEAR for ChimeraX by the user's linear-intensity rule; the sqrt rule applies to naparym-live, opym-viewer and argus-desktop | opym #82; chimerax-ngff #15, cell-cinema #14, argus-desktop #12 |
 | DUP-18 | kept | `tools/tiff_series_to_ngff.py` is an intentionally different writer; a docstring note says it is not opym-compatible | chimerax-ngff #15 |
 | DUP-19 | needs user | archive or delete of old repos (decision (b)) and the HPC `../software/opym` question are the user's | none |

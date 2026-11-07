@@ -9,7 +9,7 @@ Review and plan: [docs/review/2026-11-review.md](docs/review/2026-11-review.md),
 ## Run and test
 
 - Use bioimaging's venv, FROM THE REPO ROOT ONLY:
-  `../bioimaging/.venv/bin/python -m pytest -m "not gpu"` (766 pass at the end of the 2026-11 run). From a worktree use
+  `../bioimaging/.venv/bin/python -m pytest -m "not gpu"` (780 pass once the hygiene and handedness-prep branches are both merged; 768 on the hygiene branch alone). From a worktree use
   `~/projects/science/bioimaging/.venv/bin/python`. This repo's own `.venv` is stale (numcodecs 0.16 vs zarr 2;
   `ipywidgets` missing); re-sync with `uv sync`.
 - Never import test modules from another directory: the conftest isolation is skipped and the lane tests act on

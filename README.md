@@ -115,7 +115,7 @@ Golden vectors for them are in `opym.testing`, which the consumers' tests import
 | `opym.stream.qcproj` | raw-projection sidecar for the live QC | CORE |
 | `opym.registry` | the registry schema and writer, `RegistryReader` / `connect_ro`, stage and status vocabulary, key codec | opym-dashboard, opym-viewer, CORE, bioimaging |
 | `opym.timeline` | acquisition times: zarr-free readers, relative-time rules, the `opym_time` record, the `reader=` hook | cell-cinema, opym-dashboard, bioimaging |
-| `opym.store` | layout-3 names and attrs readers, progress, voxel size, frame count, output path names and helpers, `leaf_for_store` (viewer store path back to its dataset leaf) | opym-dashboard, CORE, bioimaging, argus-desktop, channelaligner |
+| `opym.store` | layout-3 names and attrs readers, progress, voxel size, frame count, output path names and helpers, `leaf_for_store` (viewer store path back to its dataset leaf) | opym-dashboard, CORE, bioimaging, argus-desktop, channelaligner, pymmcore-gui |
 | `opym.display` | the sqrt 8-bit rule and its decode, the linear shift (ChimeraX), the channel palette and the legacy `FF3D3D` remap | naparym-live, opym-viewer, argus-desktop, chimerax-ngff, cell-cinema |
 | `opym.ome_zarr_writer` | the processed-store writer, `downsample2`, `mip_stacks` | channelaligner, CORE, bioimaging |
 | `opym.metadata` | MDA settings and the one z-step reader (`parse_z_step`, `zarr_fallback_z_step`) | bioimaging |
