@@ -75,6 +75,11 @@ DEFAULT_VIEW_ROOT = Path("/dev/shm/opym_live_view")
 # Newest timepoints whose uncompressed view buffers stay on the RAM disk
 # (about 1 GB per channel each at 161 planes).
 BUFFER_KEEP_T = 3
+# The processed view store on the RAM disk is about as large as the raw store
+# it comes from (100 T x 2 C: 45 GB view against 46 GB raw, with the newest
+# uncompressed buffers on top): what a SESSION_START must find room for besides
+# the raw bytes (LIVE-05).
+VIEW_STORE_RAW_RATIO = 0.9
 SHEET_ANGLE_DEG = 60.0
 # Written at every session start (see `ZarrLiveLane.start_session`): each GPU
 # server, when idle, runs one warm-up on it -- the session's PSF cache, a

@@ -502,6 +502,45 @@ def test_the_argus_side_sender_resends_on_request(monkeypatch):
     assert sent == [1, 3]
 
 
+def test_the_room_check_counts_the_live_view_store_when_that_lane_is_on(
+    tmp_path, recv, monkeypatch
+):
+    """LIVE-05: the one-format lane's view store lands on the same RAM disk and
+    is about as large as the raw store; counting raw bytes alone admitted
+    sessions that then filled tmpfs."""
+    import shutil
+
+    import opym.stream.receiver as receiver_mod
+
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
+    monkeypatch.setattr(receiver_mod, "_estimate_session_bytes", lambda _h: 64.7e9)
+    # 64.7 GB raw + 0.9 x that + the floor = 142.9 GB; raw + floor alone is 84.7.
+    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=120))
+    monkeypatch.setenv("OPYM_LIVE_LANE", "1")
+    monkeypatch.setenv("OPYM_DECON_PSF", str(tmp_path / "psf.tif"))
+    monkeypatch.setenv("OPYM_LIVE_FORMAT", "zarr")
+
+    sock = _dealer(recv, "sess-view")
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
+    ack = _pump(recv, sock)
+    assert ack["unknown_session"] is True
+    assert "need 142.9 GB" in ack["rejected"]
+    assert "58.2 GB live view store" in ack["rejected"]
+    assert "sess-view" not in recv.sessions
+
+    monkeypatch.delenv("OPYM_LIVE_FORMAT")  # the TIFF lane has no view store
+    assert receiver_mod._estimate_view_bytes(10**9) == 0
+    monkeypatch.delenv("OPYM_LIVE_LANE")
+    monkeypatch.delenv("OPYM_DECON_PSF")  # and with no live lane, none either
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
+    ack = _pump(recv, sock)
+    assert not ack.get("unknown_session")
+    assert "sess-view" in recv.sessions
+    sock.close()
+
+
 def test_a_session_start_frees_ram_disk_space_before_refusing(
     tmp_path, recv, monkeypatch
 ):

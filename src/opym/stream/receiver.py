@@ -431,6 +431,14 @@ def _estimate_session_bytes(header: dict[str, Any]) -> int:
     return nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
 
 
+def _estimate_view_bytes(raw_bytes: int) -> int:
+    """What the one-format live lane's view store adds on the RAM disk, which
+    it shares with the raw staging (0 when that lane is off; LIVE-05)."""
+    if _live_lane_enabled() and _decon_enabled() and live_zarr.live_format() == "zarr":
+        return int(raw_bytes * live_zarr.VIEW_STORE_RAW_RATIO)
+    return 0
+
+
 @dataclass
 class _SlabAssembly:
     """One (t, c) volume arriving as z-slabs (FRAME headers with `z0`)."""
@@ -1036,14 +1044,21 @@ class StreamReceiver:
                 # mid-session, and 2x turned a back-to-back movie down
                 # while the previous one was still draining (2026-09-28:
                 # 114.8 GB free for a 64.7 GB session). See module docstring.
-                need_bytes = estimated_bytes + _stage_floor_bytes()
+                view_bytes = _estimate_view_bytes(estimated_bytes)
+                need_bytes = estimated_bytes + view_bytes + _stage_floor_bytes()
                 if need_bytes > free_bytes:
                     free_bytes = self._free_stage_space(stage_root, need_bytes)
                 if need_bytes > free_bytes:
                     raise _StageShort(
                         f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
                         f"free, need {need_bytes / 1e9:.1f} GB (this session's "
-                        f"estimated {estimated_bytes / 1e9:.1f} GB + the floor)"
+                        f"estimated {estimated_bytes / 1e9:.1f} GB"
+                        + (
+                            f" + {view_bytes / 1e9:.1f} GB live view store"
+                            if view_bytes
+                            else ""
+                        )
+                        + " + the floor)"
                     )
 
             base_name = self._resolve_base_name(
