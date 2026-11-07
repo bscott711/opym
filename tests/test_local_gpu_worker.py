@@ -838,7 +838,8 @@ def _survivor(sup, server_id="1"):
     env = {k: v for k, v in os.environ.items() if k != "PETAKIT_JOBS_DIR"}
     return subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
-        env=env | {"PETAKIT_SERVER_ID": server_id, "PETAKIT_JOBS_DIR": str(sup.base_dir)},
+        env=env
+        | {"PETAKIT_SERVER_ID": server_id, "PETAKIT_JOBS_DIR": str(sup.base_dir)},
     )
 
 
@@ -973,7 +974,9 @@ def test_consolidation_runs_off_the_tick_and_never_twice_at_once(tmp_path, monke
         return 0
 
     monkeypatch.setattr(local_gpu_worker, "run_pending_consolidations", slow)
-    sup, launched, clock = _make_supervisor(tmp_path, spawn=local_gpu_worker.spawn_thread)
+    sup, launched, clock = _make_supervisor(
+        tmp_path, spawn=local_gpu_worker.spawn_thread
+    )
     _ticket(sup.queue_dir, "job.json")
     sup.tick()
     (sup.queue_dir / "job.json").unlink()

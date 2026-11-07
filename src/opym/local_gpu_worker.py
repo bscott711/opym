@@ -367,7 +367,7 @@ class HangWalk(NamedTuple):
     """A newest-file walk of a claimed ticket's dataDir, running off the tick."""
 
     future: Future
-    claim: "Claim"
+    claim: Claim
     data_dir: str
 
 

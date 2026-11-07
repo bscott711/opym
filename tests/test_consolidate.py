@@ -133,7 +133,7 @@ def test_a_missing_timepoint_leaves_a_blank_frame_not_a_shifted_series(tmp_path)
 
 
 def test_pending_consolidation_keeps_its_sidecar_while_zarrs_are_missing(tmp_path):
-    """BF-09: the sidecar went away after the first pass, so a gap was never repaired."""
+    """BF-09: the sidecar went away after the first pass: a gap was never repaired."""
     from opym.consolidate import run_pending_consolidations
 
     jobs = tmp_path / "jobs"

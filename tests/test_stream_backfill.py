@@ -1027,7 +1027,8 @@ def test_a_refused_metadata_request_leaves_a_finished_store_marked(world):
         reply = call(bfill.BF_META, {**header, "files": [
             {"rel": "p0/.zarray", "data": json.dumps(zarray).encode()}]})
         assert not reply["ok"] and "differs" in reply["error"]
-        reply = call(bfill.BF_META, {**header, "files": [{"rel": "../../escape", "data": b"x"}]})
+        escape = {"rel": "../../escape", "data": b"x"}
+        reply = call(bfill.BF_META, {**header, "files": [escape]})
         assert not reply["ok"] and "unsafe" in reply["error"]
     finally:
         sock.close(0)
@@ -1045,8 +1046,10 @@ def test_an_accepted_metadata_request_still_takes_the_marker_down(world):
     dst = remote_store(world)
     call, sock = _raw(world)
     try:
-        reply = call(bfill.BF_META, {"leaf": str(dst.parent), "store": dst.name, "files": [
-            {"rel": "p0/.zarray", "data": (src / "p0" / ".zarray").read_bytes()}]})
+        zarray = (src / "p0" / ".zarray").read_bytes()
+        header = {"leaf": str(dst.parent), "store": dst.name}
+        files = [{"rel": "p0/.zarray", "data": zarray}]
+        reply = call(bfill.BF_META, {**header, "files": files})
         assert reply["ok"]
     finally:
         sock.close(0)
