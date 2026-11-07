@@ -258,6 +258,40 @@ _ZAP_DOMAIN = b"opym-direct"
 _UNKNOWN_NOTICE_EVERY_S = 2.0
 
 
+# Bounds for the numbers a client declares, checked before anything is
+# allocated or indexed with them (ING-F3): a volume side, a volume's bytes, a
+# timepoint count. Far above any real acquisition, far below "kills the host".
+_MAX_DIM = 65536
+_MAX_VOLUME_BYTES = 64 * 1024**3
+_MAX_TIMEPOINTS = 10_000_000
+_MAX_CHANNELS = 64
+
+
+def _int_field(value: Any, what: str, lo: int, hi: int) -> int:
+    """`value` as an int in [lo, hi]; ValueError otherwise (bools and floats
+    are not ints here: they would silently index the wrong thing)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{what} must be an integer, got {value!r}")
+    if not lo <= value <= hi:
+        raise ValueError(f"{what} must be in [{lo}, {hi}], got {value}")
+    return value
+
+
+def _checked_shape(value: Any, what: str = "shape_zyx") -> tuple[int, int, int]:
+    """A declared (z, y, x) volume shape as three ints in [1, _MAX_DIM]."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{what} must be three integers, got {value!r}")
+    nz, ny, nx = (_int_field(v, f"{what} entry", 1, _MAX_DIM) for v in value)
+    return nz, ny, nx
+
+
+def _checked_dtype(value: Any) -> np.dtype:
+    try:
+        return np.dtype(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unusable dtype {value!r}") from exc
+
+
 def _env_list(name: str) -> list[str]:
     return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
 
@@ -349,6 +383,20 @@ class _StageShort(ValueError):
     """The RAM disk has no room for a session yet: a SESSION_START turned
     down for this is answered (with "rejected"), since a retry can succeed
     once a drain frees space. Other rejections stay silent."""
+
+
+def _check_session_numbers(header: dict[str, Any], channels: list[Any]) -> None:
+    """SESSION_START's declared counts and shape, in range (ValueError if not),
+    before any of them sizes a path, an array or a RAM-disk estimate."""
+    _int_field(header["num_timepoints"], "num_timepoints", 1, _MAX_TIMEPOINTS)
+    _checked_shape(header["shape_zyx"])
+    _checked_dtype(header["dtype"])
+    if not 1 <= len(channels) <= _MAX_CHANNELS:
+        raise ValueError(f"channels must hold 1..{_MAX_CHANNELS} entries")
+    for c in channels:
+        _int_field(c, "channel", 0, _MAX_CHANNELS * 1024)
+    if len(set(channels)) != len(channels):
+        raise ValueError(f"channels must be distinct, got {channels!r}")
 
 
 def _estimate_session_bytes(header: dict[str, Any]) -> int:
@@ -513,6 +561,9 @@ class StreamReceiver:
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
         self._unknown_noticed: dict[str, float] = {}
+        # Messages and housekeeping steps that failed without taking the receiver
+        # down, by kind (stream_health.json "errors"; ING-F3, LIVE-02).
+        self.errors: dict[str, int] = {}
         # Sessions closed for idling, by close time (see _handle_session_start).
         self._idle_closed: dict[str, float] = {}
         # Where each closed session's stream_status.json went, so a client's
@@ -738,13 +789,58 @@ class StreamReceiver:
             )
         return True
 
+    def _count_error(self, kind: str) -> None:
+        self.errors[kind] = self.errors.get(kind, 0) + 1
+
     def _handle_incoming(self, sock: zmq.Socket) -> None:
+        """One message, whatever it holds. No exception from a handler may end
+        the poll loop: that would drop every open session's in-memory state and,
+        with the client resending after the restart, loop (ING-F3). A message
+        that fails is logged, counted (`errors`) and dropped; a SESSION_START is
+        also answered "rejected", so its client retries instead of waiting."""
         identity, *rest = sock.recv_multipart()
         try:
             msg_type, session_id, header, payload = unpack_message(rest)
         except ValueError as exc:
             logger.warning("Dropping malformed message from %r: %s", identity, exc)
+            self._count_error("malformed_message")
             return
+        except Exception:
+            logger.exception("Dropping unreadable message from %r", identity)
+            self._count_error("unreadable_message")
+            return
+        try:
+            self._dispatch_message(
+                sock, identity, msg_type, session_id, header, payload
+            )
+        except Exception as exc:
+            logger.exception(
+                "Handling %s for session %s failed -- message dropped, receiver "
+                "carries on",
+                msg_type.decode(errors="replace"),
+                session_id,
+            )
+            self._count_error(f"{msg_type.decode(errors='replace')}_failed")
+            if msg_type == MSG_SESSION_START:
+                try:
+                    self._send_unknown(
+                        sock,
+                        identity,
+                        session_id,
+                        rejected=f"receiver error ({type(exc).__name__}): {exc}",
+                    )
+                except Exception:
+                    logger.exception("Could not answer the rejected SESSION_START")
+
+    def _dispatch_message(
+        self,
+        sock: zmq.Socket,
+        identity: bytes,
+        msg_type: str,
+        session_id: str,
+        header: dict[str, Any],
+        payload: bytes | None,
+    ) -> None:
 
         # The DEALER client is required to set zmq.IDENTITY == session_id,
         # or "<session_id>#<k>" for its extra links (see protocol.py) --
@@ -836,6 +932,7 @@ class StreamReceiver:
             base_name = header["base_name"]
             channels = list(header["channels"])
             channel_names = list(header.get("channel_names") or [])
+            _check_session_numbers(header, channels)
             if len(channel_names) != len(channels):
                 raise ValueError(
                     f"channel_names (got {len(channel_names)}) must have exactly "
@@ -911,11 +1008,12 @@ class StreamReceiver:
                 ack_floor=-1 if resume_through is None else resume_through,
                 resumed=resume_through is not None,
             )
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, OSError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
-            if isinstance(exc, _StageShort):
+            if isinstance(exc, (_StageShort, OSError)):
                 # Answer, so the client knows why and retries (space may
-                # come back once a drain ends) instead of waiting on a
+                # come back once a drain ends; a destination that cannot be
+                # used right now may be fixed) instead of waiting on a
                 # silent socket.
                 self._send_unknown(sock, identity, session_id, rejected=str(exc))
             return
@@ -1351,11 +1449,16 @@ class StreamReceiver:
                 "FRAME with no payload for session %s -- dropped", session_id
             )
             return
+        try:
+            t, c, frame_index = self._frame_coordinates(session, header)
+        except (KeyError, ValueError) as exc:
+            logger.warning("Dropping a bad FRAME for session %s: %s", session_id, exc)
+            self._count_error("bad_frame")
+            return
         if self._held_back(session):
             return
 
         recv_s = time.time()
-        t, c, frame_index = header["t"], header["c"], header["frame_index"]
         wire_bytes = len(payload)
         if header.get("codec") == "blosc":
             try:
@@ -1416,6 +1519,51 @@ class StreamReceiver:
         ):
             self._send_ack(session)
 
+    @staticmethod
+    def _frame_coordinates(
+        session: SessionState, header: dict[str, Any]
+    ) -> tuple[int, int, int]:
+        """A FRAME's `(t, c, frame_index)`, checked against the session: `t`
+        inside the declared timepoints (a negative one would index from the
+        end of the array) and `c` one of its channels (ING-F3)."""
+        t = _int_field(header["t"], "t", 0, session.num_timepoints - 1)
+        c = header["c"]
+        if isinstance(c, bool) or c not in session.channel_store_paths:
+            raise ValueError(f"c={c!r} is not one of this session's channels")
+        frame_index = _int_field(header["frame_index"], "frame_index", 0, 2**62)
+        return t, c, frame_index
+
+    def _slab_geometry(
+        self,
+        session: SessionState,
+        header: dict[str, Any],
+        payload: bytes,
+        asm: _SlabAssembly | None,
+    ) -> tuple[np.dtype, tuple[int, int, int], int, int]:
+        """A slab's `(dtype, shape, nz, z0)`, checked before the volume is
+        allocated: ValueError if the planes do not fit the volume, the payload
+        is not exactly the declared planes, or an earlier slab of this volume
+        declared something else (ING-F3)."""
+        dtype = _checked_dtype(header.get("dtype") or session.dtype)
+        shape = _checked_shape(header["shape_zyx"])
+        nz = _int_field(header["nz"], "nz", shape[0], _MAX_DIM)
+        z0 = _int_field(header["z0"], "z0", 0, nz - shape[0])
+        if nz * shape[1] * shape[2] * dtype.itemsize > _MAX_VOLUME_BYTES:
+            raise ValueError(f"a volume of {nz} x {shape[1]} x {shape[2]} is too big")
+        want = shape[0] * shape[1] * shape[2] * dtype.itemsize
+        if len(payload) != want:
+            raise ValueError(
+                f"slab payload is {len(payload)} bytes, its header declares {want}"
+            )
+        if asm is not None and (
+            asm.have is None
+            or len(asm.have) != nz
+            or asm.volume.shape[1:] != shape[1:]
+            or asm.volume.dtype != dtype
+        ):
+            raise ValueError("slab disagrees with the earlier slabs of its volume")
+        return dtype, shape, nz, z0
+
     def _handle_slab(
         self,
         session: SessionState,
@@ -1445,11 +1593,21 @@ class StreamReceiver:
             session.processed_frame_indices.add(frame_index)
             self._advance_ack_floor(session)
             return
-        dtype = np.dtype(header.get("dtype") or session.dtype)
-        slab = np.frombuffer(payload, dtype=dtype).reshape(header["shape_zyx"])
         asm = session.slabs.get((t, c))
+        try:
+            dtype, shape, nz, _ = self._slab_geometry(session, header, payload, asm)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Dropping a bad slab (t=%s, c=%s) for session %s: %s",
+                t,
+                c,
+                session.session_id,
+                exc,
+            )
+            self._count_error("bad_slab")
+            return
+        slab = np.frombuffer(payload, dtype=dtype).reshape(shape)
         if asm is None:
-            nz = int(header["nz"])
             asm = _SlabAssembly(
                 volume=np.empty((nz, *slab.shape[1:]), dtype=dtype),
                 have=np.zeros(nz, dtype=bool),
@@ -1576,9 +1734,9 @@ class StreamReceiver:
     ) -> None:
         """A whole (t, c) volume in one FRAME: raw store, then processing."""
         t, c = header["t"], header["c"]
-        shape_zyx = tuple(header.get("shape_zyx") or session.shape_zyx)
+        shape_zyx = _checked_shape(header.get("shape_zyx") or session.shape_zyx)
         dtype = header.get("dtype") or session.dtype
-        raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
+        raw = np.frombuffer(payload, dtype=_checked_dtype(dtype)).reshape(shape_zyx)
         t_start = time.perf_counter()
         arr = self._raw_array(session, c, shape_zyx, dtype)
         rawmirror.write_timepoint(arr, t, raw)
@@ -2090,6 +2248,7 @@ class StreamReceiver:
             "idle_timeout_s": self.idle_timeout_sec,
             "sessions": sessions,
             "recent_ends": self._recent_ends,
+            "errors": dict(self.errors),
         }
         try:
             path = outcome.health_path()

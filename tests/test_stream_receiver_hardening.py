@@ -5,6 +5,7 @@ destination or an unsafe name, driven over a real loopback ZMQ DEALER."""
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -12,9 +13,11 @@ import pytest
 import zarr
 import zmq
 
+from opym.stream import outcome
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_HEARTBEAT,
     MSG_SESSION_END,
     MSG_SESSION_START,
     pack_message,
@@ -200,3 +203,167 @@ def test_a_completed_volume_survives_the_end(tmp_path, recv, dealer):
     _send(recv, sock, MSG_FRAME, *_slab(0, 3, 3, 1))
     _send(recv, sock, MSG_SESSION_END, {"reason": "complete"})
     assert _timepoint_dirs(raw) == [0]
+
+
+# --- ING-F3: one bad message cannot take the receiver down ---------------------
+
+
+def _still_serving(recv, dealer, tmp_path, sid="sess-after"):
+    """The receiver answers a fresh, valid session: proof it survived."""
+    sock = dealer(sid)
+    ack = _start(recv, sock, _header(tmp_path / "good", base_name="Good"), sid=sid)
+    assert ack is not None and sid in recv.sessions
+    sock.close()
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permissions",
+)
+def test_session_start_with_an_unreadable_raw_root_is_rejected_not_fatal(
+    tmp_path, recv, dealer
+):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        sock = dealer()
+        ack = _start(recv, sock, _header(locked / "raw"))
+        assert ack is not None
+        assert ack["unknown_session"] and ack["rejected"]
+        assert SID not in recv.sessions
+        _still_serving(recv, dealer, tmp_path)
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_frame_without_t_is_dropped_and_counted(tmp_path, recv, dealer):
+    sock = dealer()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    header, payload = _frame(0, 0)
+    del header["t"]
+    _send(recv, sock, MSG_FRAME, header, payload)
+    assert recv.errors == {"bad_frame": 1}
+    _still_serving(recv, dealer, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"t": -1}, {"t": 3}, {"t": 1.0}, {"t": True}, {"c": 7}, {"frame_index": -1}],
+)
+def test_a_frame_outside_the_declared_grid_is_dropped(tmp_path, recv, dealer, bad):
+    """t=-1 used to index the LAST timepoint of the array."""
+    raw = tmp_path / "raw"
+    sock = dealer()
+    assert _start(recv, sock, _header(raw)) is not None
+    header, payload = _frame(0, 0)
+    header.update(bad)
+    _send(recv, sock, MSG_FRAME, header, payload)
+    assert recv.errors == {"bad_frame": 1}
+    assert not _store(raw).exists()
+    assert recv.sessions[SID].received_pairs == set()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"shape_zyx": [3, 4, 9]},  # payload is 3 x 4 x 5
+        {"shape_zyx": [3, 4]},
+        {"shape_zyx": [0, 4, 5]},
+        {"z0": 5},  # 5 + 3 planes > nz=6
+        {"z0": -1},
+        {"nz": 10**9},
+        {"nz": 2},
+        {"dtype": "not-a-dtype"},
+    ],
+)
+def test_a_slab_that_does_not_fit_is_dropped_before_anything_is_allocated(
+    tmp_path, recv, dealer, bad
+):
+    raw = tmp_path / "raw"
+    sock = dealer()
+    assert _start(recv, sock, _header(raw)) is not None
+    header, payload = _slab(0, 0, 3, 0)
+    header.update(bad)
+    _send(recv, sock, MSG_FRAME, header, payload)
+    assert recv.errors == {"bad_slab": 1}
+    assert recv.sessions[SID].slabs == {}
+    assert not _store(raw).exists()
+
+
+def test_a_slab_that_disagrees_with_its_volume_is_dropped(tmp_path, recv, dealer):
+    sock = dealer()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    _send(recv, sock, MSG_FRAME, *_slab(0, 0, 3, 0))
+    header, payload = _slab(0, 3, 3, 1, nz=8)
+    _send(recv, sock, MSG_FRAME, header, payload)
+    assert recv.errors == {"bad_slab": 1}
+    assert recv.sessions[SID].slabs[(0, 0)].z0s == {0}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"num_timepoints": 0},
+        {"num_timepoints": "3"},
+        {"shape_zyx": [6, 4]},
+        {"shape_zyx": [6, 4, 10**9]},
+        {"dtype": "nonsense"},
+        {"channels": [0, 0], "channel_names": ["A", "B"]},
+    ],
+)
+def test_a_session_start_with_unusable_numbers_is_refused_without_a_crash(
+    tmp_path, recv, dealer, bad
+):
+    sock = dealer()
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, SID, _header(tmp_path / "raw", **bad))
+    )
+    _drive(recv)
+    assert SID not in recv.sessions
+    _still_serving(recv, dealer, tmp_path)
+
+
+def test_an_unexpected_handler_error_is_logged_counted_and_survived(
+    tmp_path, recv, dealer, monkeypatch
+):
+    """The catch-all: whatever a handler raises, the poll loop carries on and
+    the other open session keeps its state."""
+    other = dealer("sess-other")
+    assert _start(recv, other, _header(tmp_path / "o", base_name="O"), "sess-other")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("handler bug")
+
+    monkeypatch.setattr(recv, "_handle_heartbeat", _boom)
+    sock = dealer()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    sock.send_multipart(pack_message(MSG_HEARTBEAT, SID, {}))
+    _drive(recv)
+
+    assert recv.errors == {"HEARTBEAT_failed": 1}
+    assert {SID, "sess-other"} <= set(recv.sessions)
+    _still_serving(recv, dealer, tmp_path)
+
+
+def test_a_session_start_that_fails_unexpectedly_is_answered_rejected(
+    tmp_path, recv, dealer, monkeypatch
+):
+    def _boom(*_a, **_k):
+        raise RuntimeError("lane exploded")
+
+    monkeypatch.setattr(recv, "_send_ack", _boom)
+    sock = dealer()
+    ack = _start(recv, sock, _header(tmp_path / "raw"))
+    assert ack["unknown_session"] and "lane exploded" in ack["rejected"]
+    assert recv.errors == {"SESSION_START_failed": 1}
+
+
+def test_the_health_record_carries_the_error_counts(tmp_path, recv, dealer):
+    sock = dealer()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    header, payload = _frame(0, 0)
+    header["t"] = -1
+    _send(recv, sock, MSG_FRAME, header, payload)
+    recv._write_health()
+    assert outcome.read_health()["errors"] == {"bad_frame": 1}
