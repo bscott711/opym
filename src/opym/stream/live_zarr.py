@@ -101,6 +101,11 @@ def view_bits() -> int:
 # (idle timeout, crash) would otherwise never warm for it.
 PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
+# Once a session has ended, tickets that make no progress at all for this long
+# (no server claiming them, a dead GPU) are given up on, so the session can
+# finalize as failed and release the live lease and the dataset to the
+# backfill (LIVE-01). Any ticket finishing or failing counts as progress.
+POST_END_STALL_S = 1800.0
 
 
 def _view_dir_finished(d: Path) -> bool:
@@ -237,6 +242,9 @@ class ZarrLiveSession:
     """How the receiver says the session ended (opym.stream.outcome)."""
     superseded: bool = False
     started_at: float = 0.0
+    ended_at: float = 0.0
+    last_progress_at: float = 0.0
+    """When a ticket last finished or failed (see `POST_END_STALL_S`)."""
     first_done_at: float | None = None
     last_status_write: float = 0.0
 
@@ -250,6 +258,10 @@ class ZarrLiveSession:
 
     def buffer(self, t: int, c: int) -> Path:
         return self.buffers_dir / buffer_name(t, c)
+
+    def dispatchable(self) -> bool:
+        """The edge-erosion mask comes from (0, 0), so nothing runs without it."""
+        return 0 in self.staged.get(0, ())
 
     def settled(self) -> bool:
         """Every fully staged timepoint is archived or failed, nothing in flight."""
@@ -383,12 +395,65 @@ class ZarrLiveLane(LiveLane):
         if self.qc and raw is not None and not session.superseded:
             self._submit_qc(session, t, cidx, raw)
 
+    def end_session(self, session_id: str, end: dict | None = None) -> None:
+        session = self.sessions.get(session_id)
+        if session is not None and not session.ended:
+            session.ended_at = self._clock()
+        super().end_session(session_id, end)
+
     # --- pump steps ---------------------------------------------------------
+
+    def pump(self) -> None:
+        super().pump()
+        for session in list(self.sessions.values()):
+            if self._give_up_unfinishable(session) and session.settled():
+                self._finalize(session)
+
+    def _give_up_unfinishable(self, session: ZarrLiveSession) -> bool:
+        """After `ended`, fail what can never finish so the session settles
+        (LIVE-01): volumes waiting on a (0, 0) that did not arrive can never
+        be dispatched, and tickets that nothing has claimed or finished for
+        `POST_END_STALL_S` are not coming back. Without this the session
+        stayed "running" for good, holding the live lease and the dataset off
+        the backfill until the receiver restarted. Returns True if it gave
+        something up."""
+        if not session.ended or session.superseded:
+            return False
+        gave_up = False
+        if session.ready and not session.dispatchable():
+            ts = sorted({t for t, _ in session.ready})
+            logger.error(
+                "Live lane (zarr): session %s ended without T=0 C=0, so nothing "
+                "can be dispatched; T=%s left to the batch backfill",
+                session.session_id,
+                ts,
+            )
+            session.failed.update(ts)
+            session.ready.clear()
+            gave_up = True
+        waited = self._clock() - max(session.ended_at, session.last_progress_at)
+        if session.tickets and waited >= POST_END_STALL_S:
+            ts = sorted({tk.t for tk in session.tickets.values()})
+            logger.error(
+                "Live lane (zarr): session %s ended %.0f s ago and %d ticket(s) "
+                "have made no progress; giving up, T=%s left to the batch backfill",
+                session.session_id,
+                waited,
+                len(session.tickets),
+                ts,
+            )
+            queue_dir = lanes.live_queue_dir(self.jobs)
+            for name in session.tickets:  # a server must not claim them later
+                (queue_dir / name).unlink(missing_ok=True)
+            session.failed.update(ts)
+            session.tickets.clear()
+            gave_up = True
+        return gave_up
 
     def _dispatch(self, session: ZarrLiveSession) -> None:
         if session.superseded or not session.ready:
             return
-        if 0 not in session.staged or 0 not in session.staged[0]:
+        if not session.dispatchable():
             return  # the erosion mask comes from (0, 0)
         free = self.max_outstanding - self._in_flight()
         session.ready.sort()
@@ -533,6 +598,7 @@ class ZarrLiveLane(LiveLane):
                 )
             if (self.jobs / "completed" / name).exists():
                 del session.tickets[name]
+                session.last_progress_at = self._clock()
                 trace.record(
                     "ticket_done",
                     jobs=self._jobs,
@@ -556,6 +622,7 @@ class ZarrLiveLane(LiveLane):
                 session.archiving[tc] = self._pool.submit(self._archive, session, *tc)
             elif (self.jobs / "failed" / name).exists():
                 del session.tickets[name]
+                session.last_progress_at = self._clock()
                 if session.superseded:
                     continue
                 if ticket.attempt < 2:
