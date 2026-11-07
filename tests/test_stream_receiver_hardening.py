@@ -367,3 +367,69 @@ def test_the_health_record_carries_the_error_counts(tmp_path, recv, dealer):
     _send(recv, sock, MSG_FRAME, header, payload)
     recv._write_health()
     assert outcome.read_health()["errors"] == {"bad_frame": 1}
+
+
+# --- LIVE-02: a failing live lane cannot kill the receiver ---------------------
+
+
+class _BrokenLane:
+    """A live lane whose every call raises, as one with a full tmpfs does."""
+
+    sessions: dict = {}
+
+    def pump(self):
+        raise OSError(28, "No space left on device")
+
+    def frame_staged(self, *_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    def end_session(self, *_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    def qc_latest_path(self, _sid):
+        raise OSError(28, "No space left on device")
+
+    def close(self):
+        pass
+
+
+def test_a_pump_that_raises_does_not_end_the_poll_loop(tmp_path, recv, dealer, caplog):
+    sock = dealer()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    recv._live = _BrokenLane()
+    caplog.clear()
+    for _ in range(30):
+        recv._run_once()
+    assert recv.errors["live_pump_failed"] == 30
+    # counted every time, logged with its traceback once per minute
+    assert len([r for r in caplog.records if r.exc_info]) == 1
+    assert SID in recv.sessions
+
+
+def test_the_other_steps_still_run_when_the_pump_raises(tmp_path, make_recv, dealer):
+    recv = make_recv(idle_timeout_sec=0.2)
+    sock = _dealer_factory(recv)()
+    assert _start(recv, sock, _header(tmp_path / "raw")) is not None
+    recv._live = _BrokenLane()
+    _drive(recv, 0.6)
+    assert SID not in recv.sessions  # the idle sweep ran after the failing pump
+    assert recv.errors["live_pump_failed"] > 0
+
+
+def test_a_lane_that_raises_on_a_frame_costs_the_view_not_the_frame(
+    tmp_path, recv, dealer
+):
+    raw = tmp_path / "raw"
+    sock = dealer()
+    assert _start(recv, sock, _header(raw, num_timepoints=1)) is not None
+    session = recv.sessions[SID]
+    recv._live = _BrokenLane()
+    session.live = session.live_zarr = session.decon_enabled = True
+    _send(recv, sock, MSG_FRAME, *_frame(0, 0))
+    assert session.received_pairs == {(0, 0)}  # written, counted, ACKed
+    assert recv.errors["live_frame_staged_failed"] == 1
+    assert session.ack_floor == 0
+
+    _send(recv, sock, MSG_SESSION_END, {"reason": "complete"})
+    assert SID not in recv.sessions  # end_session raised too; the end completed
+    assert recv.errors["live_end_session_failed"] == 1

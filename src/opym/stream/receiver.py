@@ -206,6 +206,9 @@ _CLIENT_LOG_DIR_ENV_VAR = "OPYM_STREAM_CLIENT_LOG_DIR"
 _CLIENT_LOG_MAX_LINES = 5000
 POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
+# A housekeeping step that keeps failing (a full tmpfs under the live lane's
+# ticket writes) is logged with its traceback this often, and counted every time.
+_STEP_LOG_EVERY_S = 60.0
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
 # thousand earlier acquisitions under one name means something is wrong
 # with naming, not a genuine collision; reject the session and say so.
@@ -564,6 +567,7 @@ class StreamReceiver:
         # Messages and housekeeping steps that failed without taking the receiver
         # down, by kind (stream_health.json "errors"; ING-F3, LIVE-02).
         self.errors: dict[str, int] = {}
+        self._step_logged: dict[str, float] = {}
         # Sessions closed for idling, by close time (see _handle_session_start).
         self._idle_closed: dict[str, float] = {}
         # Where each closed session's stream_status.json went, so a client's
@@ -692,20 +696,59 @@ class StreamReceiver:
         for sock in (self._socket, self._direct_socket):
             if sock is not None and sock in events:
                 self._handle_incoming(sock)
-        self._flush_pending_acks()
-        self._sweep_idle_sessions()
+        # Each step on its own: none of them may end the poll loop or starve the
+        # steps after it (LIVE-02: a full tmpfs made the live lane's pump() raise
+        # on a ticket write, which killed the receiver and, on restart, the same).
+        self._guarded("flush_acks", self._flush_pending_acks)
+        self._guarded("sweep_idle", self._sweep_idle_sessions)
         if time.monotonic() - self._last_health_write >= _HEALTH_EVERY_S:
-            self._write_health()
+            self._guarded("health", self._write_health)
         if time.monotonic() - self._last_space_check >= _SPACE_CHECK_EVERY_S:
-            self._check_stage_space()
+            self._guarded("stage_space", self._check_stage_space)
         # Held while any session is open; refreshed every few seconds so it
         # goes stale (and frees the GPUs) within a minute if we crash.
         if self._live is not None:
-            self._live.pump()
-            self._forward_qc()
+            self._guarded("live_pump", self._live.pump)
+            self._guarded("forward_qc", self._forward_qc)
         # The lease also covers live work still in flight after SESSION_END.
+        self._guarded("lease", self._update_lease)
+
+    def _update_lease(self) -> None:
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
+
+    def _guarded(self, step: str, fn, *args) -> None:
+        """Run one housekeeping step; if it raises, count it
+        (`errors["<step>_failed"]`), log it (with the traceback at most every
+        `_STEP_LOG_EVERY_S`) and carry on."""
+        try:
+            fn(*args)
+        except Exception:
+            kind = f"{step}_failed"
+            self._count_error(kind)
+            now = time.monotonic()
+            if now - self._step_logged.get(step, float("-inf")) >= _STEP_LOG_EVERY_S:
+                self._step_logged[step] = now
+                logger.exception(
+                    "Receiver step %r failed (%d so far) -- carrying on",
+                    step,
+                    self.errors[kind],
+                )
+
+    def _lane_hook(self, what: str, session_id: str, fn, *args, **kwargs) -> None:
+        """Call into the live lane for one session. The live view is a
+        convenience, the acquisition is not: a lane that raises costs that view
+        a volume, never the frame, the ACK or the receiver."""
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            self._count_error(f"live_{what}_failed")
+            logger.exception(
+                "Session %s: live lane %s failed -- carrying on without it for "
+                "this call",
+                session_id,
+                what,
+            )
 
     def _running_live_sessions(self) -> set[str]:
         return set(self._live.sessions) if self._live is not None else set()
@@ -1415,8 +1458,13 @@ class StreamReceiver:
                 session.received_pairs.add((t, c))
                 n += 1
                 if session.live and self._live is not None:
-                    self._live.frame_staged(
-                        session.session_id, t, session.channel_cidx[c]
+                    self._lane_hook(
+                        "frame_staged",
+                        session.session_id,
+                        self._live.frame_staged,
+                        session.session_id,
+                        t,
+                        session.channel_cidx[c],
                     )
         return n
 
@@ -1765,8 +1813,14 @@ class StreamReceiver:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 write_decon_staged_tiff(raw, dst)
             if session.live:
-                self._live.frame_staged(
-                    session.session_id, t, session.channel_cidx[c], raw=raw
+                self._lane_hook(
+                    "frame_staged",
+                    session.session_id,
+                    self._live.frame_staged,
+                    session.session_id,
+                    t,
+                    session.channel_cidx[c],
+                    raw=raw,
                 )
         session.stage_raw_s.append(raw_write_s)
         session.stage_tiff_s.append(time.perf_counter() - t_start)
@@ -1827,30 +1881,33 @@ class StreamReceiver:
     def _forward_qc(self) -> None:
         """Send each open session's newest QC verdict to its client, once."""
         now = time.monotonic()
-        for session in self.sessions.values():
+        for session in list(self.sessions.values()):
             if not (session.accepts_qc and session.live) or session.ended:
                 continue
             if now - session.qc_checked_at < QC_CHECK_SEC:
                 continue
             session.qc_checked_at = now
-            path = self._live.qc_latest_path(session.session_id)
-            try:
-                mtime = path.stat().st_mtime
-                if mtime == session.qc_mtime:
-                    continue
-                record = json.loads(path.read_text())
-            except (AttributeError, OSError, ValueError):
-                continue
-            session.qc_mtime = mtime
-            seq = record.get("seq", -1)
-            if record.get("session_id") != session.session_id:
-                continue
-            if not isinstance(seq, int) or seq <= session.qc_seq_sent:
-                continue
-            session.sock.send_multipart(
-                [session.identity, *pack_message(MSG_QC, session.session_id, record)]
-            )
-            session.qc_seq_sent = seq
+            self._guarded("forward_qc_session", self._forward_qc_one, session)
+
+    def _forward_qc_one(self, session: SessionState) -> None:
+        path = self._live.qc_latest_path(session.session_id)
+        try:
+            mtime = path.stat().st_mtime
+            if mtime == session.qc_mtime:
+                return
+            record = json.loads(path.read_text())
+        except (AttributeError, OSError, ValueError):
+            return
+        session.qc_mtime = mtime
+        seq = record.get("seq", -1)
+        if record.get("session_id") != session.session_id:
+            return
+        if not isinstance(seq, int) or seq <= session.qc_seq_sent:
+            return
+        session.sock.send_multipart(
+            [session.identity, *pack_message(MSG_QC, session.session_id, record)]
+        )
+        session.qc_seq_sent = seq
 
     def _handle_session_end(self, session_id: str, header: dict[str, Any]) -> None:
         session = self.sessions.get(session_id)
@@ -1893,7 +1950,13 @@ class StreamReceiver:
         _write_stage_profile(session, reason, end)
         self._record_end(session, end)
         if session.live:
-            self._live.end_session(session.session_id, end)
+            self._lane_hook(
+                "end_session",
+                session.session_id,
+                self._live.end_session,
+                session.session_id,
+                end,
+            )
         # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
         # see protocol.py's ACK docs) previously had no way to learn about
         # this session's LAST batch of frames if SESSION_END arrived before
