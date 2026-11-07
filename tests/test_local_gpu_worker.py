@@ -716,3 +716,43 @@ def test_rc_127_is_reported_loudly_and_in_the_status(tmp_path, capsys):
     assert s1["launch_env_broken"] is True
     s2 = next(s for s in status["servers"] if s["server_id"] == "2")
     assert s2["launch_env_broken"] is False
+
+
+def _orphaned_backfill_active(sup, data):
+    """A backfill ticket whose server was killed with the whole host
+    (systemctl restart opym-serve): `.active_` ticket, no process, no claim."""
+    active = sup.queue_dir / ".active_bf_orphan.json"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.write_text(json.dumps({"jobType": "deskew", "dataDir": str(data)}))
+    return active
+
+
+def test_orphan_reclaim_sweeps_a_backfill_tickets_partial_outputs(tmp_path):
+    """BF-01: after a restart the killed server's "<name>_<uuid>.tif/.zarr"
+    outputs stayed in the data dir, where globs read them as extra frames."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path)
+    _orphaned_backfill_active(sup, data)
+    sup.tick()
+    assert (sup.queue_dir / "bf_orphan.json").exists()
+    assert not [p for p in data.rglob("*") if UUID in p.name]
+    assert (data / "Decon" / "DSR_decon" / "cell_C0_T000.tif").exists()
+
+
+def test_orphan_reclaim_leaves_a_live_tickets_data_dir_alone(tmp_path):
+    """Negative control for BF-01: live tickets share their session's dataDir."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path)
+    active = sup.live_queue_dir / ".active_LIVE_t000.json"
+    active.write_text(json.dumps({"jobType": "deskew", "dataDir": str(data)}))
+    sup.tick()
+    assert (sup.live_queue_dir / "LIVE_t000.json").exists()
+    assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
+
+
+def test_orphan_reclaim_does_not_sweep_while_a_server_is_alive(tmp_path):
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path, any_server_alive=lambda: True)
+    _orphaned_backfill_active(sup, data)
+    sup.tick()
+    assert len([p for p in data.rglob("*") if UUID in p.name]) == 3

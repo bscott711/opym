@@ -559,6 +559,11 @@ class ServerSupervisor:
             for staging in lane_dir.glob(".requeue_*.json"):
                 os.replace(staging, lane_dir / staging.name.removeprefix(".requeue_"))
             for active in sorted(lane_dir.glob(".active_*.json")):
+                if lane_dir == self.queue_dir:
+                    # No server runs, so nothing is writing: the killed
+                    # server's half-written outputs go before the ticket does
+                    # (live tickets share their session's dataDir; not swept).
+                    self._sweep_partials(active)
                 outcome = requeue_claim(active, "orphaned claim: no server was running")
                 print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
         for rec in self.claims_dir.glob("S*.json"):
