@@ -135,6 +135,40 @@ def _multiscales(name: str, levels: int, voxel_um: float, time_interval_s: float
     ]
 
 
+class ProcessedStoreComplete(FileExistsError):
+    """The target store's progress file says ``complete``: a finished export
+    that a new session of the same name must not wipe (PROC-F9)."""
+
+
+def _guard_complete_store(out_path: Path, on_complete: str) -> None:
+    """Before ``zarr.open_group(mode="w")`` wipes ``out_path``: if it holds a
+    finished store (``.opym_live.json`` state ``complete``), refuse
+    (``on_complete="refuse"``, the default), rename it to
+    ``<name>.superseded-<unix time>`` and carry on (``"move_aside"``), or wipe
+    it as before (``"overwrite"``). A store that is absent, still ``running``
+    or ``failed`` is re-created as always: a half-written one has nothing to
+    protect, and a resumed session does not come through here."""
+    if on_complete not in ("refuse", "move_aside", "overwrite"):
+        raise ValueError(
+            f"on_complete must be refuse/move_aside/overwrite: {on_complete!r}"
+        )
+    if on_complete == "overwrite" or not Path(out_path).is_dir():
+        return
+    rec = read_progress(out_path)
+    if not rec or rec.get("state") != "complete":
+        return
+    if on_complete == "refuse":
+        raise ProcessedStoreComplete(
+            f"{out_path} is a complete processed store; refusing to overwrite "
+            "it. Pass on_complete='move_aside' to keep it under a new name, or "
+            "'overwrite' to replace it."
+        )
+    aside = Path(out_path).with_name(
+        f"{Path(out_path).name}.superseded-{int(time.time())}"
+    )
+    os.rename(out_path, aside)
+
+
 def _omero(name: str, n_c: int, labels: list[str]):
     return {
         "name": name,
@@ -161,11 +195,15 @@ def create_store(
     voxel_um: float = DSR_VOXEL_UM,
     levels: int = PYRAMID_LEVELS,
     time_interval_s: float = 1.0,
+    on_complete: str = "refuse",
 ):
-    """Allocate an empty legacy-layout store (all zeros, nothing written)."""
+    """Allocate an empty legacy-layout store (all zeros, nothing written).
+    A finished store already at ``out_path`` is not wiped (`on_complete`, see
+    `_guard_complete_store`)."""
     import zarr
 
     out_path = Path(out_path)
+    _guard_complete_store(out_path, on_complete)
     root = zarr.open_group(str(out_path), mode="w")
     for lvl, shp in enumerate(level_shapes(n_t, n_c, shape_zyx, levels)):
         root.create_dataset(
@@ -211,6 +249,7 @@ def create_processed_store(
     levels: int = PYRAMID_LEVELS,
     time_interval_s: float | None = None,
     acquisition_date=None,
+    on_complete: str = "refuse",
 ) -> ProcessedArrays:
     """Allocate an empty processed store (bioformats2raw layout 3, see the
     module docstring) for `n_t` x `n_c` DSR volumes of `shape_zyx`.
@@ -218,6 +257,11 @@ def create_processed_store(
     uint16, blosc-lz4, `/` separators, chunk size 1 on t and c -- the layout
     opymWriteZarrBlock requires -- and fill value 0, so a chunk the writer
     skipped as all-zero reads back as zeros.
+
+    A finished store already at ``out_path`` (progress state ``complete``) is
+    never wiped silently: ``on_complete`` is ``"refuse"`` (raise
+    `ProcessedStoreComplete`, the default), ``"move_aside"`` or ``"overwrite"``
+    (PROC-F9; see `_guard_complete_store`).
     """
     import zarr
     from numcodecs import Blosc
@@ -225,6 +269,7 @@ def create_processed_store(
     from opym.ome_xml import processed_ome_xml
 
     out_path = Path(out_path)
+    _guard_complete_store(out_path, on_complete)
     name = out_path.name.removesuffix(".ome.zarr").removesuffix("_dsr")
     labels = channel_labels or [f"C{c}" for c in range(n_c)]
     compressor = Blosc(cname="lz4", clevel=5, shuffle=Blosc.SHUFFLE)

@@ -249,3 +249,91 @@ def test_old_ticket_without_the_extra_fields_never_matches_the_full_one(tmp_path
     }
     assert dc.ticket_decon_fingerprint(legacy, full=False) == "a0.2_o0.9_h0.4-1.0_d2"
     assert "?" in dc.ticket_decon_fingerprint(legacy, full=True)
+
+
+# --------------------------------------------------------------------------
+# PROC-F9: a complete processed store is not wiped by a new session
+# --------------------------------------------------------------------------
+
+
+def _store_kw():
+    return {"n_t": 1, "n_c": 1, "shape_zyx": (4, 8, 8)}
+
+
+def _complete_store(path: Path):
+    import numpy as np
+
+    from opym import ome_zarr_writer as w
+
+    arrays = w.create_processed_store(path, **_store_kw())
+    w.write_timepoint(path, 0, 0, np.full((4, 8, 8), 7, np.uint16))
+    w.write_progress(path, n_t=1, n_c=1, done=[[0, 0]], state="complete")
+    return arrays
+
+
+def test_create_processed_store_refuses_a_complete_store(tmp_path):
+    from opym import ome_zarr_writer as w
+
+    store = tmp_path / "Cell_dsr.ome.zarr"
+    _complete_store(store)
+    with pytest.raises(w.ProcessedStoreComplete):
+        w.create_processed_store(store, **_store_kw())
+    # nothing was wiped
+    assert w.read_progress(store)["state"] == "complete"
+    assert (w.image_group(store)["0"][0, 0, 0] == 7).all()
+
+
+def test_create_processed_store_move_aside_keeps_the_old_one(tmp_path):
+    from opym import ome_zarr_writer as w
+
+    store = tmp_path / "Cell_dsr.ome.zarr"
+    _complete_store(store)
+    w.create_processed_store(store, on_complete="move_aside", **_store_kw())
+    assert w.read_progress(store)["state"] == "running"
+    (aside,) = tmp_path.glob("Cell_dsr.ome.zarr.superseded-*")
+    assert w.read_progress(aside)["state"] == "complete"
+    assert (w.image_group(aside)["0"][0, 0, 0] == 7).all()
+
+
+def test_create_processed_store_overwrite_still_available(tmp_path):
+    from opym import ome_zarr_writer as w
+
+    store = tmp_path / "Cell_dsr.ome.zarr"
+    _complete_store(store)
+    w.create_processed_store(store, on_complete="overwrite", **_store_kw())
+    assert w.read_progress(store)["state"] == "running"
+    assert not list(tmp_path.glob("*.superseded-*"))
+
+
+@pytest.mark.parametrize("state", ["running", "failed"])
+def test_unfinished_store_is_recreated_as_before(tmp_path, state):
+    from opym import ome_zarr_writer as w
+
+    store = tmp_path / "Cell_dsr.ome.zarr"
+    w.create_processed_store(store, **_store_kw())
+    w.write_progress(store, n_t=1, n_c=1, done=[], state=state)
+    w.create_processed_store(store, **_store_kw())
+    assert w.read_progress(store)["state"] == "running"
+
+
+def test_legacy_create_store_is_guarded_too(tmp_path):
+    import numpy as np
+
+    from opym import ome_zarr_writer as w
+
+    store = tmp_path / "legacy.ome.zarr"
+    kw = {**_store_kw(), "dtype": np.uint16}
+    w.create_store(store, **kw)
+    w.write_progress(store, n_t=1, n_c=1, done=[[0, 0]], state="complete")
+    with pytest.raises(w.ProcessedStoreComplete):
+        w.create_store(store, **kw)
+    w.create_store(store, on_complete="overwrite", **kw)
+
+
+def test_bad_on_complete_value_is_rejected(tmp_path):
+    from opym import ome_zarr_writer as w
+
+    with pytest.raises(ValueError, match="on_complete"):
+        w.create_processed_store(
+            tmp_path / "x.ome.zarr", on_complete="x", **_store_kw()
+        )
