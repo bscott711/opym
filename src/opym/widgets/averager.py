@@ -19,6 +19,15 @@ class PSFAverager:
     """
     Interactive widget for generating a Master PSF by aligning and averaging
     individual bead ROIs.
+
+    LEGACY (DUP-07, docs/review/2026-11-duplication.md): kept for reference, not
+    used by any pipeline. The PSF it saves (`Master_PSF_Final_Strict.tif`) is NOT
+    rotated, but decon needs the rot90 PSF: `opym.utils.orient_zyx_for_dsr` and
+    `orient_zyx_for_decon_tiff` rot90 the data, and the PSF must carry the same
+    rot90 (see the `orient_zyx_for_decon_tiff` docstring in `opym/utils.py`; an
+    unrotated PSF against rot90 data is a mirror). The current PSF path is
+    bioimaging's `psf_tools/extract_bead_psf.py`, which applies the rot90
+    (`rotate_90=True` by default).
     """
 
     def __init__(
