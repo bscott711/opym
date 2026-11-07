@@ -22,6 +22,7 @@ from pathlib import Path
 
 from opym.decon_config import XY_PIXEL_SIZE_UM
 from opym.display import default_channel_color, normalize_color
+from opym.utils import mirror_root
 
 # The root attribute that marks a processed store.
 LAYOUT_KEY = "bioformats2raw.layout"
@@ -57,6 +58,23 @@ def viewer_store_path(output_base: Path | str, leaf_name: str) -> Path:
     the viewers look for) a dataset's processed store. `output_base` is
     `opym.utils.resolve_output_base(leaf_dir)`."""
     return Path(output_base) / VIEWER_DIR / dsr_store_name(leaf_name)
+
+
+def leaf_for_store(store_path: Path | str) -> str | None:
+    """The dataset's leaf directory (its registry `leaf_dir`) for a viewer store
+    path, or None when the path is not `<output base>/viewer/<leaf>_dsr.ome.zarr`.
+    The inverse of `viewer_store_path(resolve_output_base(leaf), leaf.name)`
+    (`opym.stream.live.live_viewer_store`), undoing the output mirror when the
+    leaf was not writable."""
+    store_path = Path(store_path)
+    if store_path.parent.name != VIEWER_DIR:
+        return None
+    base = store_path.parent.parent
+    try:
+        leaf = Path("/") / base.relative_to(mirror_root())
+    except ValueError:
+        leaf = base
+    return str(leaf) if store_path.name == dsr_store_name(leaf.name) else None
 
 
 def mip_movies_dir(output_base: Path | str) -> Path:

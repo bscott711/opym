@@ -22,7 +22,8 @@ now `import opym...` and pin it by SHA; the mirrors are deleted. No version bump
   `normalize_color`, so old stores are read correctly without rewriting them.
 - `opym.store` (#82): layout-3 names, zarr-free attrs and progress readers, `voxel_size_um`, `time_interval_s`,
   `channel_colors`; `frame_count` (#84); output path names and helpers `VIEWER_DIR`, `DSR_STORE_SUFFIX`, `MIP_MOVIES_DIR`,
-  `ALIGNED_STORE_SUFFIX`, `dsr_store_name`, `viewer_store_path`, `mip_movies_dir`, `aligned_store_name`, `is_aligned_store` (#85).
+  `ALIGNED_STORE_SUFFIX`, `dsr_store_name`, `viewer_store_path`, `mip_movies_dir`, `aligned_store_name`, `is_aligned_store` (#85); `leaf_for_store`, the inverse of `viewer_store_path`
+  (viewer store path back to its dataset leaf, undoing the output mirror), replacing the copies in opym-dashboard and bioimaging.
 - `opym.stream.live_status` (#82): the live pointer, status and buffer names and the heartbeat/staleness rule.
 - `opym.registry.RegistryReader` and `connect_ro` (#81): the one read-only registry reader (dashboard and viewer logic), with the
   key codec and the status vocabulary; `opym.stream.backfill_runs` run-record readers; `opym.metadata.zarr_fallback_z_step`.

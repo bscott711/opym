@@ -210,3 +210,33 @@ def test_the_pipelines_paths_are_built_from_those_names(tmp_path):
     got = live.live_viewer_store(leaf)
     assert got == store.viewer_store_path(resolve_output_base(leaf), "Cell_1")
     assert timeline.dataset_dir(got) == resolve_output_base(leaf)
+
+
+def test_leaf_for_store_inverts_the_pipelines_path(tmp_path, monkeypatch):
+    """Every output_base case (in place, ancestor rule, mirrored) round-trips."""
+    from opym.stream import live
+    from opym.testing import readers
+    from opym.utils import MIRROR_ROOT_ENV
+
+    mirror = tmp_path / "mirror"
+    monkeypatch.setenv(MIRROR_ROOT_ENV, str(mirror))
+    work = tmp_path / "work"
+    cases = readers.output_base_cases(work, mirror)
+    try:
+        for case in cases:
+            got = store.leaf_for_store(live.live_viewer_store(case.leaf_dir))
+            assert got == str(case.leaf_dir.resolve()), case.name
+            as_text = str(live.live_viewer_store(case.leaf_dir))
+            assert store.leaf_for_store(as_text) == got
+    finally:
+        readers.restore_permissions(work)
+
+
+def test_leaf_for_store_rejects_other_paths(tmp_path):
+    viewer = tmp_path / "Cell_1" / "viewer"
+    assert store.leaf_for_store(tmp_path / "Cell_1" / "Cell_1_dsr.ome.zarr") is None
+    assert store.leaf_for_store(viewer / "Other_dsr.ome.zarr") is None
+    assert store.leaf_for_store(viewer / "Cell_1_aligned.ome.zarr") is None
+    assert store.leaf_for_store(viewer / "Cell_1_dsr.ome.zarr") == str(
+        tmp_path / "Cell_1"
+    )

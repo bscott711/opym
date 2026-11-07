@@ -39,7 +39,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import zarr
@@ -1585,7 +1585,7 @@ def main(
             )
             return 2
     client = BackfillClient(
-        connect,
+        cast(list[str], connect),  # set above: --connect, the default, or the tunnel
         a.maps,
         settle_s=a.settle,
         window=window,

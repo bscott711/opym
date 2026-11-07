@@ -163,7 +163,8 @@ def parse_mda_settings(mda_settings_file: Path) -> dict[str, Any]:
     alongside per-channel pre-cropped `*.ome.zarr` stores instead of a single
     raw OME-TIF (see `opym.discovery.KIND_ZARR_PRECROPPED`).
     """
-    import yaml  # lazy: only this reader needs pyyaml (the [server] extra)
+    # lazy: only this reader needs pyyaml (the [server] extra)
+    import yaml  # type: ignore[import-untyped]
 
     try:
         with mda_settings_file.open("r", encoding="utf-8") as f:

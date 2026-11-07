@@ -20,6 +20,7 @@ Golden vectors for consumers' tests: `opym.testing.display`.
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import numpy as np
 
@@ -103,7 +104,7 @@ class DisplayEncoding:
         self.power = power
         self.vmax = float(vmax)
         self.shift = shift
-        self._lut = None
+        self._lut: np.ndarray | None = None
 
     @classmethod
     def sqrt(cls, vmax: float = SQRT_VMAX) -> DisplayEncoding:
@@ -154,7 +155,7 @@ class DisplayEncoding:
             if self.power == 2:
                 self._lut = sqrt_lut(self.vmax)
             else:
-                code = np.minimum(np.arange(65536) >> self.shift, 255)
+                code = np.minimum(np.arange(65536) >> cast(int, self.shift), 255)
                 self._lut = code.astype(np.uint8)
         return self._lut
 

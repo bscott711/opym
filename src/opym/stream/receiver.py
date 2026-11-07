@@ -145,9 +145,10 @@ import sqlite3
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import zmq
@@ -585,7 +586,7 @@ class StreamReceiver:
         drain_high_water_bytes: int = drain.DEFAULT_HIGH_WATER_BYTES,
         direct_bind: str | None = None,
         allow_ips: list[str] | tuple[str, ...] = (),
-        raw_roots: list[Path | str] | tuple[Path | str, ...] = (),
+        raw_roots: Sequence[Path | str] = (),
     ) -> None:
         self.bind_addr = bind_addr
         self.direct_bind = direct_bind
@@ -649,7 +650,7 @@ class StreamReceiver:
 
         self._direct_socket: zmq.Socket | None = None
         self._direct_ctx: zmq.Context | None = None
-        self._auth = None
+        self._auth: Any = None
         if direct_bind:
             self._bind_direct(direct_bind, list(allow_ips))
 
@@ -913,7 +914,7 @@ class StreamReceiver:
         self,
         sock: zmq.Socket,
         identity: bytes,
-        msg_type: str,
+        msg_type: bytes,
         session_id: str,
         header: dict[str, Any],
         payload: bytes | None,
@@ -964,7 +965,7 @@ class StreamReceiver:
             self._late_session_end(session_id, header)
             self._send_unknown(sock, identity, session_id)
             return
-        if msg_type == MSG_HEARTBEAT:
+        if msg_type == MSG_HEARTBEAT and session is not None:
             self._handle_heartbeat(session, header)
         elif msg_type == MSG_FRAME:
             self._handle_frame(session_id, header, payload)
@@ -1479,7 +1480,7 @@ class StreamReceiver:
             live.channel_label(session.channel_names[session.channels.index(c)])
             for c in by_cidx
         ]
-        common = {
+        common: dict[str, Any] = {
             "base_name": session.base_name,
             "num_timepoints": session.num_timepoints,
             "n_channels": len(session.channels),
@@ -1556,7 +1557,12 @@ class StreamReceiver:
         restart: its slabs already ACKed are never resent, so start the
         assembly from the planes already on disk."""
         have = self._raw_planes_on_disk(session, t, c)
-        if have is None or not have.any() or have.shape != asm.have.shape:
+        if (
+            have is None
+            or not have.any()
+            or asm.have is None
+            or have.shape != asm.have.shape
+        ):
             return
         arr = self._raw_array(session, c, asm.volume.shape, asm.volume.dtype.str)
         for z in np.flatnonzero(have):
@@ -1591,7 +1597,7 @@ class StreamReceiver:
         wire_bytes = len(payload)
         if header.get("codec") == "blosc":
             try:
-                payload = _blosc.decompress(payload)
+                payload = cast(bytes, _blosc.decompress(payload))
             except Exception:
                 logger.exception(
                     "Undecodable blosc FRAME (t=%d, c=%d) for session %s -- "
@@ -1778,8 +1784,9 @@ class StreamReceiver:
             return
         asm.volume[z0 : z0 + slab.shape[0]] = slab
         asm.z0s.add(z0)
-        asm.have[z0 : z0 + slab.shape[0]] = True
-        if not asm.have.all():
+        have = cast(np.ndarray, asm.have)  # set where the assembly is created
+        have[z0 : z0 + slab.shape[0]] = True
+        if not have.all():
             return
 
         del session.slabs[(t, c)]
@@ -1821,7 +1828,7 @@ class StreamReceiver:
             arr = rawmirror.create_channel_store(
                 session.channel_store_paths[c],
                 num_timepoints=session.num_timepoints,
-                shape_zyx=tuple(shape_zyx),
+                shape_zyx=(shape_zyx[0], shape_zyx[1], shape_zyx[2]),
                 dtype=dtype,
                 z_step_um=session.z_step_um,
                 output_format=session.output_format,
@@ -1897,7 +1904,7 @@ class StreamReceiver:
                 self._lane_hook(
                     "frame_staged",
                     session.session_id,
-                    self._live.frame_staged,
+                    cast(LiveLane, self._live).frame_staged,
                     session.session_id,
                     t,
                     session.channel_cidx[c],
@@ -1971,7 +1978,8 @@ class StreamReceiver:
             self._guarded("forward_qc_session", self._forward_qc_one, session)
 
     def _forward_qc_one(self, session: SessionState) -> None:
-        path = self._live.qc_latest_path(session.session_id)
+        # None (no such session) is caught below as an AttributeError.
+        path: Any = cast(LiveLane, self._live).qc_latest_path(session.session_id)
         try:
             mtime = path.stat().st_mtime
             if mtime == session.qc_mtime:
@@ -2034,7 +2042,7 @@ class StreamReceiver:
             self._lane_hook(
                 "end_session",
                 session.session_id,
-                self._live.end_session,
+                cast(LiveLane, self._live).end_session,
                 session.session_id,
                 end,
             )

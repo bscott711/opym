@@ -386,7 +386,7 @@ class LiveLane:
     def _submit(
         self, session: LiveSession, timepoints: list[int], attempt: int
     ) -> None:
-        frames = [
+        frames: list[str | Path] = [
             session.frame(t, c) for t in timepoints for c in range(session.n_channels)
         ]
         patterns = [f"_C{c}_T" for c in range(session.n_channels)]
