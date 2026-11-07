@@ -813,6 +813,27 @@ def test_a_claim_record_in_the_other_lane_does_not_own_a_same_named_ticket(tmp_p
     assert (sup.live_queue_dir / ".active_same.json").exists()
 
 
+@pytest.mark.parametrize("job_type", ["pipeline", "pipeline_batch"])
+def test_an_async_pipeline_ticket_in_flight_is_not_a_stray(tmp_path, job_type):
+    """BF-06 (R10): the server hands `pipeline`/`pipeline_batch` to a parfeval
+    worker and clears its claim record at once, so an in-flight one has an
+    `.active_` file and no record for as long as it runs. It must be neither
+    requeued nor have its live outputs swept."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "next.json")
+    sup.tick()
+    inflight = sup.queue_dir / ".active_batch.json"
+    inflight.write_text(json.dumps({"jobType": job_type, "dataDir": str(data)}))
+    _claim(sup, "1", "next.json")
+    for _ in range(4):
+        clock.t += local_gpu_worker.ORPHAN_SWEEP_EVERY_S
+        sup.tick()
+    assert inflight.exists()
+    assert not (sup.queue_dir / "batch.json").exists()
+    assert [p for p in data.rglob("*") if UUID in p.name]
+
+
 def test_reclaiming_orphans_does_not_count_against_the_requeue_cap(tmp_path):
     """BF-06: three supervisor restarts sent a ticket to failed/."""
     sup, _, _ = _make_supervisor(tmp_path)

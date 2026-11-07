@@ -117,8 +117,13 @@ def _frame_zarrs(root, base, ts, cs=(0,), shape=(4, 3, 2)):
 
 def _consolidate(root, base, **kw):
     return consolidate_to_ome_zarr(
-        decon_dir=root, base_name=base, z_step_um=0.3, xy_pixel_um=0.116,
-        t_interval_s=1.0, channel_names=["C0"], **kw,
+        decon_dir=root,
+        base_name=base,
+        z_step_um=0.3,
+        xy_pixel_um=0.116,
+        t_interval_s=1.0,
+        channel_names=["C0"],
+        **kw,
     )
 
 
@@ -142,10 +147,18 @@ def test_pending_consolidation_keeps_its_sidecar_while_zarrs_are_missing(tmp_pat
     data.mkdir()
     (jobs / "completed" / "t.json").write_text(json.dumps({"dataDir": str(data)}))
     expected = [f"s_T{t:04d}_C0.zarr" for t in range(3)]
-    (data / ".opym_consolidate.json").write_text(json.dumps({
-        "base_name": "s", "z_step_um": 0.3, "xy_pixel_um": 0.116,
-        "t_interval_s": 1.0, "channel_names": ["C0"], "expected_zarrs": expected,
-    }))
+    (data / ".opym_consolidate.json").write_text(
+        json.dumps(
+            {
+                "base_name": "s",
+                "z_step_um": 0.3,
+                "xy_pixel_um": 0.116,
+                "t_interval_s": 1.0,
+                "channel_names": ["C0"],
+                "expected_zarrs": expected,
+            }
+        )
+    )
     _frame_zarrs(data, "s", ts=[0, 2])
     assert run_pending_consolidations(jobs) == 1
     assert (data / ".opym_consolidate.json").exists()

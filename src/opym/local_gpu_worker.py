@@ -148,6 +148,9 @@ ORPHAN_SWEEP_EVERY_S = 60.0
 # server is running, is an orphan: run_petakit_server.m writes the record
 # right after the rename, so a gap this long is not a claim in progress.
 STRAY_CLAIM_GRACE_S = 120.0
+# Ticket types run_petakit_server.m dispatches to a parfeval worker and then
+# forgets (claim cleared at once): an in-flight one is never a stray claim.
+ASYNC_JOB_TYPES = frozenset({"pipeline", "pipeline_batch"})
 DEFAULT_PREEMPT_AFTER_S = 30.0
 KILL_GRACE_S = 20.0
 # A live ticket runs in ~0.5 s warm and ~10 s cold (PSF cache built, code
@@ -667,17 +670,34 @@ class ServerSupervisor:
                 held.add((claim.lane, claim.ticket))
         return held
 
+    @staticmethod
+    def _is_async_ticket(active: Path) -> bool:
+        try:
+            job_type = json.loads(active.read_text()).get("jobType")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return job_type in ASYNC_JOB_TYPES
+
     def _reclaim_strays(self, now: float) -> None:
         """Servers are running, but a `.active_` ticket that no claim record
         names (its server died before writing one, or its record was lost) has
         no owner and would sit until the idle timeout, its dataset `running`.
         Seen unowned for STRAY_CLAIM_GRACE_S, it is put back like any
-        orphan, per lane, with its partial outputs swept first (backfill)."""
+        orphan, per lane, with its partial outputs swept first (backfill).
+
+        Async pipeline tickets (ASYNC_JOB_TYPES) are skipped: the server hands
+        them to a parfeval worker and clears its claim record at once, and the
+        worker moves `.active_` to completed/ or failed/ when it finishes. An
+        in-flight one has no record, so it is neither swept nor requeued here
+        (if the whole host dies, the orphan reclaim at the next start takes
+        it)."""
         held = self._claimed_tickets()
         unowned: dict[Path, float] = {}
         for lane_dir in (self.live_queue_dir, self.queue_dir):
             for active in sorted(lane_dir.glob(".active_*.json")):
                 if (lane_dir.name, active.name.removeprefix(".active_")) in held:
+                    continue
+                if self._is_async_ticket(active):
                     continue
                 first = self._stray_seen.get(active, now)
                 unowned[active] = first
