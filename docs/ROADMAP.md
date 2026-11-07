@@ -7,7 +7,7 @@ do not overlap.
 
 | # | Item | Scope | Depends on | Unblocks | State (2026-11-07) |
 |---|---|---|---|---|---|
-| 1 | Real acquisition times end to end | L (cross-repo: pymmcore-gui) | none | 5 (partly), cell-cinema time stamps, grant evidence | done in code: opym #83, pymmcore-gui #65 |
+| 1 | Real acquisition times end to end | L (cross-repo: pymmcore-gui) | none | 5 (partly), cell-cinema time stamps, grant evidence | done and deployed: opym #83, pymmcore-gui #65 |
 | 2 | Receiver hardening | M | none | 5 | done: #86 |
 | 3 | Handedness decision, then consistency | M | user decision | any mask or ROI reuse across products | decided; 3a and 3b are the user's |
 | 4 | Test isolation and view eviction safety | S | none | safe test runs for 2 and 5 | done: #79 |
@@ -21,15 +21,22 @@ Merged PRs of the 2026-11-06/07 run (all `bscott711/opym` unless named): #79 tes
 ([ADR 0001](adr/0001-light-base.md)), #81 read-only readers, #82 display/store/live_status, #83 stream wire, FRAME epoch time and
 THE sender, #84 and #85 contract gaps, #86 receiver hardening, #87 backfill, #88 processing, #89 live liveness. Consumers:
 bioimaging #44, opym-dashboard #23, opym-viewer #5, CORE #26, pymmcore-gui #65 (fork main), naparym-live #8, cell-cinema #14,
-argus-desktop #12, chimerax-ngff #15, channelaligner #3. None of this is deployed: production still runs the checkouts it ran
-before; deploy order is in the consumers' READMEs and [ADR 0001](adr/0001-light-base.md).
+argus-desktop #12, chimerax-ngff #15, channelaligner #3.
+
+**Deployed 2026-11-07 (about 09:00 Argus time)**, in the order of the consumers' READMEs and [ADR 0001](adr/0001-light-base.md):
+opym_local `b9189d2`, bioimaging `d4bfdd9`, CORE `6d42533`, opym-dashboard `2eab996`, opym-viewer `e8df7ee`, argus-desktop `f17b972`,
+channelaligner `9209119`, cell-cinema `2a24a8f`, chimerax-ngff `dd4b0a6`, naparym-live `e7ad74b`; the 8 units are active.
+The `opym-*` units were restarted at the deploy, so `opym-serve` runs the edited `.m` files. The rig PC runs pymmcore-gui
+`feat/piezo-camera-only` at `09180ac` (= fork `main` = tag `v0.3.0`, which pins opym `b9189d2`). opym `main` is two docs commits
+ahead of the production checkout (#92). Not done: `opym-add-times --apply` on production, the `.zattrs` handedness stamp (3b),
+and the opym release tag. Other docs point here for these SHAs.
 
 ## 1. Real acquisition times end to end
-- Status: DONE in code (opym #83, pymmcore-gui #65; not deployed). One shared rule, `opym.stream.protocol.frame_epoch_s`:
+- Status: DONE in code (opym #83, pymmcore-gui #65; deployed 2026-11-07). One shared rule, `opym.stream.protocol.frame_epoch_s`:
   `timestamp` in [1e9, 1e11) is used; else `acq_first_s` in that window (logged once per session); else no time and one WARNING
   per session. The rig sends `timestamp = acq_first_s` (epoch s). Every old/new combination works; deploy order is receiver first,
   then the rig. cell-cinema reads what opym writes (DUP-16). Existing stores keep relative time only; `opym-add-times --apply`
-  has not been run on production.
+  has not been run on production (the `--apply` run is still open).
 - What: the receiver takes the epoch from `acq_first_s` (+ `clock_offset_s`), or the sender sends epoch seconds in
   `timestamp`; refuse values below 1e9 with a log line. Add a contract test that feeds the real sender's FRAME header.
   `opym-add-times` derives relative seconds from the ms values already stored. cell-cinema's `rawtimes.py` copy reads
@@ -91,7 +98,7 @@ before; deploy order is in the consumers' READMEs and [ADR 0001](adr/0001-light-
 ## 7. Processing P2s
 - Status: DONE except PROC-F2 and PROC-F5 (see Deferred): PROC-F3, F4, F9, F10, F11, F12 in #88. F12 (full decon fingerprint)
   is opt-in (`OPYM_FULL_DECON_FINGERPRINT=1`) because turning it on makes every existing registry row mismatch once; F10 is opt-in
-  (`strict=True`) and bioimaging has to pass it; F4 needs an `opym-serve` restart to load the edited `.m` files.
+  (`strict=True`) and bioimaging has to pass it; F4's edited `.m` files are loaded since the `opym-serve` restart at the 2026-11-07 deploy.
 - What: atomic ticket writes (PROC-F3); read the PSF z step and send `dz_psf` (PROC-F4); decide the PSF resample
   step for the `pipeline` route (PROC-F5); refuse `psf` with `zarr_input` (PROC-F2); skip-stale-DSR flag (PROC-F11);
   decon fingerprint covers all knobs and the PSF (PROC-F12); refuse to overwrite a complete processed store
