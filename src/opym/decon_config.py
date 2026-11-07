@@ -36,6 +36,23 @@ DECON_OTF_CUM_THRESH = 0.90  # unchanged from the old default; super4 kept it
 DECON_HANN_WIN_BOUNDS = [0.4, 1.0]
 DECON_DAMP_FACTOR = 2
 DECON_EDGE_EROSION = 3
+# The remaining knobs of the decon ticket, as the tickets built from
+# `deskew_decon_kwargs` carry them today (no `n_iters`: petakit.py defaults to 2
+# for 'omw'; no `background`: PetaKit5D resolves its own 100 counts).
+DECON_RL_METHOD = "omw"
+DECON_ITERATIONS = 2
+DECON_BACKGROUND = None
+
+# PROC-F12. The classic fingerprint (alpha, OTF threshold, hann bounds, damp)
+# is what every registry row and `.opym_live.json` already recorded, so
+# changing its format would make the whole archive look stale at the next
+# backfill pass (hundreds of datasets re-deconvolved on the GPUs). The full
+# fingerprint (edge erosion, RL method, iterations, background, interpolation
+# method, PSF size and mtime appended) is therefore opt-in: pass `full=True`,
+# or set this variable to 1, in the SAME process that writes and the one that
+# compares fingerprints. Switching it on makes every existing row mismatch
+# once; that migration is a decision for whoever turns it on.
+FULL_FINGERPRINT_ENV = "OPYM_FULL_DECON_FINGERPRINT"
 
 # Linear, not cubic (user decision 2026-09-24). Cubic makes PetaKit5D's
 # deskewRotateFrame3D fall back to CPU imwarp: 13.6 s per 111-plane frame on
@@ -84,17 +101,86 @@ def dsr_dir_name_for(psf: Path | None) -> str:
     return "DSR_decon" if psf else "DSR_nodecon"
 
 
-def decon_params_fingerprint() -> str:
-    """A short, deterministic fingerprint of the decon knobs in effect,
-    recorded per dataset so a parameter retune (not just a PSF swap) is
-    visible to the backfill's provenance check."""
-    return (
-        f"a{DECON_WIENER_ALPHA}_o{DECON_OTF_CUM_THRESH}_"
-        f"h{DECON_HANN_WIN_BOUNDS[0]}-{DECON_HANN_WIN_BOUNDS[1]}_d{DECON_DAMP_FACTOR}"
+def full_fingerprint_enabled() -> bool:
+    """True when `OPYM_FULL_DECON_FINGERPRINT` is set to a truthy value."""
+    return os.environ.get(FULL_FINGERPRINT_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
-def ticket_decon_fingerprint(params: dict) -> str | None:
+def psf_stamp(psf: str | Path | None) -> str:
+    """``<size>-<mtime seconds>`` of a PSF file, or ``?`` if it cannot be
+    stat-ed. A PSF edited in place (same path) changes this; the path alone
+    cannot show that."""
+    if not psf:
+        return "?"
+    try:
+        st = Path(psf).stat()
+    except OSError:
+        return "?"
+    return f"{st.st_size}-{int(st.st_mtime)}"
+
+
+def _num_str(value, like: float | int) -> str:
+    """Render ``value`` with the type of the constant ``like`` ('?' if None):
+    a ticket stores 2.0 where the constant is the int 2."""
+    if value is None:
+        return "?"
+    as_like = type(like)(value)
+    return str(as_like) if float(value) == as_like else str(value)
+
+
+def _full_suffix(
+    edge_erosion, rl_method, iterations, background, interp_method, psf_stamp_str
+) -> str:
+    bg = "x" if background is None else _num_str(background, 100.0)
+    return (
+        f"_e{_num_str(edge_erosion, DECON_EDGE_EROSION)}"
+        f"_r{rl_method if rl_method else '?'}"
+        f"_i{_num_str(iterations, DECON_ITERATIONS)}"
+        f"_b{bg}"
+        f"_m{interp_method if interp_method else '?'}"
+        f"_p{psf_stamp_str}"
+    )
+
+
+def decon_params_fingerprint(
+    psf: str | Path | None = None, *, full: bool | None = None
+) -> str:
+    """A short, deterministic fingerprint of the decon knobs in effect,
+    recorded per dataset so a parameter retune (not just a PSF swap) is
+    visible to the backfill's provenance check.
+
+    Default: the classic four-knob string (see `FULL_FINGERPRINT_ENV` for why
+    it is unchanged). ``full=True`` (or the env variable) appends edge
+    erosion, RL method, iterations, background, interpolation method and the
+    PSF's size and mtime (`psf_stamp` of ``psf``, else of ``OPYM_DECON_PSF``).
+    """
+    base = (
+        f"a{DECON_WIENER_ALPHA}_o{DECON_OTF_CUM_THRESH}_"
+        f"h{DECON_HANN_WIN_BOUNDS[0]}-{DECON_HANN_WIN_BOUNDS[1]}_d{DECON_DAMP_FACTOR}"
+    )
+    if not (full_fingerprint_enabled() if full is None else full):
+        return base
+    if psf is None:
+        try:
+            psf = resolve_decon_psf()
+        except FileNotFoundError:
+            psf = None
+    return base + _full_suffix(
+        DECON_EDGE_EROSION,
+        DECON_RL_METHOD,
+        DECON_ITERATIONS,
+        DECON_BACKGROUND,
+        DSR_INTERP_METHOD,
+        psf_stamp(psf),
+    )
+
+
+def ticket_decon_fingerprint(params: dict, *, full: bool | None = None) -> str | None:
     """`decon_params_fingerprint`'s format, computed from a submitted ticket's
     `parameters` instead of the current settings -- i.e. what a finished
     ticket's output was actually made with. None for a deskew-only ticket.
@@ -105,16 +191,13 @@ def ticket_decon_fingerprint(params: dict) -> str | None:
     where the constant is the int 2. A knob the ticket doesn't carry at all
     (tickets from before it was set explicitly) renders as `?`, which can
     never match a real fingerprint.
+
+    With ``full`` (see `decon_params_fingerprint`) the extra knobs come from
+    the ticket too; the PSF stamp is the ``psf_stamp`` the ticket recorded at
+    submission (the file may have changed since), `?` for older tickets.
     """
     if not params.get("run_decon") and not params.get("psf_path"):
         return None
-
-    def num(key: str, like: float | int) -> str:
-        value = params.get(key)
-        if value is None:
-            return "?"
-        as_like = type(like)(value)
-        return str(as_like) if float(value) == as_like else str(value)
 
     hann = params.get("hann_win_bounds")
     lo, hi = DECON_HANN_WIN_BOUNDS
@@ -122,10 +205,20 @@ def ticket_decon_fingerprint(params: dict) -> str | None:
         hann_str = f"{type(lo)(hann[0])}-{type(hi)(hann[1])}"
     else:
         hann_str = "?"
-    alpha = num("wiener_alpha", DECON_WIENER_ALPHA)
-    otf = num("otf_cum_thresh", DECON_OTF_CUM_THRESH)
-    damp = num("damp_factor", DECON_DAMP_FACTOR)
-    return f"a{alpha}_o{otf}_h{hann_str}_d{damp}"
+    alpha = _num_str(params.get("wiener_alpha"), DECON_WIENER_ALPHA)
+    otf = _num_str(params.get("otf_cum_thresh"), DECON_OTF_CUM_THRESH)
+    damp = _num_str(params.get("damp_factor"), DECON_DAMP_FACTOR)
+    base = f"a{alpha}_o{otf}_h{hann_str}_d{damp}"
+    if not (full_fingerprint_enabled() if full is None else full):
+        return base
+    return base + _full_suffix(
+        params.get("edge_erosion"),
+        params.get("rl_method"),
+        params.get("decon_iter"),
+        params.get("background"),
+        params.get("interp_method"),
+        params.get("psf_stamp") or "?",
+    )
 
 
 def deskew_decon_kwargs(psf: Path | None) -> dict:
