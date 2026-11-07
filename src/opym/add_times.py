@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from . import timeline
+from .store import DSR_STORE_SUFFIX, VIEWER_DIR
 
 
 def find_stores(path: Path) -> list[Path]:
@@ -26,10 +27,10 @@ def find_stores(path: Path) -> list[Path]:
     path = Path(path)
     if path.name.endswith(".ome.zarr") and (path / ".zgroup").exists():
         return [path]
-    own = sorted((path / "viewer").glob("*_dsr.ome.zarr"))
+    own = sorted((path / VIEWER_DIR).glob(f"*{DSR_STORE_SUFFIX}"))
     if own:
         return own
-    return sorted(path.glob("*/viewer/*_dsr.ome.zarr"))
+    return sorted(path.glob(f"*/{VIEWER_DIR}/*{DSR_STORE_SUFFIX}"))
 
 
 def _backup(store: Path) -> None:

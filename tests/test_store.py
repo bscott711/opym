@@ -183,3 +183,30 @@ def test_frame_count_reads_zarr_v3_metadata_and_misses_cleanly(tmp_path):
     assert store.frame_count(tmp_path / "missing.ome.zarr") is None
     (v3 / "0" / "0" / "zarr.json").write_text("{}")
     assert store.frame_count(v3) is None
+
+
+def test_output_tree_names(tmp_path):
+    assert (store.VIEWER_DIR, store.MIP_MOVIES_DIR) == ("viewer", "mip_movies")
+    assert store.DSR_STORE_SUFFIX == "_dsr.ome.zarr"
+    assert store.ALIGNED_STORE_SUFFIX == "_aligned.ome.zarr"
+    assert store.dsr_store_name("Cell_1") == "Cell_1_dsr.ome.zarr"
+    assert (
+        store.viewer_store_path(tmp_path, "Cell_1")
+        == tmp_path / "viewer" / "Cell_1_dsr.ome.zarr"
+    )
+    assert store.mip_movies_dir(tmp_path) == tmp_path / "mip_movies"
+    assert store.aligned_store_name("Cell_1_dsr") == "Cell_1_dsr_aligned.ome.zarr"
+    assert store.is_aligned_store("x/Cell_1_dsr_aligned.ome.zarr")
+    assert not store.is_aligned_store(store.dsr_store_name("Cell_1"))
+
+
+def test_the_pipelines_paths_are_built_from_those_names(tmp_path):
+    from opym import timeline
+    from opym.stream import live
+    from opym.utils import resolve_output_base
+
+    leaf = tmp_path / "Cell_1"
+    leaf.mkdir()
+    got = live.live_viewer_store(leaf)
+    assert got == store.viewer_store_path(resolve_output_base(leaf), "Cell_1")
+    assert timeline.dataset_dir(got) == resolve_output_base(leaf)

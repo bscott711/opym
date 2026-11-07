@@ -37,6 +37,42 @@ CHUNKS_ZYX = (64, 256, 256)
 # one value, decon_config's.
 DSR_VOXEL_UM = XY_PIXEL_SIZE_UM
 
+# The names of the output tree below a dataset's output base
+# (`opym.utils.resolve_output_base`): <base>/viewer/<leaf>_dsr.ome.zarr, the
+# MIP movies in <base>/mip_movies, and the channel-aligned copy that the aligner
+# writes beside a viewer store (<stem>_aligned.ome.zarr).
+VIEWER_DIR = "viewer"
+DSR_STORE_SUFFIX = "_dsr.ome.zarr"
+MIP_MOVIES_DIR = "mip_movies"
+ALIGNED_STORE_SUFFIX = "_aligned.ome.zarr"
+
+
+def dsr_store_name(leaf_name: str) -> str:
+    """The viewer store's folder name for a dataset leaf: `<leaf>_dsr.ome.zarr`."""
+    return f"{leaf_name}{DSR_STORE_SUFFIX}"
+
+
+def viewer_store_path(output_base: Path | str, leaf_name: str) -> Path:
+    """`<output base>/viewer/<leaf>_dsr.ome.zarr`, where the pipeline writes (and
+    the viewers look for) a dataset's processed store. `output_base` is
+    `opym.utils.resolve_output_base(leaf_dir)`."""
+    return Path(output_base) / VIEWER_DIR / dsr_store_name(leaf_name)
+
+
+def mip_movies_dir(output_base: Path | str) -> Path:
+    """`<output base>/mip_movies`, the dataset's MIP movies and posters."""
+    return Path(output_base) / MIP_MOVIES_DIR
+
+
+def aligned_store_name(stem: str) -> str:
+    """The folder name of the channel-aligned copy: `<stem>_aligned.ome.zarr`."""
+    return f"{stem}{ALIGNED_STORE_SUFFIX}"
+
+
+def is_aligned_store(path: Path | str) -> bool:
+    """Is `path` named like a channel-aligned copy (so not a primary viewer store)?"""
+    return Path(path).name.endswith(ALIGNED_STORE_SUFFIX)
+
 
 def _read_json(path: Path):
     try:
