@@ -65,6 +65,7 @@ from opym.decon_config import (
     dsr_dir_name_for,
 )
 from opym.petakit import submit_live_frames_job
+from opym.store import viewer_store_path
 from opym.stream import qcproj, trace
 
 # The names and the status readers live in live_status (light, for consumers);
@@ -100,7 +101,7 @@ def live_viewer_store(dest_leaf: Path) -> Path:
     """The napari store for a streamed dataset: where the backfill's viewer
     export writes it (`resolve_output_base(leaf)/viewer/<leaf name>_dsr...`)."""
     dest_leaf = Path(dest_leaf)
-    return resolve_output_base(dest_leaf) / "viewer" / f"{dest_leaf.name}_dsr.ome.zarr"
+    return viewer_store_path(resolve_output_base(dest_leaf), dest_leaf.name)
 
 
 def live_qc_dir(dest_leaf: Path) -> Path:

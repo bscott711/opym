@@ -57,6 +57,7 @@ from opym.display import (  # noqa: F401
     napari_colormap_name,
 )
 from opym.ome_zarr_writer import complete_timepoints, image_group, read_progress
+from opym.store import DSR_STORE_SUFFIX, VIEWER_DIR
 from opym.stream import trace
 from opym.stream.live_status import (  # noqa: F401
     LIVE_LATEST_NAME,
@@ -173,10 +174,10 @@ def resolve_store(arg: str | None, jobs: Path | None = None) -> Path:
         p = Path(arg)
         if p.suffix == ".zarr" or (p / ".zgroup").exists():
             return p
-        found = sorted((p / "viewer").glob("*_dsr.ome.zarr"))
+        found = sorted((p / VIEWER_DIR).glob(f"*{DSR_STORE_SUFFIX}"))
         if found:
             return found[0]
-        raise FileNotFoundError(f"No *_dsr.ome.zarr store at or under {p}")
+        raise FileNotFoundError(f"No *{DSR_STORE_SUFFIX} store at or under {p}")
     latest = (jobs or lanes.jobs_dir()) / LIVE_LATEST_NAME
     try:
         return Path(json.loads(latest.read_text())["store"])
@@ -1535,7 +1536,7 @@ class LiveFollower:
         self.session_id = session_id
         self.jobs = jobs
         self.buffers_dir = Path(buffers_dir) if buffers_dir else None
-        self.name = self.store.name.removesuffix("_dsr.ome.zarr").removesuffix(
+        self.name = self.store.name.removesuffix(DSR_STORE_SUFFIX).removesuffix(
             ".ome.zarr"
         )
         group = image_group(self.store)

@@ -7,6 +7,13 @@ change behaviour).
 
 ## [Unreleased]
 
+### Added
+- `opym.timeline`: `times_from_arrays`, `record_from_arrays`, `time_record`, `combine_stores`, public `known_time` and a
+  `reader=` hook on `read_raw_times` / `from_raw_stores` / `resolve_times`, so a consumer with its own array reader
+  (ChimeraX, the rig's blosc-compressed `t`) no longer needs the private `_known`.
+- `opym.store`: `VIEWER_DIR`, `DSR_STORE_SUFFIX`, `MIP_MOVIES_DIR`, `ALIGNED_STORE_SUFFIX` and the path helpers
+  `dsr_store_name`, `viewer_store_path`, `mip_movies_dir`, `aligned_store_name`, `is_aligned_store`; opym's own path sites use them.
+
 ## [0.5.0] - 2026-11-05
 
 The headline of this release is the **SSH backfill** (finished acquisitions moved from the acquisition PC to Argus, verified
