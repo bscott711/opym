@@ -151,3 +151,101 @@ def test_live_tickets_carry_dz_psf(tmp_path):
         queue_dir=tmp_path / "q",
     )
     assert json.loads(ticket.read_text())["parameters"]["dz_psf"] == 0.25
+
+
+# --------------------------------------------------------------------------
+# PROC-F12: the full decon fingerprint covers every knob and the PSF
+# --------------------------------------------------------------------------
+
+
+def _current_ticket_params(tmp_path: Path, psf: Path, **override) -> dict:
+    from opym.decon_config import deskew_decon_kwargs
+
+    kwargs = deskew_decon_kwargs(psf)
+    kwargs.update(override)
+    return _deskew_params(tmp_path, psf, **kwargs)
+
+
+def test_classic_fingerprint_is_unchanged_by_default(tmp_path, monkeypatch):
+    """Every recorded registry row and .opym_live.json carries this string;
+    the default must not move or the archive looks stale."""
+    from opym import decon_config as dc
+
+    monkeypatch.delenv(dc.FULL_FINGERPRINT_ENV, raising=False)
+    assert dc.decon_params_fingerprint() == "a0.2_o0.9_h0.4-1.0_d2"
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    params = _current_ticket_params(tmp_path, psf)
+    assert dc.ticket_decon_fingerprint(params) == "a0.2_o0.9_h0.4-1.0_d2"
+
+
+def test_full_fingerprint_of_a_current_ticket_matches_the_current_settings(
+    tmp_path,
+):
+    from opym import decon_config as dc
+
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    params = _current_ticket_params(tmp_path, psf)
+    now = dc.decon_params_fingerprint(psf, full=True)
+    assert dc.ticket_decon_fingerprint(params, full=True) == now
+    assert now.startswith("a0.2_o0.9_h0.4-1.0_d2_e3_romw_i2_bx_mlinear_p")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"edge_erosion": 0},
+        {"n_iters": 5},
+        {"background": 90.0},
+        {"interp_method": "cubic"},
+        {"rl_method": "simplified"},
+    ],
+)
+def test_each_missing_knob_now_changes_the_full_fingerprint(tmp_path, override):
+    from opym import decon_config as dc
+
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    now = dc.decon_params_fingerprint(psf, full=True)
+    params = _current_ticket_params(tmp_path, psf, **override)
+    assert dc.ticket_decon_fingerprint(params, full=True) != now
+    # ... and the classic fingerprint is blind to it (the finding).
+    assert dc.ticket_decon_fingerprint(params, full=False) == (
+        dc.decon_params_fingerprint(full=False)
+    )
+
+
+def test_editing_the_psf_in_place_changes_the_full_fingerprint(tmp_path):
+    from opym import decon_config as dc
+
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    before = dc.decon_params_fingerprint(psf, full=True)
+    _write_psf(psf, 0.1)
+    os.utime(psf, (1_000_000_000, 1_000_000_000))
+    assert dc.decon_params_fingerprint(psf, full=True) != before
+    assert dc.psf_stamp(tmp_path / "missing.tif") == "?"
+
+
+def test_env_switch_turns_the_full_fingerprint_on(tmp_path, monkeypatch):
+    from opym import decon_config as dc
+
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    monkeypatch.setenv("OPYM_DECON_PSF", str(psf))
+    monkeypatch.setenv(dc.FULL_FINGERPRINT_ENV, "1")
+    assert dc.decon_params_fingerprint() == dc.decon_params_fingerprint(psf, full=True)
+    assert dc.decon_params_fingerprint().endswith(dc.psf_stamp(psf))
+    monkeypatch.setenv(dc.FULL_FINGERPRINT_ENV, "0")
+    assert dc.decon_params_fingerprint() == "a0.2_o0.9_h0.4-1.0_d2"
+
+
+def test_old_ticket_without_the_extra_fields_never_matches_the_full_one(tmp_path):
+    from opym import decon_config as dc
+
+    legacy = {
+        "run_decon": True,
+        "psf_path": "/x/psf.tif",
+        "wiener_alpha": 0.2,
+        "otf_cum_thresh": 0.9,
+        "hann_win_bounds": [0.4, 1.0],
+        "damp_factor": 2.0,
+    }
+    assert dc.ticket_decon_fingerprint(legacy, full=False) == "a0.2_o0.9_h0.4-1.0_d2"
+    assert "?" in dc.ticket_decon_fingerprint(legacy, full=True)

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import ipywidgets as widgets
 
-from .decon_config import DSR_INTERP_METHOD
+from .decon_config import DSR_INTERP_METHOD, psf_stamp
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
 from .utils import resolve_output_base
 
@@ -511,6 +511,9 @@ def submit_remote_deskew_job(
         params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
         params["dz_psf"] = resolve_psf_dz(resolved_psfs, dz_psf)
+        # Size and mtime of the PSF the output is made with, so the full decon
+        # fingerprint (PROC-F12) can tell an in-place PSF edit later.
+        params["psf_stamp"] = psf_stamp(resolved_psfs[0])
         if background is not None:
             params["background"] = float(background)
         if edge_erosion is not None:
