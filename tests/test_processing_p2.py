@@ -376,3 +376,70 @@ def test_parse_z_step_strict_refuses_a_file_without_a_step(tmp_path, body):
     assert parse_z_step(tmp_path / "m.txt", default_z_step=0.3) == 0.3
     with pytest.raises(ZStepUnknown):
         parse_z_step(tmp_path / "m.txt", default_z_step=0.3, strict=True)
+
+
+# --------------------------------------------------------------------------
+# PROC-F11: stale DSR output is flagged, and removable on request
+# --------------------------------------------------------------------------
+
+
+def _stale_tree(tmp_path: Path) -> Path:
+    data = tmp_path / "data"
+    for sub in ("DSR_nodecon", "Decon", "keep"):
+        (data / sub).mkdir(parents=True, exist_ok=True)
+        (data / sub / "old.tif").write_text("old")
+    (data / "ds_C0_T000.tif").touch()
+    return data
+
+
+def _submit_over(tmp_path: Path, data: Path, psf=None, **kwargs):
+    return petakit.submit_remote_deskew_job(
+        input_target=data,
+        z_step_um=0.5,
+        dsr_dir_name="DSR_nodecon",
+        psf_path=psf,
+        channel_patterns=["_C0_T"],
+        queue_dir=tmp_path / "queue",
+        **kwargs,
+    )
+
+
+def test_default_keeps_stale_output_and_warns(tmp_path, caplog):
+    data = _stale_tree(tmp_path)
+    with caplog.at_level("WARNING", logger="opym.petakit"):
+        _submit_over(tmp_path, data)
+    assert (data / "DSR_nodecon" / "old.tif").exists()
+    assert "OLD result" in caplog.text
+
+
+def test_clean_stale_output_removes_dsr_only_without_a_psf(tmp_path):
+    data = _stale_tree(tmp_path)
+    _submit_over(tmp_path, data, clean_stale_output=True)
+    assert not (data / "DSR_nodecon").exists()
+    assert (data / "Decon" / "old.tif").exists(), "no decon requested: Decon kept"
+    assert (data / "keep" / "old.tif").exists()
+    assert (data / "ds_C0_T000.tif").exists()
+
+
+def test_clean_stale_output_with_a_psf_also_removes_decon(tmp_path):
+    data = _stale_tree(tmp_path)
+    psf = _write_psf(tmp_path / "psf.tif", 0.1)
+    _submit_over(tmp_path, data, psf=psf, clean_stale_output=True)
+    assert not (data / "DSR_nodecon").exists() and not (data / "Decon").exists()
+    assert (data / "keep" / "old.tif").exists()
+
+
+def test_clean_stale_output_never_follows_a_dir_name_out_of_the_input(tmp_path):
+    data = _stale_tree(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x").write_text("x")
+    petakit.submit_remote_deskew_job(
+        input_target=data,
+        z_step_um=0.5,
+        dsr_dir_name="../outside",
+        channel_patterns=["_C0_T"],
+        queue_dir=tmp_path / "queue",
+        clean_stale_output=True,
+    )
+    assert (outside / "x").exists()

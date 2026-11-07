@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -240,6 +241,31 @@ def resolve_psf_dz(
     return PSF_DZ_DEFAULT_UM
 
 
+def _handle_stale_output(
+    input_target: Path, dir_names: list[str], clean: bool
+) -> list[Path]:
+    """Existing output directories a deskew ticket would silently reuse
+    (PROC-F11). With ``clean`` they are removed (only real directories that
+    sit directly under ``input_target``); without it a warning names them.
+    Returns the ones found."""
+    found = []
+    for name in dir_names:
+        d = input_target / Path(name.strip("/")).name
+        if d.is_dir() and not d.is_symlink():
+            found.append(d)
+    if clean:
+        for d in found:
+            shutil.rmtree(d)
+    elif found:
+        _log.warning(
+            "Existing output %s will be reused as is: PetaKit5D skips frames "
+            "whose output exists, so this ticket may finish at once with the "
+            "OLD result. Pass clean_stale_output=True to remove it first.",
+            [str(d) for d in found],
+        )
+    return found
+
+
 def submit_remote_crop_job(
     base_file: Path,
     top_roi: tuple[slice, slice] | None,
@@ -339,6 +365,7 @@ def submit_remote_deskew_job(
     save_mip: bool = False,
     zarr_input: bool = False,
     dz_psf: float | None = None,
+    clean_stale_output: bool = False,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -416,6 +443,14 @@ def submit_remote_deskew_job(
         forwarded by the server to XR_decon_data_wrapper's ``dzPSF``. Left
         None it is read from the PSF's ImageJ ``spacing`` tag (see
         `resolve_psf_dz`; PROC-F4).
+    clean_stale_output : bool, default False
+        PetaKit5D skips any frame whose output already exists, so a ticket
+        over an existing ``<input_target>/<dsr_dir_name>/`` (and, with a PSF,
+        ``<input_target>/Decon/``) completes at once with the OLD output
+        (PROC-F11). True removes those two directories before the ticket is
+        written (what the bioimaging backfill does for a retry). Default
+        False keeps today's behaviour and only logs a warning when stale
+        output is present.
     """
     _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
@@ -473,6 +508,12 @@ def submit_remote_deskew_job(
         raise FileNotFoundError(f"Input directory not found: {input_target}")
 
     base_name = input_target.name
+
+    _handle_stale_output(
+        input_target,
+        [dsr_dir_name, "Decon"] if (psf_path or psf_paths) else [dsr_dir_name],
+        clean_stale_output,
+    )
 
     # Build parameters dictionary
     params = {
