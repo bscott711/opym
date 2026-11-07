@@ -726,3 +726,55 @@ def test_a_restarted_receiver_drains_what_the_old_one_never_finished(
         )
     )
     second.close()
+
+
+# --- stream_status.json: concurrent writers do not share a tmp file ------------
+
+
+def test_status_writes_use_a_tmp_name_of_their_own(tmp_path, monkeypatch):
+    names = []
+    real_replace = os.replace
+
+    def _record(src, dst):
+        names.append(Path(src).name)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(outcome.os, "replace", _record)
+    outcome.write_status(tmp_path, {"a": 1})
+    outcome.write_status(tmp_path, {"a": 2})
+    assert len(names) == 2 and len(set(names)) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == [outcome.STATUS_NAME]
+
+
+def test_concurrent_status_writers_never_leave_a_partial_file(tmp_path):
+    import json
+    import threading
+
+    big = {"pad": "x" * 200_000}
+    stop = threading.Event()
+    bad = []
+
+    def _write(n):
+        for i in range(60):
+            outcome.write_status(tmp_path, {**big, "writer": n, "i": i})
+
+    def _read():
+        while not stop.is_set():
+            try:
+                json.loads((tmp_path / outcome.STATUS_NAME).read_text())
+            except FileNotFoundError:
+                pass
+            except ValueError as exc:
+                bad.append(exc)
+
+    reader = threading.Thread(target=_read)
+    writers = [threading.Thread(target=_write, args=(n,)) for n in range(4)]
+    reader.start()
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join()
+    stop.set()
+    reader.join()
+    assert not bad
+    assert outcome.read_status(tmp_path) is not None

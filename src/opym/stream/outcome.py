@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -133,9 +134,15 @@ def write_status(leaf_dir: Path, record: dict[str, Any]) -> Path:
     leaf_dir = Path(leaf_dir)
     leaf_dir.mkdir(parents=True, exist_ok=True)
     path = leaf_dir / STATUS_NAME
-    tmp = path.with_name(f".{STATUS_NAME}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(record, indent=1))
-    os.replace(tmp, path)
+    # One tmp name per call: the drain pool and the status thread both write
+    # this file from the receiver process, so the pid alone is not unique.
+    tmp = path.with_name(f".{STATUS_NAME}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(record, indent=1))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
