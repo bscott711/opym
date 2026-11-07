@@ -756,3 +756,68 @@ def test_orphan_reclaim_does_not_sweep_while_a_server_is_alive(tmp_path):
     _orphaned_backfill_active(sup, data)
     sup.tick()
     assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
+
+
+# --- BF-06: orphan reclaim per lane, not only when no server runs -------------
+
+
+def test_a_stray_claim_is_reclaimed_while_other_servers_are_busy(tmp_path):
+    """BF-06: an `.active_` ticket no claim record names stayed for as long as ANY
+    server was up, its dataset `running` until the idle timeout."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_busy.json")
+    sup.tick()  # server 1 and 2 start
+    _claim(sup, "1", "bf_busy.json")
+    _orphaned_backfill_active(sup, data)  # claimed by a server that then died
+    stray = sup.queue_dir / ".active_bf_orphan.json"
+
+    clock.t += local_gpu_worker.ORPHAN_SWEEP_EVERY_S
+    sup.tick()  # first seen: could still be a claim in progress
+    assert stray.exists()
+    clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+    sup.tick()
+    assert not stray.exists()
+    assert (sup.queue_dir / "bf_orphan.json").exists()
+    assert (sup.queue_dir / ".active_bf_busy.json").exists()  # the owned one stays
+    assert not [p for p in data.rglob("*") if UUID in p.name]
+
+
+def test_a_claim_with_a_record_is_never_a_stray(tmp_path):
+    """Control for BF-06: a ticket a running server holds is left alone however
+    long it runs."""
+    sup, _, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_busy.json")
+    sup.tick()
+    _claim(sup, "1", "bf_busy.json")
+    for _ in range(5):
+        clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+        sup.tick()
+    assert (sup.queue_dir / ".active_bf_busy.json").exists()
+    assert not (sup.queue_dir / "bf_busy.json").exists()
+
+
+def test_a_claim_record_in_the_other_lane_does_not_own_a_same_named_ticket(tmp_path):
+    sup, _, clock = _make_supervisor(tmp_path)
+    _ticket(sup.live_queue_dir, "same.json")
+    sup.tick()
+    _claim(sup, "1", "same.json", lane="queue_live")
+    _ticket(sup.queue_dir, ".active_same.json")
+    for _ in range(2):
+        clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+        sup.tick()
+    assert (sup.queue_dir / "same.json").exists()
+    assert (sup.live_queue_dir / ".active_same.json").exists()
+
+
+def test_reclaiming_orphans_does_not_count_against_the_requeue_cap(tmp_path):
+    """BF-06: three supervisor restarts sent a ticket to failed/."""
+    sup, _, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, ".active_bf.json")
+    for _ in range(MAX_REQUEUES + 2):
+        sup._reclaim_unowned()
+        assert (sup.queue_dir / "bf.json").exists()
+        os.replace(sup.queue_dir / "bf.json", sup.queue_dir / ".active_bf.json")
+    assert not list((sup.base_dir / "failed").glob("bf.json"))
+    ticket = json.loads((sup.queue_dir / ".active_bf.json").read_text())
+    assert ticket.get("requeueCount", 0) == 0

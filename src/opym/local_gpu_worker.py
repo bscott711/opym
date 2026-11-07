@@ -142,6 +142,10 @@ MAX_REQUEUES = 2
 DEFAULT_HANG_AFTER_S = 60 * 60
 HANG_CHECK_EVERY_S = 300.0
 ORPHAN_SWEEP_EVERY_S = 60.0
+# A `.active_` ticket that no claim record names, seen for this long while a
+# server is running, is an orphan: run_petakit_server.m writes the record
+# right after the rename, so a gap this long is not a claim in progress.
+STRAY_CLAIM_GRACE_S = 120.0
 DEFAULT_PREEMPT_AFTER_S = 30.0
 KILL_GRACE_S = 20.0
 # A live ticket runs in ~0.5 s warm and ~10 s cold (PSF cache built, code
@@ -390,6 +394,7 @@ class ServerSupervisor:
         self._any_server_alive = any_server_alive
         self._clean_exit_pending_consolidation = False
         self._last_orphan_sweep = float("-inf")
+        self._stray_seen: dict[Path, float] = {}
         for d in (
             self.queue_dir,
             self.live_queue_dir,
@@ -407,13 +412,18 @@ class ServerSupervisor:
             if slot.proc is not None and slot.proc.poll() is not None:
                 self._on_exit(slot, now)
 
-        if not any(s.proc is not None for s in self.slots):
-            if now - self._last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
-                self._last_orphan_sweep = now
-                self._reclaim_unowned()
-            if self._clean_exit_pending_consolidation:
-                self._clean_exit_pending_consolidation = False
-                self._run_consolidations()
+        if now - self._last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
+            self._last_orphan_sweep = now
+            if not any(s.proc is not None for s in self.slots):
+                self._reclaim_unowned(now)
+            else:
+                self._reclaim_strays(now)
+        if (
+            not any(s.proc is not None for s in self.slots)
+            and self._clean_exit_pending_consolidation
+        ):
+            self._clean_exit_pending_consolidation = False
+            self._run_consolidations()
 
         # A fresh live or warm lease starts servers before the first ticket
         # lands: Matlab takes ~16 s to come up, then warms for the shape.
@@ -508,7 +518,10 @@ class ServerSupervisor:
     def _read_claim(self, slot: ServerSlot) -> Claim | None:
         """The ticket this server holds, or None. Records written before
         lanes existed have no "queue" field and came from the backfill queue."""
-        path = self._claim_path(slot)
+        return self._read_claim_file(self._claim_path(slot))
+
+    @staticmethod
+    def _read_claim_file(path: Path) -> Claim | None:
         try:
             rec = json.loads(path.read_text())
             lane = str(rec.get("queue") or lanes.BACKFILL_QUEUE_NAME)
@@ -549,12 +562,18 @@ class ServerSupervisor:
                 flush=True,
             )
 
-    def _reclaim_unowned(self) -> None:
+    def _reclaim_unowned(self, now: float | None = None) -> None:
         """With no server process alive at all, nothing can legitimately hold
         a claim, so every `.active_` ticket is an orphan. Also finishes any
-        requeue interrupted between its write and its rename."""
+        requeue interrupted between its write and its rename. Reclaiming does
+        not count against the ticket's requeue cap: the ticket did nothing
+        wrong, a supervisor restart is not a failure of it (three restarts
+        used to send a ticket to failed/)."""
         if self._any_server_alive():
-            return  # e.g. a server launched by hand outside this supervisor
+            # e.g. a server launched by hand outside this supervisor: its
+            # tickets have claim records, the rest are strays
+            self._reclaim_strays(self._clock() if now is None else now)
+            return
         for lane_dir in (self.live_queue_dir, self.queue_dir):
             for staging in lane_dir.glob(".requeue_*.json"):
                 os.replace(staging, lane_dir / staging.name.removeprefix(".requeue_"))
@@ -564,10 +583,46 @@ class ServerSupervisor:
                     # server's half-written outputs go before the ticket does
                     # (live tickets share their session's dataDir; not swept).
                     self._sweep_partials(active)
-                outcome = requeue_claim(active, "orphaned claim: no server was running")
+                outcome = requeue_claim(
+                    active, "orphaned claim: no server was running", count=False
+                )
                 print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
         for rec in self.claims_dir.glob("S*.json"):
             rec.unlink(missing_ok=True)
+
+    def _claimed_tickets(self) -> set[tuple[str, str]]:
+        """(lane, ticket) of every claim record, whichever server wrote it."""
+        held = set()
+        for rec in self.claims_dir.glob("S*.json"):
+            claim = self._read_claim_file(rec)
+            if claim is not None:
+                held.add((claim.lane, claim.ticket))
+        return held
+
+    def _reclaim_strays(self, now: float) -> None:
+        """Servers are running, but a `.active_` ticket that no claim record
+        names (its server died before writing one, or its record was lost) has
+        no owner and would sit until the idle timeout, its dataset `running`.
+        Seen unowned for STRAY_CLAIM_GRACE_S, it is put back like any
+        orphan, per lane, with its partial outputs swept first (backfill)."""
+        held = self._claimed_tickets()
+        unowned: dict[Path, float] = {}
+        for lane_dir in (self.live_queue_dir, self.queue_dir):
+            for active in sorted(lane_dir.glob(".active_*.json")):
+                if (lane_dir.name, active.name.removeprefix(".active_")) in held:
+                    continue
+                first = self._stray_seen.get(active, now)
+                unowned[active] = first
+                if now - first < STRAY_CLAIM_GRACE_S:
+                    continue
+                if lane_dir == self.queue_dir:
+                    self._sweep_partials(active)
+                outcome = requeue_claim(
+                    active, "orphaned claim: no server holds it", count=False
+                )
+                print(f"♻️  {active.name}: {outcome} (stray claim)", flush=True)
+                unowned.pop(active)
+        self._stray_seen = unowned
 
     # --- hang detection -------------------------------------------------------
 
