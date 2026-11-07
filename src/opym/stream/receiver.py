@@ -1731,6 +1731,7 @@ class StreamReceiver:
         log(
             "Session %s (%s): %s", session.session_id, session.base_name, end["summary"]
         )
+        self._discard_partial_volumes(session)
         _write_stage_profile(session, reason, end)
         self._record_end(session, end)
         if session.live:
@@ -1816,6 +1817,42 @@ class StreamReceiver:
         # staging on, it discovers it once the drain above lands it there --
         # either way nothing else needs triggering here.
         del self.sessions[session.session_id]
+
+    def _discard_partial_volumes(self, session: SessionState) -> int:
+        """Remove the planes of every volume still arriving slab by slab (a
+        session that ended mid-volume: abort, error, idle, stall) from its raw
+        store, and forget the volume. A partial volume left on disk is counted
+        as a written timepoint downstream and processed with its missing
+        planes as zeros (ING-F2); an absent one is simply not there. Each
+        discarded volume is logged. Returns how many."""
+        discarded = 0
+        for (t, c), asm in list(session.slabs.items()):
+            planes = int(asm.have.sum()) if asm.have is not None else 0
+            try:
+                rawmirror.discard_timepoint(session.channel_store_paths[c], t)
+            except OSError:
+                logger.exception(
+                    "Session %s: could not remove the partial volume (t=%d, c=%d) "
+                    "from %s -- delete p0/%d by hand before processing it",
+                    session.session_id,
+                    t,
+                    c,
+                    session.channel_store_paths[c],
+                    t,
+                )
+                continue
+            del session.slabs[(t, c)]
+            discarded += 1
+            logger.warning(
+                "Session %s: discarded the unfinished volume (t=%d, c=%d): %d of "
+                "%d planes had arrived",
+                session.session_id,
+                t,
+                c,
+                planes,
+                0 if asm.have is None else len(asm.have),
+            )
+        return discarded
 
     def _retain_paused(self, session: SessionState) -> None:
         """The client gave up streaming this run mid-way (SESSION_END reason

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -259,6 +260,24 @@ def write_planes(arr: zarr.Array, t: int, z0: int, planes_zyx: np.ndarray) -> No
     still being acquired). With one chunk per plane, each plane is its own
     chunk file, so slabs of one volume never touch each other's chunks."""
     arr[t, z0 : z0 + planes_zyx.shape[0]] = planes_zyx
+
+
+def discard_timepoint(store_path: Path, t: int) -> bool:
+    """Remove every plane written for timepoint `t` of the channel store at
+    `store_path` (its `p0/<t>` chunk directory); True if there was any.
+
+    For a volume that never completed (session ended mid-volume): zarr reads a
+    missing plane as zeros and `channel_store_timepoints` counts the numbered
+    directory as a written timepoint, so leaving the partial planes makes the
+    backfill process a volume with holes as if it were whole (ING-F2). The
+    array itself stays; a later resume of the same store starts that volume
+    again from nothing.
+    """
+    tdir = Path(store_path) / "p0" / str(int(t))
+    if not tdir.is_dir():
+        return False
+    shutil.rmtree(tdir)
+    return True
 
 
 def store_path_for_channel(raw_root: Path, base_name: str, channel_name: str) -> Path:
