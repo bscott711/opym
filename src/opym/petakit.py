@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import subprocess
 import threading
@@ -1066,8 +1067,19 @@ def _write_ticket(payload: dict, base_name: str, prefix: str, queue_dir: Path) -
     # stale process is visible in the log instead of being inferred hours later.
     payload.setdefault("submitterRev", _submitter_revision())
 
-    with open(job_file, "w") as f:
-        json.dump(payload, f, indent=4)
+    # Atomic publish (PROC-F3). The server polls the queue every 20 ms during
+    # a live session and claims the oldest `*.json` it sees; a ticket created
+    # empty and filled afterwards can be claimed half-written and sent to
+    # failed/. The server's listing skips dot-files, so write the whole body
+    # under a hidden `.tmp` name and `os.replace` it into place.
+    tmp_file = job_file.with_name(f".{job_file.name}.tmp")
+    try:
+        with open(tmp_file, "w") as f:
+            json.dump(payload, f, indent=4)
+        os.replace(tmp_file, job_file)
+    except BaseException:
+        tmp_file.unlink(missing_ok=True)
+        raise
     return job_file
 
 
