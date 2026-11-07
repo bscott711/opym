@@ -40,9 +40,23 @@ NEW_DIR = "decon_stage"
 # Flags that would make this a writer. Refused by name so the intent is clear.
 WRITE_FLAGS = frozenset(
     {
-        "--apply", "--write", "--reset", "--execute", "--exec", "--run",
-        "--fix", "--force", "--yes", "--delete", "--remove", "--move",
-        "--commit", "--rerun", "--submit", "--migrate", "--in-place",
+        "--apply",
+        "--write",
+        "--reset",
+        "--execute",
+        "--exec",
+        "--run",
+        "--fix",
+        "--force",
+        "--yes",
+        "--delete",
+        "--remove",
+        "--move",
+        "--commit",
+        "--rerun",
+        "--submit",
+        "--migrate",
+        "--in-place",
     }
 )
 

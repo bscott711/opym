@@ -25,7 +25,9 @@ _spec.loader.exec_module(lister)
 def _add(reg, tmp_path, name, *, output, finished, status="done", psf=None):
     leaf = tmp_path / "data" / name
     reg.register_dataset(
-        str(leaf), root=str(tmp_path / "data"), leaf_dir=str(leaf),
+        str(leaf),
+        root=str(tmp_path / "data"),
+        leaf_dir=str(leaf),
         master_file=str(leaf / "m.zarr"),
     )
     if psf:
@@ -49,20 +51,43 @@ def registry(tmp_path):
     a = _add(
         reg, tmp_path, "a", output=old(d / "a"), finished="2026-09-24T10:00:00+00:00"
     )
-    _add(reg, tmp_path, "b", output=old(d / "b"), finished="2026-09-28T23:00:00+00:00",
-         psf="/psf.tif")
+    _add(
+        reg,
+        tmp_path,
+        "b",
+        output=old(d / "b"),
+        finished="2026-09-28T23:00:00+00:00",
+        psf="/psf.tif",
+    )
     _add(reg, tmp_path, "c", output=old(d / "c"), finished="2026-10-02T10:00:00+00:00")
     # not candidates: new deskew-only location, decon output, TIFF-path output
-    _add(reg, tmp_path, "new", output=d / "new" / "decon_stage" / "DSR_nodecon",
-         finished="2026-11-06T10:00:00+00:00")
+    _add(
+        reg,
+        tmp_path,
+        "new",
+        output=d / "new" / "decon_stage" / "DSR_nodecon",
+        finished="2026-11-06T10:00:00+00:00",
+    )
     decon_out = d / "decon" / "decon_stage" / "Decon" / "DSR_decon"
-    _add(reg, tmp_path, "decon", output=decon_out,
-         finished="2026-09-25T10:00:00+00:00", psf="/psf.tif")
-    _add(reg, tmp_path, "tiff", output=d / "tiff" / "processed" / "DSR_nodecon",
-         finished="2026-09-25T10:00:00+00:00")
+    _add(
+        reg,
+        tmp_path,
+        "decon",
+        output=decon_out,
+        finished="2026-09-25T10:00:00+00:00",
+        psf="/psf.tif",
+    )
+    _add(
+        reg,
+        tmp_path,
+        "tiff",
+        output=d / "tiff" / "processed" / "DSR_nodecon",
+        finished="2026-09-25T10:00:00+00:00",
+    )
     # a legacy path on a stage other than deskew is not a candidate
-    reg.finish_stage(str(d / "tiff"), "mip_encode", status="done",
-                     output_path=str(old(d / "tiff")))
+    reg.finish_stage(
+        str(d / "tiff"), "mip_encode", status="done", output_path=str(old(d / "tiff"))
+    )
     reg.close()
     return path, a
 
@@ -101,7 +126,9 @@ def test_stat_flags_and_notes(registry):
         by_key = {Path(r["dataset_key"]).name: r for r in lister.candidates(reader)}
     ra, rb = by_key["a"], by_key["b"]
     assert (ra["old_output_exists"], ra["viewer_exists"], ra["mip_movies_exists"]) == (
-        True, True, False,
+        True,
+        True,
+        False,
     )
     assert "provenance mismatch" in ra["note"]
     assert rb["old_output_exists"] is False

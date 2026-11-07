@@ -22,13 +22,25 @@ Roughly 44 datasets were processed deskew-only 2026-09-24..28, so their recorded
 the repo docs' own estimate and has not been counted against the registry: the
 lister below produces the real count.
 
+## Prerequisite: an opym that has the registry reader
+
+The lister and step 3 import `RegistryReader` and `registry_path` from `opym.registry`.
+They exist from opym PR #81 (in `32dccb1`, which this runbook was written against). The
+opym installed in production today is `ae1846e`: its `opym.registry` has only
+`StatusRegistry`, so both commands exit with an ImportError (nothing is written). Run
+them either after opym is deployed, or before that from a worktree of opym at
+`origin/main` with `PYTHONPATH=<worktree>/src` set (the lister's `sys.path[0]` is
+`scripts/`, which does not include `src`). Run step 3 only after the deploy, so the reset
+goes through the same opym the service runs.
+
 ## 3a. Step 0: what the registry says (decides which path you are on)
 
 The lister is a dry run (registry opened `mode=ro`, `os.stat` on five paths per
 row, no directory walk, refuses any write-looking flag):
 
 ```
-cd ~/projects/science/opym_local            # or any worktree of it
+cd <a worktree of opym at origin/main>      # not the production checkout until opym is deployed
+export PYTHONPATH=$PWD/src                  # makes the worktree's opym win over the installed one
 PY=~/projects/science/bioimaging/.venv/bin/python
 $PY scripts/handedness_rerun_candidates.py                          # table
 $PY scripts/handedness_rerun_candidates.py --since 2026-09-24 --until 2026-09-28
@@ -104,6 +116,9 @@ the old code and would write the mirrored output again.)
    mv "$B/viewer"      "$A/viewer"
    mv "$B/mip_movies"  "$A/mip_movies"
    ```
+   If the lister shows flag `N` or `D` for the row (a `decon_stage/` output already exists),
+   the re-run removes that output first, so move `decon_stage/` aside as well
+   (`mv "$B/decon_stage" "$A/decon_stage"`), or leave that row out of this batch.
    (`mv` within one filesystem is a rename: nothing is copied or deleted.)
 3. Reset the deskew stage (this is the only registry write; it is yours to run):
 
@@ -124,7 +139,11 @@ the old code and would write the mirrored output again.)
 
 ## 3a. What is overwritten and what is kept
 
-Nothing is deleted by anything above. Checked in bioimaging `backfill/` and `pipeline.py`:
+The steps above delete nothing: they move `viewer/` and `mip_movies/` (and, for flag `N`/`D`
+rows, `decon_stage/`) aside by rename, and reset one registry row. The re-run itself removes
+only what the table marks REMOVED: a `decon_stage/` output left by an earlier run, and its
+own staged intermediates. The old `zarr_mirror/` products are not touched. Checked in
+bioimaging `backfill/` and `pipeline.py`:
 
 | Item | After the re-run | Why |
 |---|---|---|
