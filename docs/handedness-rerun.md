@@ -1,5 +1,25 @@
 # Handedness: re-running the old deskew-only datasets (3a) and stamping the convention (3b)
 
+## Resolved 2026-11-07 (3a not needed; 3b still open)
+
+The lister returned 0 candidates on the 948-row registry: no deskew row records a
+`zarr_mirror/DSR_nodecon` output. Read-only checks (registry `mode=ro`, `os.stat` and
+directory listings only, no pixels read) show why: 735 rows end in `Decon/DSR_decon`
+(all finished on/after 2026-09-20, after rot90 staging 3afa092 of 2026-09-19) and 139
+are live-lane viewer stores (rot90 staging), so every served product is already rot90.
+35 leaves still hold an orphan `zarr_mirror/DSR_nodecon` that no consumer reads
+(dashboard, CORE, ChimeraX link code and `_dsr_dir_for` never look there); every viewer
+store and MIP movie of those 35 is newer than the decon output. The "~44" figure below
+was an estimate and has no registry equivalent.
+
+- 3a (re-run) is not needed. The lister stays as a check: run it again if a deskew-only
+  row ever points at `zarr_mirror/`.
+- Remaining hazard: masks made on the pre-2026-09-20 mirrored outputs must not be applied
+  to current outputs. The 35 orphan dirs are the PI's to delete, never us.
+- 3b (stamping the convention in `.zattrs`) stays open as a proposal.
+
+Everything below is the historical runbook, written before this check.
+
 Prepared, not run. Nothing here has been executed against the production registry
 or the data. Written against opym `32dccb1` and bioimaging `origin/main` `880c420`
 (PR #39 is in it). ROADMAP item 3; finding PROC-F1 in `docs/review/2026-11-review.md`.

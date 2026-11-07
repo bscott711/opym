@@ -48,10 +48,13 @@ Review and plan: [docs/review/2026-11-review.md](docs/review/2026-11-review.md),
   main, makes the rig send `acq_first_s`); the old ms form is still accepted through `acq_first_s`. Stores written before have relative time
   only. `opym-add-times` is dry run unless `--apply`.
 - Handedness: decided 2026-11-05, canonical = rot90 (decon, live, measured PSF, TIFF cropper). `zarr_input=True`
-  (`zxy`) is its y-mirror and the backfill no longer uses it (bioimaging PR #39: deskew-only stages rot90 too). The
-  roughly 44 zarr datasets processed deskew-only 2026-09-24..28 are still the old mirrored handedness and have NOT been
-  re-run (user decides; no deletions by us): do not move masks from those to other products. Stamping the convention
-  in store `.zattrs` is still open (PROC-F1).
+  (`zxy`) is its y-mirror and the backfill no longer uses it (bioimaging PR #39: deskew-only stages rot90 too).
+  Checked 2026-11-07 (read-only, no pixels read): the old "~44 still mirrored" worry is gone. Of the 948 registry datasets every served one
+  points at a rot90 product: 735 `Decon/DSR_decon` rows (all finished on/after 2026-09-20, after rot90 staging 3afa092 of
+  2026-09-19) and 139 live-lane viewer stores. 35 leaves still hold an orphan `zarr_mirror/DSR_nodecon` that no
+  consumer reads; every viewer store and MIP movie of those 35 is newer than the decon output. Remaining hazard: masks
+  made on the pre-2026-09-20 mirrored outputs must not be applied to current outputs. The 35 orphan dirs are the PI's
+  to delete, never us. Stamping the convention in store `.zattrs` is still open (PROC-F1).
 - sqrt8 contract with naparym-live: 8-bit view buffers hold `round(255*sqrt(v/vmax))`, `vmax` = 2^k-1 fixed per
   channel and session by the first volume; encode (MATLAB LUT), decode (GPU shader) and `DisplayEncoding` must agree.
 - The receiver's idle-close text ("closed on Argus ...", `protocol.IDLE_CLOSED_REASON`) is string-matched by the rig;

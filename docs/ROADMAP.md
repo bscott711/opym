@@ -51,11 +51,13 @@ before; deploy order is in the consumers' READMEs and [ADR 0001](adr/0001-light-
 ## 3. Handedness decision, then consistency
 - Decided 2026-11-05 (user): canonical = rot90 (decon, live, measured PSF, TIFF cropper). Done: bioimaging PR #39 makes
   the deskew-only zarr path stage rot90 TIFFs like decon (`zarr_input=False`), so new output matches.
-- Open: (a) the roughly 44 datasets processed deskew-only 2026-09-24..28 (`zarr_mirror/DSR_nodecon`) are still the old
-  mirrored handedness and have NOT been re-run; the user decides whether to re-run them, and we delete nothing.
-  (b) Stamp the convention in store `.zattrs`.
-- Why: PROC-F1. Until (a) is done those `DSR_nodecon` outputs are a y-mirror of every decon and live product.
-- Status: 3a and 3b are the user's. The prepared re-run steps and a read-only lister are in
+- Resolved 2026-11-07 (a): the "~44 still mirrored" datasets no longer exist in the registry. Every served product of the 948 datasets is rot90
+  products (735 `Decon/DSR_decon` finished on/after 2026-09-20, 139 live-lane viewer stores); 35 leaves keep an orphan
+  `zarr_mirror/DSR_nodecon` that nothing reads, for the PI to delete (never us). No re-run needed. Remaining hazard: masks made on
+  pre-2026-09-20 mirrored outputs must not be applied to current outputs.
+- Open: (b) Stamp the convention in store `.zattrs`.
+- Why: PROC-F1.
+- Status: 3a closed; 3b is the user's. The prepared re-run steps and a read-only lister are in
   [docs/handedness-rerun.md](handedness-rerun.md).
 
 ## 4. Test isolation and view eviction safety
