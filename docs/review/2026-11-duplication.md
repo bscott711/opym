@@ -1,5 +1,47 @@
 # opym duplication and divergence audit (2026-11-06)
 
+## Outcome (2026-11-07)
+
+The recommendation below to guard the mirrors with contract tests instead of imports is SUPERSEDED. The user decided on
+2026-11-06 that opym is the source of truth and the hand-written copies are deleted and replaced by `import opym...`. Contract
+tests stay, as regression guards for the shared code (golden vectors live in `opym.testing`). "Not recommended: making CORE,
+dashboard, viewer, cell-cinema, chimerax-ngff or the rig import opym" is reversed: the base install is now numpy-only
+([ADR 0001](../adr/0001-light-base.md)), so `import opym.<contract module>` is light enough for every runtime (ChimeraX and
+pvpython install it `--no-deps`). Nothing is deployed yet; the PRs are merged to main.
+
+State per finding. PR numbers: opym unless a repo is named. Shared modules came from #80 to #85 (light base, readers, display and
+store, stream wire and sender, gaps).
+
+| # | state | what happened | PR |
+|---|---|---|---|
+| DUP-01 | replaced | naparym-live re-pinned to a current opym SHA and its host mirrors deleted | naparym-live #8 |
+| DUP-02 | kept | a uv cache, not copies; `uv cache prune` reclaims it when wanted | none |
+| DUP-03 | replaced | dashboard imports `opym.registry` (`RegistryReader`, key codec), `opym.utils`, `opym.stream.outcome`, `live_status`, `backfill_runs`, `opym.timeline`, `opym.store` | opym-dashboard #23 (opym #81, #82, #84, #85) |
+| DUP-04 | replaced | opym-viewer imports the registry lookup, key codec and `resolve_output_base`; its 8-bit rule is now opym's sqrt (user decision (c)) | opym-viewer #5 |
+| DUP-05 | replaced | bioimaging no longer declares `opym` (nor the other opym scripts); opym declares all of its own | opym #83, bioimaging #44 |
+| DUP-06 | replaced | `run_pipeline_cli.py` deleted; the two psf_tools sweeps use `opym.roi_detect` and `opym.metadata.parse_z_step` (decision (f)) | bioimaging #44 |
+| DUP-07 | kept, marked legacy | `PSFAverager` and `generate_synthetic_psfs.py` stay for reference; docstrings say decon needs the rot90 PSF and that bioimaging `psf_tools/extract_bead_psf.py` is the current path | this docs change (M48) |
+| DUP-08 | replaced | one z-step reader (`zarr_fallback_z_step`), one palette (`opym.display`), marker/lock/settle constants in `bfill`, registry path in `opym.registry`; bioimaging imports them | opym #81, #82, #84; bioimaging #44 |
+| DUP-09 | replaced | the bioimaging test registry fake is now a `StatusRegistry` subclass, so a new registry method cannot be missing from it | bioimaging #44 |
+| DUP-10 | replaced | pymmcore-gui `_protocol.py` deleted; `_session.py` imports `opym.stream.protocol` | opym #83, pymmcore-gui #65 |
+| DUP-11 | replaced | FRAME time is epoch seconds (`frame_epoch_s`), old ms form accepted via `acq_first_s`; not yet on the rig, existing stores keep relative time only | opym #83, pymmcore-gui #65 |
+| DUP-12 | replaced | pymmcore-gui `_bfill.py` and `_bfill_run.py` deleted, `opym.stream.bfill` / `bfill_run` imported | opym #83, pymmcore-gui #65 |
+| DUP-13 | replaced | the rig's sender became `opym.stream.backfill_client`; pymmcore-gui keeps a 53-line wrapper; one `opym-backfill-send` script | opym #83, pymmcore-gui #65, bioimaging #44 |
+| DUP-14 | `downsample2` replaced; linkbench halves kept | channelaligner imports `opym.ome_zarr_writer.downsample2`; the rig client and opym sink of the link benchmark are complementary halves, not copies | channelaligner #3 |
+| DUP-15 | replaced | CORE's layout-3 reader copy deleted for `opym.store`; its fixtures come from `opym.testing.store`, a real writer-built store | CORE #26 |
+| DUP-16 | replaced, a 42-line reader shim kept | cell-cinema reads times through `opym.timeline` with a `reader=` hook; the glue stays because ChimeraX has no zarr and the rig's `t` array is blosc-compressed | cell-cinema #14, opym #85 |
+| DUP-17 | replaced | the legacy `FF3D3D` red is remapped to magenta in the reader (`normalize_color`), one palette in `opym.display`; no store rewritten (decision (e)). chimerax-ngff and cell-cinema stay LINEAR for ChimeraX by the user's linear-intensity rule; the sqrt rule applies to naparym-live, opym-viewer and argus-desktop | opym #82; chimerax-ngff #15, cell-cinema #14, argus-desktop #12 |
+| DUP-18 | kept | `tools/tiff_series_to_ngff.py` is an intentionally different writer; a docstring note says it is not opym-compatible | chimerax-ngff #15 |
+| DUP-19 | needs user | archive or delete of old repos (decision (b)) and the HPC `../software/opym` question are the user's | none |
+
+Decisions from the list below: (a) rename `opym_local`: not done, left as is. (b) old repos: needs the user. (c) opym-viewer
+rule: sqrt, done. (d) CORE depends on opym now (CORE #26). (e) old red stores: remapped in the readers. (f) `run_pipeline_cli`:
+retired.
+
+Still open from this audit: DUP-19 and decision (b); the rename (a); the bioimaging MIP movies (percentile stretch for video) and
+CORE seglab per-image sqrt were judged ML or movie inputs, not viewers, and not changed. The text below is the audit as written
+on 2026-11-06.
+
 Rev: opym `eb55bfd`; bioimaging `01db054`; naparym-live `0d128ce`; opym-dashboard `f9cf089`; opym-viewer `fde6803`;
 pymmcore-gui `85800c3`; CRISPy `7e9ee06`; channelaligner `c473cf8`; peach-pit-plugin `38ad2a4`; CORE `de6dd12`;
 chimerax-ngff `c1c56a7`; cell-cinema `1c7799b`; argus-desktop `92f688a`. Read-only audit; no data, registry or rig PC

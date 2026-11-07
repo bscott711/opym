@@ -9,6 +9,7 @@
 # LB_STAGE_FLOOR_GB=N sets lv-receive's RAM-disk floor (R5; default: the
 # receiver's own, 20 GB); LB_VIEW_BITS=8|16 its view buffers' bit depth
 # (default: the receiver's own, 8).
+# LB_CORE=DIR is the CORE checkout whose celldet-live-qc runs as lv-qc (default: ~/projects/science/CORE).
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -38,11 +39,12 @@ up() {
     -p StandardOutput="append:$LV/logs/lv-serve.log" -p StandardError="append:$LV/logs/lv-serve.log" \
     "$PY" -m opym.local_gpu_worker
   receiver
-  if [ -x "$HOME/projects/CORE/.venv/bin/celldet-live-qc" ]; then
-    systemd-run --user --collect --unit=lv-qc -p WorkingDirectory="$HOME/projects/CORE" \
+  core="${LB_CORE:-$HOME/projects/science/CORE}"
+  if [ -x "$core/.venv/bin/celldet-live-qc" ]; then
+    systemd-run --user --collect --unit=lv-qc -p WorkingDirectory="$core" \
       --setenv=CUDA_VISIBLE_DEVICES= --setenv=OMP_NUM_THREADS=4 --setenv=PYTHONUNBUFFERED=1 "$thp" \
       -p StandardOutput="append:$LV/logs/lv-qc.log" -p StandardError="append:$LV/logs/lv-qc.log" \
-      "$HOME/projects/CORE/.venv/bin/celldet-live-qc" --jobs "$JOBS"
+      "$core/.venv/bin/celldet-live-qc" --jobs "$JOBS"
   fi
   systemd-run "${common[@]}" --unit=lv-sample \
     -p StandardOutput="append:$LV/logs/lv-sample.log" -p StandardError="append:$LV/logs/lv-sample.log" \

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from opym import live_view
 from opym import ome_zarr_writer as w
 
@@ -380,6 +381,7 @@ def test_follower_traces_each_newly_shown_timepoint(tmp_path):
     """opym-live-trace's last hop: when naparym-live built the layers for t."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
+
     from opym.stream import trace
 
     jobs = tmp_path / "jobs"
@@ -426,6 +428,7 @@ def test_paint_clock_needs_a_qt_window():
 def test_watcher_hands_its_paint_clock_to_each_follower(tmp_path):
     pytest.importorskip("napari")
     from napari.components import ViewerModel
+
     from opym.stream import trace
 
     jobs = tmp_path / "jobs"
@@ -448,6 +451,7 @@ def test_follower_shows_a_timepoint_from_its_buffers_before_the_store(tmp_path):
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
+
     from opym.stream.live_zarr import buffer_name
 
     resize_dask_cache(0)
@@ -697,6 +701,7 @@ def test_each_channel_shows_its_newest_timepoint_as_soon_as_it_lands(tmp_path):
     lands, and each channel's arrival is traced."""
     pytest.importorskip("napari")
     from napari.components import ViewerModel
+
     from opym.stream import trace
 
     store, buffers = _buffered_session(tmp_path, done_t=1)
@@ -1065,6 +1070,7 @@ def test_an_8bit_viewer_maps_the_servers_8bit_buffers_and_uses_their_encoding(
     pytest.importorskip("napari")
     from napari.components import ViewerModel
     from napari.utils import resize_dask_cache
+
     from opym.stream.live_zarr import buffer_name
 
     resize_dask_cache(0)

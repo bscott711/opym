@@ -3,12 +3,13 @@
 Real-time frame-streaming receiver for opym.
 
 Bridges a ZeroMQ frame stream from an acquisition workstation into the
-existing `/dev/shm/petakit_jobs` ticket pipeline (see `opym.petakit`,
-`opym.local_gpu_worker`, `opym.consolidate`) -- those modules are unmodified;
-this package only produces the same shape of staged zarr + JSON ticket the
-batch path already produces, per frame instead of per dataset.
+`/dev/shm/petakit_jobs` ticket pipeline (see `opym.petakit`,
+`opym.local_gpu_worker`). The receiver writes each channel into a raw OME-Zarr
+store as the frames arrive; with the live lane on it queues one live ticket per
+completed (timepoint, channel) volume, and a finished dataset is discovered by
+the backfill exactly like one that arrived by file transfer.
 
-See `opym_local/docs/STREAMING_PROTOCOL.md` for the wire-protocol spec.
+See `docs/STREAMING_PROTOCOL.md` (in `bscott711/opym`) for the wire-protocol spec.
 
 The package namespace is lazy (`from opym.stream import StreamReceiver` and the
 `MSG_*` / `pack_message` names still work): `import opym.stream.protocol` must

@@ -194,7 +194,8 @@ def written_timepoints(store: Path, main_rel: str, ndim: int) -> list[int]:
 def chunk_count_for_t(store: Path, main_rel: str, t: int) -> tuple[int, int]:
     """(chunk files present, smallest chunk file) for timepoint `t` of a `/`-separated 4-D store."""
     d = array_dir(store, main_rel) / str(t)
-    n, smallest = 0, None
+    n = 0
+    smallest: int | None = None
     if not d.is_dir():
         return 0, 0
     for root, _dirs, files in os.walk(d):
@@ -207,7 +208,8 @@ def chunk_count_for_t(store: Path, main_rel: str, t: int) -> tuple[int, int]:
 
 def chunk_count_for_volume(store: Path, main_rel: str) -> tuple[int, int]:
     """(chunk files present, smallest chunk file) in a whole array dir, for a 3-D store."""
-    n, smallest = 0, None
+    n = 0
+    smallest: int | None = None
     for root, _dirs, files in os.walk(array_dir(store, main_rel)):
         for f in files:
             if f.startswith("."):

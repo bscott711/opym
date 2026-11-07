@@ -144,9 +144,10 @@ class RunRecords:
                     if "argus" in st:
                         doc.setdefault("stores", {}).setdefault(key, {})["argus"] = st["argus"]
             else:
-                doc = self._load(run_id)
-                if doc is None:
+                loaded = self._load(run_id)
+                if loaded is None:
                     return {"kind": "run", "ok": False, "error": "unknown run (no start)"}
+                doc = loaded
                 if op == "store":
                     key = str(header.get("key", ""))
                     entry = dict(header.get("entry") or {})

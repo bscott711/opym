@@ -39,17 +39,40 @@ newer.
     source .venv/bin/activate
     ```
 
-3. Install the package in editable mode:
+3. Install the package in editable mode with the extras you need:
 
     ```bash
-    uv pip install -e ".[viewer]"
+    uv pip install -e ".[server,viewer]"
     ```
 
-The `viewer` extra adds `ipywidgets`, `matplotlib`, `ipyfilechooser` and
-`ipython`. `opym` imports `ipywidgets` when it loads, so install it even if you
-only use the command line. The interactive ROI selector in Workflow 1 also needs
-the `ipympl` backend, which the extra does not install. Use `".[viewer,dev]"` to also get the test and lint
-tools.
+The base install depends on numpy only ([ADR 0001](docs/adr/0001-light-base.md)), so the contract modules below import in any
+runtime. Everything else is an extra:
+
+| Extra | Adds | For |
+|---|---|---|
+| `stream` | msgpack, pyzmq, zarr (below 3), numcodecs | stream and backfill clients and senders (the rig) |
+| `server` | tifffile, zarr, numcodecs, tqdm, scikit-image, scikit-learn, scipy, PyPetaKit5D, imagecodecs, pyyaml, pyzmq, msgpack, ome-types | what the processing server runs: `opym-receive`, `opym-receive-backfill`, `opym-serve` (installed by bioimaging as `opym[server]`) |
+| `viewer` | ipywidgets, matplotlib, ipyfilechooser, ipython | the Jupyter viewers and the ROI notebook |
+| `all` | `server` + `viewer` | |
+| `dev` | bandit, mypy, pre-commit, pytest, ruff | tests and lint |
+
+A missing heavy dependency fails where it is first used, not at `import opym`. The interactive ROI selector in Workflow 1 also
+needs the `ipympl` backend, which no extra installs.
+
+**Using opym from another repo.** Consumers import opym instead of copying its contracts and pin it by commit:
+
+```toml
+dependencies = ["opym"]
+[tool.uv.sources]
+opym = { git = "https://github.com/bscott711/opym", rev = "<sha>" }
+```
+
+(`opym @ git+https://github.com/bscott711/opym@<sha>` where the build backend allows direct references.) Runtimes that must
+not change their shared numpy (the shared ChimeraX, `pvpython`, the argus-desktop runtime) install it with `--no-deps`, for
+example `chimerax -m pip install --no-deps "opym @ git+https://github.com/bscott711/opym@<sha>"`; argus-desktop's runtime
+does this as a second step after its hashed sync. bioimaging is the exception: it runs the server, so it keeps the editable
+`../opym_local` path and declares `opym[server]`. Changing a contract means a new opym commit and a bump of each consumer's
+pin; the list of what a module owns and who imports it is under "Contract modules" below.
 
 The GPU pipeline additionally needs MATLAB with the PetaKit5D source on a machine
 with NVIDIA GPUs (the supervisor starts MATLAB with
@@ -68,18 +91,41 @@ neither is installed by this package.
 | `opym-stream-watch` | `opym.stream.client:main` | Stream a local zarr store (acquisition-PC side). |
 | `opym-add-times` | `opym.add_times:main` | Write real per-volume acquisition times into existing processed stores (dry run unless `--apply`). |
 | `opym-receive-backfill` | `opym.stream.backfill_receiver:main` | Receive finished OME-Zarr acquisitions from the acquisition PC over SSH, verified by readback (see [docs/SSH_BACKFILL.md](docs/SSH_BACKFILL.md)). |
-| `opym-backfill-send` | `opym.stream.backfill_client:main` | Send finished acquisitions to `opym-receive-backfill`. The rig runs the copy that ships with pymmcore-gui. |
+| `opym-backfill-send` | `opym.stream.backfill_client:main` | Send finished acquisitions to `opym-receive-backfill`. This is the one sender; the rig runs it through a thin wrapper in pymmcore-gui. |
 
-This package declares `opym` and `opym-add-times`. The other commands are
-declared by the companion `bioimaging` project, which installs `opym` as a
-dependency and also provides the bulk backfill driver. The companion also
-installs its own command named `opym`, so where both are installed, run this
-package's CLI as `python -m opym.cli`. Which `opym` is on PATH depends on
-install order: in the production bioimaging venv it is this package's
-`opym.cli` since the 0.5.0 install on 2026-11-05, and a reinstall of
-bioimaging flips it (CL-08). Every command above can likewise be run
-from a plain checkout as `python -m <module>`, for example
-`python -m opym.stream.receiver`.
+This package declares all of these commands (`pyproject.toml`, `[project.scripts]`). bioimaging, which installs `opym` as a
+dependency, declares only its own `opym-backfill` (the bulk backfill driver) and `opym-storage-triage`. Each command needs the
+extra that goes with it: `stream` for the senders and clients, `server` for the receivers and the GPU worker. Every command
+can also be run from a plain checkout as `python -m <module>`, for example `python -m opym.stream.receiver`.
+
+## Contract modules
+
+These modules are the single home of the formats other repos read. Each imports with numpy only (enforced by
+`tests/test_light_base.py`; `opym.stream.protocol` and `opym.stream.bfill` need `stream` only to pack or unpack a message).
+Golden vectors for them are in `opym.testing`, which the consumers' tests import.
+
+| Module | Owns | Imported by |
+|---|---|---|
+| `opym.stream.protocol` | wire message types, framing, ports, idle-close text, session-end reasons, typed headers, `frame_epoch_s` | pymmcore-gui (rig sender), opym-dashboard |
+| `opym.stream.bfill`, `bfill_run` | backfill wire messages, completion marker, lock and settle constants, run vocabulary | pymmcore-gui, bioimaging |
+| `opym.stream.backfill_client` | THE backfill sender | pymmcore-gui (wrapper) |
+| `opym.stream.backfill_runs` | backfill run-record readers, action and result vocabulary | opym-dashboard |
+| `opym.stream.outcome` | per-session outcome record and `stream_health.json` readers | opym-dashboard |
+| `opym.stream.live_status` | live pointer, status and view-buffer names, heartbeat and staleness rule | opym-dashboard, CORE |
+| `opym.stream.qcproj` | raw-projection sidecar for the live QC | CORE |
+| `opym.registry` | the registry schema and writer, `RegistryReader` / `connect_ro`, stage and status vocabulary, key codec | opym-dashboard, opym-viewer, CORE, bioimaging |
+| `opym.timeline` | acquisition times: zarr-free readers, relative-time rules, the `opym_time` record, the `reader=` hook | cell-cinema, opym-dashboard, bioimaging |
+| `opym.store` | layout-3 names and attrs readers, progress, voxel size, frame count, output path names and helpers, `leaf_for_store` (viewer store path back to its dataset leaf) | opym-dashboard, CORE, bioimaging, argus-desktop, channelaligner, pymmcore-gui |
+| `opym.display` | the sqrt 8-bit rule and its decode, the linear shift (ChimeraX), the channel palette and the legacy `FF3D3D` remap | naparym-live, opym-viewer, argus-desktop, chimerax-ngff, cell-cinema |
+| `opym.ome_zarr_writer` | the processed-store writer, `downsample2`, `mip_stacks` | channelaligner, CORE, bioimaging |
+| `opym.metadata` | MDA settings and the one z-step reader (`parse_z_step`, `zarr_fallback_z_step`) | bioimaging |
+| `opym.utils` | `resolve_output_base`, rot90 orientation for DSR and decon | opym-dashboard, opym-viewer, bioimaging |
+| `opym.lanes` | jobs directory, live lease and backfill admission constants | naparym-live, bioimaging, CORE, opym-dashboard |
+| `opym.decon_config` | decon parameters, fingerprint, voxel constants | bioimaging, CORE |
+
+Heavier modules (`opym.stream.receiver`, `local_gpu_worker`, `petakit`, `discovery`, `live_view`) need the `server` extra
+or, for `live_view`, `stream`; bioimaging imports `petakit`, `discovery` and `stream.live`, and naparym-live and opym-viewer
+import `opym.live_view`.
 
 ## Workflow 1: Interactive ROI Selection (Jupyter)
 
@@ -249,7 +295,7 @@ is a ready-made client for the acquisition PC. It polls a local pymmcore MDA zar
 store and streams each completed timepoint (default `--connect` is
 `tcp://127.0.0.1:5555`). Custom clients can reuse
 `opym.stream.client.StreamSender`, which needs no MATLAB or GPU dependencies
-(the rig GUI does not; see docs/STREAMING_PROTOCOL.md).
+(the rig GUI has its own sender built on `opym.stream.protocol`; see docs/STREAMING_PROTOCOL.md).
 
 ## SSH backfill of finished acquisitions
 
@@ -267,9 +313,12 @@ The receiver records each volume's acquisition time in the raw store
 `opym-add-times PATH...` patches stores that already exist (dry run unless
 `--apply`; each changed `.zattrs` is first copied to `.zattrs.before-times`).
 
-**Known gap (2026-11):** the rig's sender currently puts milliseconds since the
-start of the run in the FRAME `timestamp`, not epoch seconds, so streamed stores
-do not yet get real times. See [docs/ROADMAP.md](docs/ROADMAP.md) item 1.
+**FRAME timestamp rule.** The time of a volume is decided by one function, `opym.stream.protocol.frame_epoch_s(header)`:
+`timestamp` is used when it is epoch seconds (between 1e9 and 1e11); otherwise `acq_first_s` (epoch seconds of the first
+plane) is used and the fallback is logged once per session; otherwise the volume gets no time and one warning per session.
+The rig (pymmcore-gui, since PR #65) sends `timestamp = acq_first_s`; an older rig that sends milliseconds since run start still
+gets real times through `acq_first_s`. Deploy the receiver first, then the rig. Stores written before this keep relative
+time only. Golden FRAME headers are in `opym.testing.stream`.
 
 ## The processed OME-Zarr store
 
@@ -364,7 +413,7 @@ also sets `OPYM_ZARR_DEFAULT_Z_STEP` and `OPYM_BACKFILL_MAX_INFLIGHT`.
 ## Development
 
 ```bash
-uv pip install -e ".[viewer,dev]"
+uv pip install -e ".[server,viewer,dev]"
 pytest -m "not gpu"     # GPU tests also skip themselves without MATLAB and a GPU
 just format             # ruff format + ruff check --fix
 ```
@@ -374,11 +423,11 @@ Run the tests from the repository root only, and never export
 production while testing. See [CLAUDE.md](CLAUDE.md) for the gotchas, the
 [2026-11 review](docs/review/2026-11-review.md) and the [roadmap](docs/ROADMAP.md).
 
-`Notebooks/` holds the Jupyter notebooks. `OPM_Cropping_Refactored.ipynb` is the
-one Workflow 1 describes. `OPM_Interactive_Petakit_Tuner.ipynb` calls a function
-that no longer exists (`opym.run_llsm_petakit_processing`), and
-`OPM_Average_PSF.ipynb` is a small stub beside `Average_PSF.ipynb`; both are
-marked for review.
+`Notebooks/` holds the Jupyter notebooks. `OPM_Cropping_Refactored.ipynb` is the one Workflow 1 describes.
+`Notebooks/legacy/` holds `OPM_Interactive_Petakit_Tuner.ipynb`, which calls a function that no longer exists, so it does not
+run. `OPM_Average_PSF.ipynb` is a small stub beside `Average_PSF.ipynb`. The averager widget behind them (`PSFAverager`) and
+`scripts/generate_synthetic_psfs.py` are legacy: decon needs a rot90 PSF, which they do not write; use bioimaging's
+`psf_tools/extract_bead_psf.py`.
 
 `scripts/live_bench/` runs an isolated copy of the live stack (its own queues,
 port and server names) to measure the live view end to end and to inject faults;

@@ -13,6 +13,7 @@ import json
 import time
 
 import pytest
+
 from opym.stream import outcome
 from opym.stream import receiver as receiver_mod
 from opym.stream.protocol import (

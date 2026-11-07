@@ -317,7 +317,7 @@ def create_processed_store(
             name=name,
             n_t=n_t,
             n_c=n_c,
-            shape_zyx=tuple(shape_zyx),
+            shape_zyx=(shape_zyx[0], shape_zyx[1], shape_zyx[2]),
             channel_labels=labels,
             voxel_um=voxel_um,
             time_interval_s=time_interval_s,

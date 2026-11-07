@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import zarr
 import zmq
+
 from opym import lanes
 from opym.stream import backfill_client as bc
 from opym.stream import bfill
