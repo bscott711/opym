@@ -508,6 +508,10 @@ class SessionState:
     live_zarr: bool = False
     """...by the one-format lane (opym.stream.live_zarr): its GPU tickets read
     the raw store directly, so no decon TIFF is staged."""
+    live_view_skipped: str = ""
+    """Why this session runs without a live view although the lane is on (the
+    RAM disk had room for the raw data but not for the view store as well;
+    LIVE-05). Empty when the view was not skipped. Shown in stream_health.json."""
     t_interval_s: float = 0.0
     accepts_qc: bool = False
     """The client listed "qc" in SESSION_START's `accepts`: forward MSG_QC."""
@@ -1026,6 +1030,7 @@ class StreamReceiver:
                     "STREAMING_PROTOCOL.md's SESSION_START fields"
                 )
 
+            live_view_skipped = ""
             stage_root = _stage_root_from_env()
             write_root = (
                 stage_root / _stage_namespace(raw_root)
@@ -1044,21 +1049,25 @@ class StreamReceiver:
                 # mid-session, and 2x turned a back-to-back movie down
                 # while the previous one was still draining (2026-09-28:
                 # 114.8 GB free for a 64.7 GB session). See module docstring.
+                # The live view store (LIVE-05) is the convenience: when only
+                # it does not fit, the session is accepted and runs without a
+                # live view; only the raw data not fitting rejects it.
                 view_bytes = _estimate_view_bytes(estimated_bytes)
-                need_bytes = estimated_bytes + view_bytes + _stage_floor_bytes()
+                raw_need = estimated_bytes + _stage_floor_bytes()
+                need_bytes = raw_need + view_bytes
                 if need_bytes > free_bytes:
                     free_bytes = self._free_stage_space(stage_root, need_bytes)
                 if need_bytes > free_bytes:
-                    raise _StageShort(
-                        f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
-                        f"free, need {need_bytes / 1e9:.1f} GB (this session's "
-                        f"estimated {estimated_bytes / 1e9:.1f} GB"
-                        + (
-                            f" + {view_bytes / 1e9:.1f} GB live view store"
-                            if view_bytes
-                            else ""
+                    if raw_need > free_bytes:
+                        raise _StageShort(
+                            f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
+                            f"free, need {raw_need / 1e9:.1f} GB (this session's "
+                            f"estimated {estimated_bytes / 1e9:.1f} GB + the floor)"
                         )
-                        + " + the floor)"
+                    live_view_skipped = (
+                        f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
+                        f"free, the raw data needs {raw_need / 1e9:.1f} GB and "
+                        f"the live view store {view_bytes / 1e9:.1f} GB more"
                     )
 
             base_name = self._resolve_base_name(
@@ -1114,6 +1123,7 @@ class StreamReceiver:
                 t_interval_s=float(header.get("t_interval_s") or 0.0),
                 ack_floor=-1 if resume_through is None else resume_through,
                 resumed=resume_through is not None,
+                live_view_skipped=live_view_skipped,
             )
         except (KeyError, ValueError, TypeError, OSError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
@@ -1127,8 +1137,15 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         self._unknown_noticed.pop(session_id, None)
+        if session.live_view_skipped:
+            logger.warning(
+                "Session %s: receiving without a live view (%s)",
+                session_id,
+                session.live_view_skipped,
+            )
         try:
-            self._maybe_start_live(session)
+            if not session.live_view_skipped:
+                self._maybe_start_live(session)
         except Exception:
             # The live view is a convenience; the acquisition is not. An
             # unreachable PSF (GPFS down after a reboot, 2026-10-23) used to
@@ -2393,6 +2410,8 @@ class StreamReceiver:
                     ),
                     "client": s.client_status,
                     "client_summary": outcome.describe_client(s.client_status),
+                    "live_view": s.live,
+                    "live_view_skipped": s.live_view_skipped or None,
                 }
             )
         record = {

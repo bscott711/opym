@@ -507,7 +507,10 @@ def test_the_room_check_counts_the_live_view_store_when_that_lane_is_on(
 ):
     """LIVE-05: the one-format lane's view store lands on the same RAM disk and
     is about as large as the raw store; counting raw bytes alone admitted
-    sessions that then filled tmpfs."""
+    sessions that then filled tmpfs. When only the VIEW does not fit, the
+    session is still accepted (rejecting it brought back the 2026-09-28
+    back-to-back refusal) and runs without a live view; when the raw data does
+    not fit, it is rejected."""
     import shutil
 
     import opym.stream.receiver as receiver_mod
@@ -517,23 +520,45 @@ def test_the_room_check_counts_the_live_view_store_when_that_lane_is_on(
     monkeypatch.setenv("OPYM_STREAM_STAGE_FLOOR_GB", "20")
     monkeypatch.setattr(receiver_mod, "_estimate_session_bytes", lambda _h: 64.7e9)
     # 64.7 GB raw + 0.9 x that + the floor = 142.9 GB; raw + floor alone is 84.7.
-    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=120))
     monkeypatch.setenv("OPYM_LIVE_LANE", "1")
     monkeypatch.setenv("OPYM_DECON_PSF", str(tmp_path / "psf.tif"))
     monkeypatch.setenv("OPYM_LIVE_FORMAT", "zarr")
 
+    # 2026-09-28: 114.8 GB free for a 64.7 GB session. The raw data fits, the
+    # view store does not: accepted, no live view, and it says so.
+    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=114.8))
     sock = _dealer(recv, "sess-view")
     sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
     ack = _pump(recv, sock)
+    assert not ack.get("unknown_session")
+    session = recv.sessions["sess-view"]
+    assert session.live is False
+    assert "58.2 GB" in session.live_view_skipped
+    assert "142.9 GB" not in session.live_view_skipped  # names the parts, not a sum
+    del recv.sessions["sess-view"]
+
+    # Room for raw + view + floor: the view is not skipped.
+    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=150))
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
+    _pump(recv, sock)
+    assert recv.sessions["sess-view"].live_view_skipped == ""
+    del recv.sessions["sess-view"]
+
+    # The raw data itself does not fit (84.7 GB needed): still rejected, and
+    # the rejection does not blame a view store it never needed.
+    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=80))
+    sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
+    ack = _pump(recv, sock)
     assert ack["unknown_session"] is True
-    assert "need 142.9 GB" in ack["rejected"]
-    assert "58.2 GB live view store" in ack["rejected"]
+    assert "need 84.7 GB" in ack["rejected"]
+    assert "live view store" not in ack["rejected"]
     assert "sess-view" not in recv.sessions
 
     monkeypatch.delenv("OPYM_LIVE_FORMAT")  # the TIFF lane has no view store
     assert receiver_mod._estimate_view_bytes(10**9) == 0
     monkeypatch.delenv("OPYM_LIVE_LANE")
     monkeypatch.delenv("OPYM_DECON_PSF")  # and with no live lane, none either
+    monkeypatch.setattr(shutil, "disk_usage", _FakeDisk(free_gb=120))
     sock.send_multipart(pack_message(MSG_SESSION_START, "sess-view", _header(raw)))
     ack = _pump(recv, sock)
     assert not ack.get("unknown_session")
