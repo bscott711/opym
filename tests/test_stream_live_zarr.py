@@ -57,16 +57,18 @@ def _raw(tmp_path, n_t, n_c):
     return arrays
 
 
-def _session(lane, tmp_path, n_t=4, n_c=2, sid="sess", **kw):
+def _session(lane, tmp_path, n_t=4, n_c=2, sid="sess", leaf="Cell_030", **kw):
+    """`leaf`: the destination folder. A new session must not reuse the folder
+    of a finished one (PROC-F9: the complete archive is not wiped)."""
     return lane.start_session(
         sid,
-        base_name="Cell_030",
+        base_name=leaf,
         num_timepoints=n_t,
         n_channels=n_c,
         raw_arrays=_raw(tmp_path, n_t, n_c),
         raw_shape_zyx=RAW_ZYX,
         stage_leaf=tmp_path / "stage" / "Cell_030",
-        dest_leaf=tmp_path / "gpfs" / "exp" / "Cell_030",
+        dest_leaf=tmp_path / "gpfs" / "exp" / leaf,
         z_step_um=0.5,
         channel_labels=["GFP 488", "mScarlet 561"][:n_c],
         time_interval_s=10.0,
@@ -374,7 +376,7 @@ def test_ram_disk_pressure_evicts_only_finished_view_stores(tmp_path, psf):
     assert _pump_until(lane, lambda: "done" not in lane.sessions)
     assert done.view_dir.exists()
     assert live_zarr.evict_finished_views(jobs) == 0  # still the latest
-    running = _session(lane, tmp_path, n_t=1, n_c=1, sid="running")
+    running = _session(lane, tmp_path, n_t=1, n_c=1, sid="running", leaf="Cell_031")
     assert done.view_dir.exists()  # the newest finished: kept until pressure
     # Left "running" by a receiver that died: it may be resumed.
     stale = live_zarr.view_root() / "stale" / "x_dsr.ome.zarr"
@@ -599,11 +601,30 @@ def test_finalize_keeps_the_view_until_a_later_session(tmp_path, psf):
     assert not s.work_dir.exists() and s.view_dir.exists()
 
     # Two later sessions: the newest finished one's view is kept, older go.
-    s2 = _session(lane, tmp_path, n_t=1, n_c=1, sid="sess2")
+    s2 = _session(lane, tmp_path, n_t=1, n_c=1, sid="sess2", leaf="Cell_031")
     assert s.view_dir.exists()
     lane.sessions.pop("sess2")
-    _session(lane, tmp_path, n_t=1, n_c=1, sid="sess3")
+    _session(lane, tmp_path, n_t=1, n_c=1, sid="sess3", leaf="Cell_032")
     assert s2.view_dir.exists() and not s.view_dir.exists()
+
+
+def test_new_session_does_not_wipe_a_complete_archive(tmp_path, psf):
+    """PROC-F9: a later session whose folder matches a finished archive is
+    refused (the receiver logs it and carries on without a live view); the
+    finished store is untouched."""
+    lane, jobs = _lane(tmp_path, psf)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    s = _session(lane, tmp_path, n_t=1, n_c=1)
+    lane.frame_staged("sess", 0, 0)
+    lane.pump()
+    for path, tk in _tickets(jobs):
+        _complete(jobs, path, tk, shape)
+    lane.end_session("sess")
+    assert _pump_until(lane, lambda: "sess" not in lane.sessions)
+    assert w.read_progress(s.archive_store)["state"] == "complete"
+    with pytest.raises(w.ProcessedStoreComplete):
+        _session(lane, tmp_path, n_t=1, n_c=1, sid="again")
+    assert w.read_progress(s.archive_store)["state"] == "complete"
 
 
 def test_receiver_uses_the_zarr_lane_and_stages_no_tiff(tmp_path, psf, monkeypatch):
