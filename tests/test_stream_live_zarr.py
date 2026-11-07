@@ -552,6 +552,38 @@ def test_a_superseding_session_stops_the_old_sessions_archive_copies(tmp_path, p
     assert w.read_progress(new.archive_store)["done"] == []
 
 
+def test_a_resumed_session_follows_tickets_already_queued_or_claimed(tmp_path, psf):
+    """LIVE-09: after a receiver restart the old tickets are still in the
+    queue (or claimed by a server); resume used to queue the same (t, c)
+    again, two servers on one view buffer."""
+    lane, jobs = _lane(tmp_path, psf)
+    _session(lane, tmp_path, n_t=1, n_c=2)
+    lane.frame_staged("sess", 0, 0)
+    lane.frame_staged("sess", 0, 1)
+    lane.pump()
+    first = {tk["parameters"]["c"]: p for p, tk in _tickets(jobs)}
+    assert set(first) == {0, 1}
+    claimed = first[0].with_name(f".active_{first[0].name}")
+    os.replace(first[0], claimed)  # a server has taken (0, 0)
+
+    # The receiver restarts: a new lane, the same session resumed.
+    lane2, _ = _lane(tmp_path, psf)
+    s2 = _session(lane2, tmp_path, n_t=1, n_c=2, resume=True)
+    lane2.frame_staged("sess", 0, 0)
+    lane2.frame_staged("sess", 0, 1)
+    lane2.pump()
+    assert sorted(p.name for p in jobs.joinpath("queue_live").glob("*.json")) == sorted(
+        [claimed.name, first[1].name]
+    )
+    assert set(s2.tickets) == {first[0].name, first[1].name}
+
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)  # and they finish under the new lane
+    os.replace(claimed, first[0])
+    for p in first.values():
+        _complete(jobs, p, json.loads(p.read_text()), shape)
+    assert _pump_until(lane2, lambda: s2.viewed == {(0, 0), (0, 1)})
+
+
 def test_finalize_keeps_the_view_until_a_later_session(tmp_path, psf):
     lane, jobs = _lane(tmp_path, psf)
     s = _session(lane, tmp_path, n_t=1, n_c=1)

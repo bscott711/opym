@@ -468,6 +468,8 @@ class ZarrLiveLane(LiveLane):
         session.ready.sort()
         while session.ready and free > 0:
             t, c = session.ready.pop(0)
+            if any((tk.t, tk.c) == (t, c) for tk in session.tickets.values()):
+                continue  # already out (a volume staged twice)
             self._submit(session, t, c, attempt=1)
             free -= 1
 
@@ -572,7 +574,41 @@ class ZarrLiveLane(LiveLane):
         except OSError as exc:
             logger.warning("Live lane (zarr): no warm-up spec written: %s", exc)
 
+    def _queued_ticket(self, session: ZarrLiveSession, t: int, c: int) -> str | None:
+        """The name of a ticket for this very (t, c) that is already queued or
+        claimed: one a previous receiver process left behind (LIVE-09). A
+        second one would put two servers on the same view buffer and chunks."""
+        queue_dir = lanes.live_queue_dir(self.jobs)
+        want = (str(session.raw_arrays[c]), str(session.buffer(t, c)))
+        try:
+            paths = list(queue_dir.glob("*.json"))  # includes `.active_*` claims
+        except OSError:
+            return None
+        for path in sorted(paths):
+            try:
+                tk = json.loads(path.read_text())
+                p = tk["parameters"]
+                if tk["jobType"] != "live_zarr" or (p["t"], p["c"]) != (t, c):
+                    continue
+                if (p["raw_store"], p["view_npy"]) == want:
+                    return path.name.removeprefix(".active_")
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # not (yet) a readable ticket
+        return None
+
     def _submit(self, session: ZarrLiveSession, t: int, c: int, attempt: int) -> None:
+        queued = self._queued_ticket(session, t, c)
+        if queued is not None:
+            logger.info(
+                "Live lane (zarr): T=%d C=%d of %s already has ticket %s; "
+                "following it instead of queueing another",
+                t,
+                c,
+                session.base_name,
+                queued,
+            )
+            session.tickets[queued] = _ZTicket(queued, t, c, attempt)
+            return
         ticket = submit_live_zarr_job(
             session.raw_arrays[c],
             t,
