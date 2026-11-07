@@ -71,7 +71,7 @@ alpha  = getp(p, 'wiener_alpha', 0.005);
 otfCT  = getp(p, 'otf_cum_thresh', 0.9);
 hann   = getp(p, 'hann_win_bounds', [0.8, 1.0]);
 damp   = getp(p, 'damp_factor', 1);
-dzPSF  = 0.1;                            % the wrapper's default; the 'deskew' branch passes none
+dzPSF  = getp(p, 'dz_psf', 0.1);          % the PSF's own z step; 0.1 is the wrapper's default (PROC-F4)
 interp = char(getp(p, 'interp_method', 'linear'));
 reverse = getp(p, 'reverse', false);
 if getp(p, 'objective_scan', false) || getp(p, 'z_stage_scan', false)

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
+import math
 import os
 import re
 import subprocess
@@ -20,6 +22,8 @@ import ipywidgets as widgets
 from .decon_config import DSR_INTERP_METHOD
 from .roi_utils import _roi_to_tuple, _tuple_to_cli_string
 from .utils import resolve_output_base
+
+_log = logging.getLogger(__name__)
 
 # Constants
 BASE_DIR = Path("/dev/shm/petakit_jobs")
@@ -185,6 +189,57 @@ def _resolve_psf_paths(
     return []
 
 
+# The PSF z step PetaKit5D's XR_decon_data_wrapper (and run_live_*.m, which
+# copy it) assume when a ticket does not say: 0.1 um, which is what the
+# production PSF (20260910_averaged_psf.tif) carries.
+PSF_DZ_DEFAULT_UM = 0.1
+
+
+def resolve_psf_dz(
+    psf_paths: list[str | Path],
+    dz_psf: float | None = None,
+) -> float:
+    """The PSF z step (um) a decon ticket must carry as ``dz_psf`` (PROC-F4).
+
+    PetaKit5D resamples the PSF's dim 3 by ``z_step_um / dz_psf``, so a PSF
+    saved at a different step than the one the MATLAB side assumes is
+    resampled at the wrong ratio with no error. Order of precedence: the
+    explicit ``dz_psf``; else the ImageJ ``spacing`` tag of the PSF files
+    (they must agree, since one ticket carries one value); else
+    ``PSF_DZ_DEFAULT_UM`` with a warning (exactly what the MATLAB side used
+    before tickets carried the field, so output is unchanged).
+    """
+    if dz_psf is not None:
+        dz = float(dz_psf)
+        if not (math.isfinite(dz) and dz > 0):
+            raise ValueError(f"dz_psf must be a positive number of um, not {dz_psf!r}")
+        return dz
+    known = {}
+    for path in psf_paths:
+        value = _read_psf_dz(path)
+        if value is not None:
+            known[str(path)] = value
+    distinct = sorted(set(known.values()))
+    if len(distinct) > 1 and not all(
+        math.isclose(v, distinct[0], rel_tol=1e-6) for v in distinct
+    ):
+        raise ValueError(
+            "The PSFs of one ticket disagree on their z step "
+            f"(ImageJ 'spacing'): {known}. A ticket carries one dz_psf; "
+            "resample them to a common step or submit them separately."
+        )
+    if distinct:
+        return distinct[0]
+    _log.warning(
+        "No ImageJ 'spacing' tag in %s; sending dz_psf=%s um (the PSF step "
+        "the MATLAB side has always assumed). Re-save the PSF with "
+        "psf_tools.extract_bead_psf, or pass dz_psf, to make it explicit.",
+        [str(p) for p in psf_paths],
+        PSF_DZ_DEFAULT_UM,
+    )
+    return PSF_DZ_DEFAULT_UM
+
+
 def submit_remote_crop_job(
     base_file: Path,
     top_roi: tuple[slice, slice] | None,
@@ -283,6 +338,7 @@ def submit_remote_deskew_job(
     damp_factor: float | None = None,
     save_mip: bool = False,
     zarr_input: bool = False,
+    dz_psf: float | None = None,
 ) -> Path:
     """
     Creates a JSON job ticket for Deskew/Rotate and optional Deconvolution.
@@ -355,6 +411,11 @@ def submit_remote_deskew_job(
         ticket's `zarr_input` field; `run_petakit_server.m` maps it to
         `zarrFile` for whichever stage actually reads the original raw
         input.
+    dz_psf : float, optional
+        The PSF's own z step (um), sent in the ticket when a PSF is given and
+        forwarded by the server to XR_decon_data_wrapper's ``dzPSF``. Left
+        None it is read from the PSF's ImageJ ``spacing`` tag (see
+        `resolve_psf_dz`; PROC-F4).
     """
     _ensure_directories(queue_dir)
     input_target = Path(input_target).resolve()
@@ -449,6 +510,7 @@ def submit_remote_deskew_job(
         )
         params["rl_method"] = rl_method
         params["gpu_decon"] = gpu_decon
+        params["dz_psf"] = resolve_psf_dz(resolved_psfs, dz_psf)
         if background is not None:
             params["background"] = float(background)
         if edge_erosion is not None:
@@ -495,6 +557,7 @@ def live_zarr_parameters(
     view_npy: str | Path | None = None,
     psf_cache_dir: str | Path | None = None,
     view_bits: int = 16,
+    dz_psf: float | None = None,
 ) -> dict:
     """The parameters of a 'live_zarr' ticket: one (t, c) volume from its raw
     OME-Zarr array (`raw_store`, (T, Z, Y, X)) through decon -> deskew/rotate
@@ -538,6 +601,7 @@ def live_zarr_parameters(
         if n_iters is not None
         else (2 if rl_method == "omw" else 25),
         "gpu_decon": gpu_decon,
+        "dz_psf": resolve_psf_dz([psf_path], dz_psf),
     }
     if view_npy is not None:
         params["view_npy"] = str(view_npy)
@@ -603,6 +667,7 @@ def submit_live_frames_job(
     hann_win_bounds: list[float] | None = None,
     damp_factor: float | None = None,
     keep_decon: bool = False,
+    dz_psf: float | None = None,
 ) -> Path:
     """Queue a 'live' ticket: decon -> deskew/rotate of `frames` (staged
     (y, x, z) TIFFs, see `opym.utils.write_decon_staged_tiff`) through the
@@ -641,6 +706,7 @@ def submit_live_frames_job(
         if n_iters is not None
         else (2 if rl_method == "omw" else 25),
         "gpu_decon": gpu_decon,
+        "dz_psf": resolve_psf_dz(psfs, dz_psf),
     }
     if background is not None:
         params["background"] = float(background)
