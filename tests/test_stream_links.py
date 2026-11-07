@@ -632,3 +632,36 @@ def test_a_session_closed_as_idle_is_not_resumed(tmp_path):
     finally:
         sock.close()
         recv.close()
+
+
+def test_a_drained_session_the_live_lane_still_reads_is_not_evicted(
+    tmp_path, recv, monkeypatch
+):
+    """LIVE-04 / ING-F8: RAM-disk pressure and a new session taking over the
+    name both evict drained copies; neither may touch the one a live ticket
+    is reading."""
+    raw, stage = tmp_path / "raw", tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    _stream_and_drain(recv, raw, stage, [(0, 0)], reason="idle_timeout")
+    assert _wait_until(lambda: "sess-stage" in recv._drain_pool._drained)
+    staged = _store(stage / _stage_namespace(raw))
+
+    class _Lane:
+        sessions = {"sess-stage": object()}
+
+        def pump(self):
+            pass
+
+        def close(self):
+            pass
+
+    recv._live = _Lane()
+    try:
+        assert recv._free_stage_space(stage, 10**15) >= 0
+        recv._drain_pool.release([staged])
+        assert staged.exists()
+        _Lane.sessions.clear()  # the lane finished the session
+        recv._drain_pool.release([staged])
+        assert not staged.exists()
+    finally:
+        recv._live = None

@@ -36,7 +36,7 @@ import queue
 import shutil
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +62,16 @@ DEFAULT_DRAIN_WORKERS = 4
 DEFAULT_RETRY_INITIAL_S = 60.0
 DEFAULT_RETRY_MAX_S = 900.0
 PENDING_DIR_NAME = "pending"
+
+
+class _Everything:
+    """A stand-in set that contains any session id."""
+
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+_EVERYTHING = _Everything()
 
 
 @dataclass
@@ -112,6 +122,7 @@ class DrainPool:
         retry_initial_s: float = DEFAULT_RETRY_INITIAL_S,
         retry_max_s: float = DEFAULT_RETRY_MAX_S,
         on_state: Callable[[DrainJob, str, str], None] | None = None,
+        protected: Callable[[], Collection[str]] | None = None,
     ) -> None:
         """`manifest_dir` (the receiver passes `<stage root>/.drain_manifests`)
         makes retention survive a restart: each drained session is recorded
@@ -125,7 +136,21 @@ class DrainPool:
 
         `on_state(job, state, detail)` is called from a drain thread with state
         "failed" (detail: the error) after each failed attempt, and "drained"
-        once a job lands. It must not raise (the pool guards it anyway)."""
+        once a job lands. It must not raise (the pool guards it anyway).
+
+        `protected()` returns the ids of sessions whose staging copies are
+        still being read (the receiver passes the live lane's running
+        sessions): none of them is evicted, by retention, the high-water mark,
+        `free_up` or `release`, until it is no longer listed. A missing raw
+        chunk reads as zeros, so a ticket whose input was evicted "succeeds"
+        with a blank volume (LIVE-04, ING-F8). If it raises, nothing is
+        evicted."""
+        self._protected = protected
+        # Held while sessions are claimed for eviction and evicted, and by
+        # `reclaim`: a resumed session's staging copy is either taken back
+        # before an eviction claims it, or already gone (and the resume falls
+        # back to the GPFS copy), never removed under its writer.
+        self._evict_lock = threading.Lock()
         self._retry_initial_s = retry_initial_s
         self._retry_max_s = retry_max_s
         self._on_state = on_state
@@ -320,41 +345,47 @@ class DrainPool:
         `_drained` and is left alone -- the caller treats it as taken.
         """
         wanted = {Path(p) for p in stage_paths}
-        with self._lock:
-            hits = [
-                (sid, e)
-                for sid, e in self._drained.items()
-                if wanted & set(e.stage_dirs)
-            ]
-            for sid, _ in hits:
-                del self._drained[sid]
-        for sid, entry in hits:
-            self._evict(sid, entry)
+        with self._evict_lock:
+            keep = self._protected_ids()
+            with self._lock:
+                hits = [
+                    (sid, e)
+                    for sid, e in self._drained.items()
+                    if wanted & set(e.stage_dirs) and sid not in keep
+                ]
+                for sid, _ in hits:
+                    del self._drained[sid]
+            for sid, entry in hits:
+                self._evict(sid, entry)
 
     def free_up(self, bytes_wanted: int) -> int:
         """Evicts drained sessions, oldest first, until `bytes_wanted` are
         freed or none is left; returns the bytes freed. For when the RAM
         disk runs short before retention expires: each one is already safe
         on GPFS (or, if paused, its full local save is sent there afterwards)."""
-        with self._lock:
-            picked: list[tuple[str, _DrainedEntry]] = []
-            freed = 0
-            for sid, entry in sorted(
-                self._drained.items(), key=lambda kv: kv[1].drained_at
-            ):
-                if freed >= bytes_wanted:
-                    break
-                picked.append((sid, entry))
-                freed += entry.size_bytes
-            for sid, _ in picked:
-                del self._drained[sid]
-        for sid, entry in picked:
-            logger.info(
-                "RAM disk short: evicting drained session %s early (%.1f GB)",
-                sid,
-                entry.size_bytes / 1e9,
-            )
-            self._evict(sid, entry)
+        with self._evict_lock:
+            keep = self._protected_ids()
+            with self._lock:
+                picked: list[tuple[str, _DrainedEntry]] = []
+                freed = 0
+                for sid, entry in sorted(
+                    self._drained.items(), key=lambda kv: kv[1].drained_at
+                ):
+                    if freed >= bytes_wanted:
+                        break
+                    if sid in keep:
+                        continue
+                    picked.append((sid, entry))
+                    freed += entry.size_bytes
+                for sid, _ in picked:
+                    del self._drained[sid]
+            for sid, entry in picked:
+                logger.info(
+                    "RAM disk short: evicting drained session %s early (%.1f GB)",
+                    sid,
+                    entry.size_bytes / 1e9,
+                )
+                self._evict(sid, entry)
         return freed
 
     def retain(self, session_id: str, stage_paths: list[Path]) -> None:
@@ -378,7 +409,7 @@ class DrainPool:
         the receiver's idle timeout) keeps writing into its old staging copy,
         which must not be evicted under it. Its next drain re-registers it."""
         wanted = {Path(p) for p in stage_paths}
-        with self._lock:
+        with self._evict_lock, self._lock:
             hits = [
                 sid for sid, e in self._drained.items() if wanted & set(e.stage_dirs)
             ]
@@ -390,14 +421,27 @@ class DrainPool:
                 path.unlink(missing_ok=True)
 
     def _sweep_retention(self) -> None:
+        # One sweep at a time, and never while `reclaim`, `release` or
+        # `free_up` holds the lock: an idle worker just tries again next second.
+        if not self._evict_lock.acquire(blocking=False):
+            return
+        try:
+            self._sweep_locked()
+        finally:
+            self._evict_lock.release()
+
+    def _sweep_locked(self) -> None:
         now = time.monotonic()
         to_evict: list[tuple[str, _DrainedEntry]] = []
+        keep = self._protected_ids()
         with self._lock:
             total = sum(e.size_bytes for e in self._drained.values())
             over_budget = total > self._high_water_bytes
             for session_id, entry in sorted(
                 self._drained.items(), key=lambda kv: kv[1].drained_at
             ):
+                if session_id in keep:
+                    continue
                 age = now - entry.drained_at
                 if age >= self._retention_s or over_budget:
                     to_evict.append((session_id, entry))
@@ -419,6 +463,17 @@ class DrainPool:
                 "and/or downstream processing is falling behind ingest",
                 self._high_water_bytes / 1e9,
             )
+
+    def _protected_ids(self) -> Collection[str] | _Everything:
+        """Sessions not to evict now (see `protected`). If asking fails,
+        everything is kept: an eviction can wait, a blank volume cannot."""
+        if self._protected is None:
+            return ()
+        try:
+            return set(self._protected())
+        except Exception:
+            logger.exception("Drain: could not list the sessions in use; evicting none")
+            return _EVERYTHING
 
     def _evict(self, session_id: str, entry: _DrainedEntry) -> None:
         failed = False

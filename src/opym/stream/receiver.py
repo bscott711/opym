@@ -600,12 +600,18 @@ class StreamReceiver:
         # needing the receiver process restarted -- mirrors `_decon_enabled`
         # being read fresh per SESSION_START rather than cached at startup.
         stage_root = _stage_root_from_env()
+        # Created on the first live session (see _maybe_start_live), so the
+        # env switches stay readable per session like the others here. Set
+        # before the drain pool starts: its threads ask which sessions the
+        # lane is still reading (LIVE-04, ING-F8).
+        self._live: LiveLane | None = None
         self._drain_pool = drain.DrainPool(
             num_workers=drain_workers,
             retention_s=drain_retention_s,
             high_water_bytes=drain_high_water_bytes,
             manifest_dir=stage_root / ".drain_manifests" if stage_root else None,
             on_state=self._drain_state,
+            protected=self._running_live_sessions,
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
@@ -613,9 +619,6 @@ class StreamReceiver:
         self._stage_short = False
         self._last_short_warning = float("-inf")
         self._freeing: threading.Thread | None = None
-        # Created on the first live session (see _maybe_start_live), so the
-        # env switches stay readable per session like the others here.
-        self._live: LiveLane | None = None
 
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
