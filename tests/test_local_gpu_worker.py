@@ -821,3 +821,69 @@ def test_reclaiming_orphans_does_not_count_against_the_requeue_cap(tmp_path):
     assert not list((sup.base_dir / "failed").glob("bf.json"))
     ticket = json.loads((sup.queue_dir / ".active_bf.json").read_text())
     assert ticket.get("requeueCount", 0) == 0
+
+
+# --- BF-07: a surviving MATLAB is killed before the ticket is requeued --------
+
+
+def _survivor(sup, server_id="1"):
+    """A process that carries the server's PETAKIT_SERVER_ID and jobs dir, like
+    MATLAB after its `bash -c` wrapper died."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "PETAKIT_JOBS_DIR"}
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=env | {"PETAKIT_SERVER_ID": server_id, "PETAKIT_JOBS_DIR": str(sup.base_dir)},
+    )
+
+
+def test_a_matlab_that_outlives_its_wrapper_is_killed_before_the_requeue(tmp_path):
+    """BF-07: `_on_exit` trusted the wrapper. The ticket was requeued, a second
+    server started, and the partial sweep deleted the live process's outputs."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_a.json", data_dir=data)
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "bf_a.json")
+    survivor = _survivor(sup, "1")
+    try:
+        assert local_gpu_worker._server_pids("1", sup.base_dir) == [survivor.pid]
+        procs["1"].exit(1)  # the wrapper is gone, MATLAB is not
+        sup.tick()
+        assert survivor.wait(timeout=30) in (-15, -9)
+        assert (sup.queue_dir / "bf_a.json").exists()
+        assert not [p for p in data.rglob("*") if UUID in p.name]
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+
+def test_a_leftover_process_is_killed_before_the_server_is_launched_again(tmp_path):
+    sup, _, _ = _make_supervisor(tmp_path)
+    survivor = _survivor(sup, "1")
+    try:
+        _ticket(sup.queue_dir, "bf_a.json")
+        sup.tick()  # would launch server 1
+        assert survivor.wait(timeout=30) in (-15, -9)
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+
+def test_another_servers_process_is_not_killed_with_a_dead_one(tmp_path):
+    """Control for BF-07: only the dead slot's own id is swept."""
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_a.json")
+    sup.tick()
+    procs = dict(launched)
+    other = _survivor(sup, "2")
+    try:
+        procs["1"].exit(1)
+        sup.tick()
+        assert other.poll() is None
+    finally:
+        other.kill()
+        other.wait()

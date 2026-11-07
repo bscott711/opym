@@ -435,6 +435,7 @@ class ServerSupervisor:
         ):
             for slot in self.slots:
                 if slot.proc is None and now >= slot.next_launch_at:
+                    self._kill_leftovers(slot)
                     print(
                         f"🚀 Launching server {slot.server_id} "
                         f"on GPU {slot.cuda_device}...",
@@ -466,6 +467,9 @@ class ServerSupervisor:
         slot.last_exit_code = rc
         slot.idle_s = None
         slot.hang_flagged_ticket = None
+        # Before the ticket goes back (and its partial outputs go): the exit of
+        # the `bash -c` wrapper does not mean MATLAB is gone.
+        self._kill_leftovers(slot)
         if slot.preempting:
             # Our own kill, to hand the GPU to live work: not a failure, so no
             # backoff, and the backfill ticket's requeue doesn't count.
@@ -511,6 +515,23 @@ class ServerSupervisor:
             "other servers are unaffected.",
             flush=True,
         )
+
+    def _kill_leftovers(self, slot: ServerSlot) -> None:
+        """Kill whatever still carries this slot's PETAKIT_SERVER_ID although
+        the server it belongs to is gone (MATLAB or a parpool worker that
+        outlived the wrapper). Left running, it would write into a dataDir the
+        requeue is about to sweep and fight the next server for the GPU."""
+        if slot.proc is not None and slot.proc.poll() is None:
+            return
+        pids = _server_pids(slot.server_id, self.base_dir)
+        if not pids:
+            return
+        print(
+            f"🔪 Server {slot.server_id}: {len(pids)} process(es) outlived it "
+            f"(pids {', '.join(map(str, sorted(pids)[:5]))}); killing them.",
+            flush=True,
+        )
+        self._kill(slot)
 
     def _claim_path(self, slot: ServerSlot) -> Path:
         return self.claims_dir / f"S{slot.server_id}.json"
