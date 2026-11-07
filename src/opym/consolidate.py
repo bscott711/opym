@@ -79,12 +79,17 @@ def consolidate_to_ome_zarr(
         print(f"[consolidate] No matching zarrs in {decon_dir} for '{base_name}'")
         return False
 
-    all_t = sorted({t for t, _ in entries})
-    all_c = sorted({c for _, c in entries})
+    # The array index of a frame is its T (and C) number, not its rank among
+    # the entries present: a missing timepoint leaves a blank frame (the zarr
+    # fill value) instead of closing the gap and shifting every later frame
+    # onto the wrong time.
+    all_t = list(range(max(t for t, _ in entries) + 1))
+    all_c = list(range(max(c for _, c in entries) + 1))
     num_t, num_c = len(all_t), len(all_c)
 
     # Read source .zarray to get exact dtype/compressor/chunks — no transcoding
-    first_path = next(iter(entries.values()))
+    ref_t, ref_c = min(entries)
+    first_path = entries[(ref_t, ref_c)]
     zarray_src_path = first_path / ".zarray"
     if not zarray_src_path.exists():
         print(f"[consolidate] ERROR: {zarray_src_path} not found — invalid zarr array")
@@ -107,8 +112,8 @@ def consolidate_to_ome_zarr(
         if not (shape_ok and dtype_ok):
             raise ValueError(
                 f"Shape/dtype mismatch in {decon_dir}: T={t} C={c} is "
-                f"{entry_meta['shape']} {entry_meta['dtype']} but T={all_t[0]} "
-                f"C={all_c[0]} (the reference entry) is {spatial_shape} "
+                f"{entry_meta['shape']} {entry_meta['dtype']} but T={ref_t} "
+                f"C={ref_c} (the reference entry) is {spatial_shape} "
                 f"{src_meta['dtype']}. Every channel is expected to produce "
                 f"same-sized volumes — refusing to consolidate a mismatched set."
             )
@@ -147,7 +152,7 @@ def consolidate_to_ome_zarr(
 
     n_linked = 0
     use_symlinks = False
-    for t_idx, t in enumerate(all_t):
+    for t_idx, t in enumerate(all_t):  # == t: the list is range(max_t + 1)
         for c_idx, c in enumerate(all_c):
             if (t, c) not in entries:
                 print(f"[consolidate]   WARNING: missing T={t} C={c}")
@@ -297,9 +302,17 @@ def run_pending_consolidations(base_dir: Path) -> int:
 
         elapsed = time.time() - start
         if success:
-            sidecar.unlink(missing_ok=True)
             n_consolidated += 1
-            print(f"[consolidate] {data_dir.name}: done in {elapsed:.1f}s")
+            if missing:
+                # The store holds blank frames for the gaps: keep the sidecar
+                # so the next pass links the frames that arrive later.
+                print(
+                    f"[consolidate] {data_dir.name}: done in {elapsed:.1f}s; "
+                    f"keeping the sidecar for {len(missing)} missing zarr(s)"
+                )
+            else:
+                sidecar.unlink(missing_ok=True)
+                print(f"[consolidate] {data_dir.name}: done in {elapsed:.1f}s")
         else:
             print(f"[consolidate] {data_dir.name}: failed after {elapsed:.1f}s")
 
