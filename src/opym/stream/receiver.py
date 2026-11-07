@@ -130,8 +130,8 @@ Client log: a client that sees "client_log" sends its own stream log
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
 holds). The partial copy is kept on staging for the usual retention but
-never copied to raw_root, so the run's full local save can be sent there by
-Globus instead.
+never copied to raw_root, so the run's full local save can be sent there
+afterwards (`opym-backfill-send`) instead.
 """
 
 from __future__ import annotations
@@ -142,6 +142,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -388,6 +389,24 @@ class _StageShort(ValueError):
     once a drain frees space. Other rejections stay silent."""
 
 
+def _check_raw_root_writable(raw_root: Path) -> None:
+    """OSError unless a file can be created in `raw_root` (made if missing).
+    Checked at SESSION_START, whether or not staging is on: with staging the
+    drain would otherwise find out only at the end of the run, after the
+    client had been told its data is safe (ING-F4). The SESSION_START is then
+    answered "rejected" and the client retries."""
+    try:
+        raw_root.mkdir(parents=True, exist_ok=True)
+        fd, probe = tempfile.mkstemp(prefix=".opym_write_check_", dir=raw_root)
+    except OSError as exc:
+        raise OSError(f"raw_root {raw_root} is not writable: {exc}") from exc
+    os.close(fd)
+    try:
+        os.unlink(probe)
+    except OSError:
+        logger.warning("Could not remove the write-check file %s", probe)
+
+
 def _check_session_numbers(header: dict[str, Any], channels: list[Any]) -> None:
     """SESSION_START's declared counts and shape, in range (ValueError if not),
     before any of them sizes a path, an array or a RAM-disk estimate."""
@@ -586,6 +605,7 @@ class StreamReceiver:
             retention_s=drain_retention_s,
             high_water_bytes=drain_high_water_bytes,
             manifest_dir=stage_root / ".drain_manifests" if stage_root else None,
+            on_state=self._drain_state,
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
@@ -668,9 +688,8 @@ class StreamReceiver:
             self._direct_ctx.term()
         # Deliberately not draining the queue first: shutdown must not block
         # on GPFS copies. Any not-yet-drained session's staging copy stays
-        # on /dev/shm, untouched, and a restarted receiver process re-drains
-        # it once it's told to (not automatic today -- see drain.py's
-        # `_drain_one` docstring, same v1 scope as the RESUME design).
+        # on /dev/shm, untouched, and its pending record (see drain.py) makes
+        # the next receiver process drain it on start.
         self._drain_pool.stop()
 
     def __enter__(self) -> StreamReceiver:
@@ -980,6 +999,7 @@ class StreamReceiver:
                     f"({', '.join(map(str, self.raw_roots))}), which is all "
                     "the direct endpoint may write to"
                 )
+            _check_raw_root_writable(raw_root)
             base_name = rawmirror.check_path_component(header["base_name"], "base_name")
             channels = list(header["channels"])
             channel_names = list(header.get("channel_names") or [])
@@ -2050,7 +2070,11 @@ class StreamReceiver:
                 # loop, so a slow/loaded GPFS write can never delay ingest
                 # for the NEXT session.
                 self._drain_pool.enqueue(
-                    drain.DrainJob(session_id=session.session_id, items=items)
+                    drain.DrainJob(
+                        session_id=session.session_id,
+                        items=items,
+                        status_leaf=session.dest_leaf_dir,
+                    )
                 )
                 logger.info(
                     "Session %s: queued %d item(s) for drain to %s",
@@ -2103,13 +2127,14 @@ class StreamReceiver:
 
     def _retain_paused(self, session: SessionState) -> None:
         """The client gave up streaming this run mid-way (SESSION_END reason
-        "paused"): its full local save goes to Argus by Globus, into the
-        same raw_root, so the partial streamed copy must not land there."""
+        "paused"): its full local save is sent to Argus afterwards
+        (`opym-backfill-send`), into the same raw_root, so the partial
+        streamed copy must not land there."""
         if session.write_root == session.raw_root:
             logger.error(
                 "Session %s was PAUSED by the client after %d (t,c) pair(s); "
                 "staging is off, so its partial raw copy is already in %s -- "
-                "remove it before sending the run by Globus",
+                "remove it before re-sending the run with opym-backfill-send",
                 session.session_id,
                 len(session.received_pairs),
                 session.dest_leaf_dir,
@@ -2120,7 +2145,8 @@ class StreamReceiver:
         logger.error(
             "Session %s was PAUSED by the client (link down longer than its "
             "buffer) after %d of %d (t,c) pair(s): the partial copy stays on "
-            "staging and is NOT copied to %s -- send this run by Globus",
+            "staging and is NOT copied to %s -- re-send this run with "
+            "opym-backfill-send",
             session.session_id,
             len(session.received_pairs),
             session.num_timepoints * len(session.channels),
@@ -2280,6 +2306,26 @@ class StreamReceiver:
         self._closed_status[session.session_id] = path
         _write_status_async(path, record)
 
+    def _drain_state(self, job: drain.DrainJob, state: str, detail: str) -> None:
+        """The drain pool's report on one session's copy to GPFS (called on a
+        drain thread): put it in the run's `stream_status.json` as `drain`, so
+        a run that ended "complete" but never reached GPFS says so. Best
+        effort; every failed attempt writes it again."""
+        if job.status_leaf is None:
+            return
+        try:
+            record = outcome.read_status(job.status_leaf) or {}
+            record["drain"] = {"state": state, "detail": detail, "at": time.time()}
+            outcome.write_status(job.status_leaf, record)
+        except OSError:
+            logger.warning(
+                "Could not record the drain state (%s) of session %s in %s",
+                state,
+                job.session_id,
+                job.status_leaf,
+                exc_info=True,
+            )
+
     def _late_session_end(self, session_id: str, header: dict[str, Any]) -> None:
         """A SESSION_END for a session already closed here: log what the
         client says, and add it to the run's stream_status.json."""
@@ -2338,6 +2384,7 @@ class StreamReceiver:
             "sessions": sessions,
             "recent_ends": self._recent_ends,
             "errors": dict(self.errors),
+            "drain": self._drain_pool.status(),
         }
         try:
             path = outcome.health_path()

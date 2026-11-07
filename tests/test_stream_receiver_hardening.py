@@ -588,3 +588,141 @@ def test_the_direct_endpoint_refuses_a_dotdot_escape_from_its_allowlist(tmp_path
         sock.close()
     finally:
         recv.close()
+
+
+# --- ING-F4: raw_root is checked, a failed drain is visible and retried --------
+
+
+def _stage_env(monkeypatch, tmp_path):
+    stage = tmp_path / "stage"
+    monkeypatch.setenv("OPYM_STREAM_STAGE_ROOT", str(stage))
+    return stage
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permissions",
+)
+@pytest.mark.parametrize("staging", [True, False])
+def test_a_raw_root_that_cannot_be_written_is_rejected_at_session_start(
+    tmp_path, make_recv, monkeypatch, staging
+):
+    if staging:
+        _stage_env(monkeypatch, tmp_path)
+    recv = make_recv()
+    dealer = _dealer_factory(recv)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o555)
+    try:
+        sock = dealer()
+        ack = _start(recv, sock, _header(ro))
+        assert ack is not None and ack["unknown_session"]
+        assert "not writable" in ack["rejected"] and str(ro) in ack["rejected"]
+        assert SID not in recv.sessions
+        sock.close()
+    finally:
+        ro.chmod(0o755)
+
+
+def test_the_write_check_leaves_nothing_behind_and_creates_a_missing_root(
+    tmp_path, recv, dealer
+):
+    raw = tmp_path / "new" / "raw"
+    sock = dealer()
+    assert _start(recv, sock, _header(raw)) is not None
+    assert SID in recv.sessions
+    assert not [p for p in raw.iterdir() if p.name.startswith(".opym_write_check_")]
+
+
+def _break_copytree(monkeypatch):
+    import opym.stream.drain as drain_mod
+
+    state = {"fail": True}
+    real = drain_mod.shutil.copytree
+
+    def _flaky(*args, **kwargs):
+        if state["fail"]:
+            raise OSError(28, "No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(drain_mod.shutil, "copytree", _flaky)
+    return state
+
+
+def _stream_one_volume_and_end(recv, sock, raw):
+    assert _start(recv, sock, _header(raw, num_timepoints=1)) is not None
+    _send(recv, sock, MSG_FRAME, *_frame(0, 0))
+    _send(recv, sock, MSG_SESSION_END, {"reason": "complete"})
+
+
+def test_a_failed_drain_shows_in_the_health_and_status_files_and_is_retried(
+    tmp_path, make_recv, monkeypatch
+):
+    _stage_env(monkeypatch, tmp_path)
+    state = _break_copytree(monkeypatch)
+    recv = make_recv()
+    recv._drain_pool._retry_initial_s = recv._drain_pool._retry_max_s = 0.1
+    raw = tmp_path / "raw"
+    sock = _dealer_factory(recv)()
+    _stream_one_volume_and_end(recv, sock, raw)
+
+    assert _wait_until(lambda: SID in recv._drain_pool.status()["failed"])
+    status = outcome.read_status(raw / "Cell_040")
+    assert status["drain"]["state"] == "failed"
+    assert "No space left" in status["drain"]["detail"]
+    assert status["outcome"]  # the run's own end record is still there
+    recv._write_health()
+    health = outcome.read_health()
+    assert health["drain"]["failed"][SID]["attempts"] >= 1
+    assert not _store(raw).exists()
+
+    state["fail"] = False  # the disk has room again
+    assert _wait_until(lambda: _store(raw).exists())
+    assert _wait_until(lambda: recv._drain_pool.status()["failed"] == {})
+    assert _wait_until(
+        lambda: (
+            (outcome.read_status(raw / "Cell_040") or {}).get("drain", {}).get("state")
+            == "drained"
+        )
+    )
+    arr = zarr.open(str(_store(raw) / "p0"), mode="r")
+    np.testing.assert_array_equal(np.asarray(arr[0]), _volume(0))
+
+
+def test_a_restarted_receiver_drains_what_the_old_one_never_finished(
+    tmp_path, make_recv, monkeypatch
+):
+    _stage_env(monkeypatch, tmp_path)
+    state = _break_copytree(monkeypatch)  # the first process cannot reach GPFS
+    first = make_recv()
+    raw = tmp_path / "raw"
+    sock = _dealer_factory(first)()
+    _stream_one_volume_and_end(first, sock, raw)
+    assert _wait_until(lambda: SID in first._drain_pool.status()["failed"])
+    sock.close()
+    first.close()  # the receiver restarts; the client already has `ended`
+    assert not _store(raw).exists()
+
+    state["fail"] = False  # GPFS is back
+    second = make_recv()
+    assert _wait_until(lambda: _store(raw).exists())
+    arr = zarr.open(str(_store(raw) / "p0"), mode="r")
+    np.testing.assert_array_equal(np.asarray(arr[0]), _volume(0))
+    assert _wait_until(
+        lambda: (
+            not (
+                tmp_path / "stage" / ".drain_manifests" / "pending" / f"{SID}.json"
+            ).exists()
+        )
+    )
+    second.close()

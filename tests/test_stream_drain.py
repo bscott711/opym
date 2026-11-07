@@ -234,3 +234,172 @@ def test_free_up_evicts_drained_sessions_oldest_first_until_enough(tmp_path):
         assert pool.free_up(1) == 0  # nothing left to evict
     finally:
         pool.stop()
+
+
+# --- ING-F4: a failed drain is retried, and a restart does not forget it -------
+
+
+def _fail_copytree(monkeypatch, times):
+    """Make the first `times` copytree calls fail like a full or flaky GPFS."""
+    import opym.stream.drain as drain_mod
+
+    real = drain_mod.shutil.copytree
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= times:
+            raise OSError(28, "No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(drain_mod.shutil, "copytree", _flaky)
+    return calls
+
+
+def test_a_failed_drain_is_retried_until_it_lands(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage" / "sample_C0.ome.zarr"
+    dest_dir = tmp_path / "raw" / "sample_C0.ome.zarr"
+    manifests = tmp_path / "stage" / ".drain_manifests"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+    calls = _fail_copytree(monkeypatch, times=2)
+    events = []
+
+    pool = DrainPool(
+        num_workers=1,
+        retention_s=9999,
+        high_water_bytes=10**12,
+        manifest_dir=manifests,
+        retry_initial_s=0.05,
+        retry_max_s=0.1,
+        on_state=lambda job, state, detail: events.append((state, detail)),
+    )
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-retry", [(stage_dir, dest_dir)]))
+        assert _wait_until(lambda: (dest_dir / "a.bin").exists())
+        assert (dest_dir / "a.bin").read_bytes() == b"hello"
+        assert calls["n"] == 3
+        assert _wait_until(lambda: pool.status()["failed"] == {})
+        assert [e[0] for e in events] == ["failed", "failed", "drained"]
+        assert "No space left" in events[0][1]
+        # landed: its pending record is gone, its retention record is there
+        assert _wait_until(
+            lambda: not (manifests / "pending" / "sess-retry.json").exists()
+        )
+        assert (manifests / "sess-retry.json").exists()
+    finally:
+        pool.stop()
+    assert stage_dir.exists()  # staging copy untouched throughout
+
+
+def test_a_drain_that_keeps_failing_says_so(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage" / "sample_C0.ome.zarr"
+    dest_dir = tmp_path / "raw" / "sample_C0.ome.zarr"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+    _fail_copytree(monkeypatch, times=10**6)
+
+    pool = DrainPool(
+        num_workers=1,
+        retention_s=9999,
+        high_water_bytes=10**12,
+        retry_initial_s=0.05,
+        retry_max_s=0.05,
+    )
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-bad", [(stage_dir, dest_dir)]))
+        assert _wait_until(
+            lambda: pool.status()["failed"].get("sess-bad", {}).get("attempts", 0) >= 3
+        )
+        info = pool.status()["failed"]["sess-bad"]
+        assert "No space left" in info["error"]
+        assert not dest_dir.exists()
+        assert (stage_dir / "a.bin").read_bytes() == b"hello"
+    finally:
+        pool.stop()
+
+
+def test_a_queued_drain_survives_a_restart(tmp_path):
+    """The receiver told the client `ended` and then restarted before the drain
+    ran: the only copy is on the RAM disk, and the new process must drain it."""
+    stage_dir = tmp_path / "stage" / "sample_C0.ome.zarr"
+    dest_dir = tmp_path / "raw" / "sample_C0.ome.zarr"
+    manifests = tmp_path / "stage" / ".drain_manifests"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+
+    first = DrainPool(manifest_dir=manifests)  # never started: nothing drains
+    first.enqueue(
+        DrainJob("sess-q", [(stage_dir, dest_dir)], status_leaf=tmp_path / "raw")
+    )
+    assert (manifests / "pending" / "sess-q.json").exists()
+    assert not dest_dir.exists()
+
+    events = []
+    second = DrainPool(
+        num_workers=1,
+        retention_s=9999,
+        high_water_bytes=10**12,
+        manifest_dir=manifests,
+        on_state=lambda job, state, detail: events.append((job.status_leaf, state)),
+    )
+    second.start()
+    try:
+        assert _wait_until(lambda: (dest_dir / "a.bin").exists())
+        assert _wait_until(lambda: not (manifests / "pending" / "sess-q.json").exists())
+        assert events == [(tmp_path / "raw", "drained")]
+    finally:
+        second.stop()
+
+
+def test_a_pending_drain_whose_staging_copy_is_gone_is_reported_not_retried(tmp_path):
+    stage_dir = tmp_path / "stage" / "sample_C0.ome.zarr"
+    dest_dir = tmp_path / "raw" / "sample_C0.ome.zarr"
+    manifests = tmp_path / "stage" / ".drain_manifests"
+    _make_tree(stage_dir, {"a.bin": b"hello"})
+    first = DrainPool(manifest_dir=manifests)
+    first.enqueue(DrainJob("sess-gone", [(stage_dir, dest_dir)]))
+    import shutil
+
+    shutil.rmtree(stage_dir)  # the reboot wiped the RAM disk
+
+    events = []
+    second = DrainPool(
+        num_workers=1,
+        manifest_dir=manifests,
+        on_state=lambda job, state, detail: events.append((state, detail)),
+    )
+    second.start()
+    try:
+        assert [e[0] for e in events] == ["failed"]
+        assert "staging copy gone" in events[0][1]
+        assert "sess-gone" in second.status()["failed"]
+        assert not (manifests / "pending" / "sess-gone.json").exists()
+        assert second.pending_count == 0 and not dest_dir.exists()
+    finally:
+        second.stop()
+
+
+def test_a_newer_job_for_a_session_replaces_its_waiting_retry(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage" / "s"
+    dest_dir = tmp_path / "raw" / "s"
+    _make_tree(stage_dir, {"a.bin": b"x"})
+    _fail_copytree(monkeypatch, times=1)
+    pool = DrainPool(num_workers=1, retry_initial_s=3600, retry_max_s=3600)
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-r", [(stage_dir, dest_dir)]))
+        assert _wait_until(lambda: pool.status()["retrying"] == 1)
+        pool.enqueue(DrainJob("sess-r", [(stage_dir, dest_dir)]))
+        assert pool.status()["retrying"] == 0
+        assert _wait_until(lambda: (dest_dir / "a.bin").exists())
+    finally:
+        pool.stop()
+
+
+def test_an_unsafe_session_id_never_names_a_manifest(tmp_path):
+    stage_dir = tmp_path / "stage" / "s"
+    manifests = tmp_path / "stage" / ".drain_manifests"
+    _make_tree(stage_dir, {"a.bin": b"x"})
+    pool = DrainPool(manifest_dir=manifests)
+    pool.enqueue(DrainJob("../../escape", [(stage_dir, tmp_path / "raw" / "s")]))
+    assert not list(tmp_path.rglob("escape*"))
