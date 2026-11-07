@@ -7,12 +7,60 @@ change behaviour).
 
 ## [Unreleased]
 
+The 2026-11 run that made opym the source of truth for the contracts other repos had copied by hand (PRs #79 to #89). Consumers
+now `import opym...` and pin it by SHA; the mirrors are deleted. No version bump and no tag yet.
+
 ### Added
-- `opym.timeline`: `times_from_arrays`, `record_from_arrays`, `time_record`, `combine_stores`, public `known_time` and a
-  `reader=` hook on `read_raw_times` / `from_raw_stores` / `resolve_times`, so a consumer with its own array reader
-  (ChimeraX, the rig's blosc-compressed `t`) no longer needs the private `_known`.
-- `opym.store`: `VIEWER_DIR`, `DSR_STORE_SUFFIX`, `MIP_MOVIES_DIR`, `ALIGNED_STORE_SUFFIX` and the path helpers
-  `dsr_store_name`, `viewer_store_path`, `mip_movies_dir`, `aligned_store_name`, `is_aligned_store`; opym's own path sites use them.
+- Light base (#80, [ADR 0001](docs/adr/0001-light-base.md)): the install depends on numpy only; extras `stream`, `server`
+  (everything the processing server runs, plus the previously undeclared `scipy`), `viewer`, `all`, `dev`. `opym` and
+  `opym.stream` import lazily, so `import opym` works without the viewer stack (BF-12) and the contract modules import in
+  ChimeraX, pvpython and the rig PC. `tests/test_light_base.py` enforces it in a numpy-only venv.
+- Console scripts `opym-backfill-send`, `opym-stream-watch`, `opym-receive`, `opym-receive-backfill`, `opym-serve` and
+  `opym-live-trace` are declared here (#83); bioimaging keeps only `opym-backfill` and `opym-storage-triage`.
+- `opym.display` (#82): the sqrt 8-bit rule (`to_8bit_sqrt`, `sqrt_decode`, `sqrt_colormap_controls`, `DisplayEncoding`), the
+  linear shift ChimeraX uses (`to_8bit_linear`) and the channel palette with the legacy `FF3D3D` red remapped to magenta in
+  `normalize_color`, so old stores are read correctly without rewriting them.
+- `opym.store` (#82): layout-3 names, zarr-free attrs and progress readers, `voxel_size_um`, `time_interval_s`,
+  `channel_colors`; `frame_count` (#84); output path names and helpers `VIEWER_DIR`, `DSR_STORE_SUFFIX`, `MIP_MOVIES_DIR`,
+  `ALIGNED_STORE_SUFFIX`, `dsr_store_name`, `viewer_store_path`, `mip_movies_dir`, `aligned_store_name`, `is_aligned_store` (#85).
+- `opym.stream.live_status` (#82): the live pointer, status and buffer names and the heartbeat/staleness rule.
+- `opym.registry.RegistryReader` and `connect_ro` (#81): the one read-only registry reader (dashboard and viewer logic), with the
+  key codec and the status vocabulary; `opym.stream.backfill_runs` run-record readers; `opym.metadata.zarr_fallback_z_step`.
+- `opym.stream.protocol` (#83): wire constants, the typed headers the rig used, and `frame_epoch_s`; session-end reason
+  constants (#84); `opym.stream.outcome` health record readers and `bfill` settle/lock constants (#84).
+- `opym.timeline` (#81, #85): zarr-free time readers, `times_from_arrays`, `record_from_arrays`, `time_record`, `combine_stores`,
+  public `known_time` and a `reader=` hook on `read_raw_times` / `from_raw_stores` / `resolve_times`, so a consumer with its own
+  array reader (ChimeraX, the rig's blosc-compressed `t`) no longer needs the private `_known`.
+- `opym.testing` (#81 to #84): golden vectors for the wire, display, store and reader contracts, imported by the consumers' tests.
+
+### Changed
+- FRAME time (#83, ING-F1): the receiver takes the epoch from `timestamp` when it is epoch seconds, else from `acq_first_s`
+  (logged once per session), else records no time and warns once per session; `rawmirror.write_epoch` refuses values outside
+  the epoch window. The rig (pymmcore-gui #65) sends `timestamp = acq_first_s`. Existing stores keep relative time only.
+- `opym.stream.backfill_client` is now the rig's sender (BF-02 fixed; tunnel and settings behind hooks), the one sender for
+  everyone; pymmcore-gui keeps a thin wrapper (#83).
+- Receiver hardening (#86): partial slab volumes are discarded at finalize (ING-F2); a catch-all per message and range checks on
+  `t`, `c`, `frame_index`, slab bounds (ING-F3); the drain keeps a durable manifest, retries with backoff and reports failures,
+  and SESSION_START checks `raw_root` is writable (ING-F4); names, `session_id` and `raw_root` are validated on both endpoints
+  (ING-F5); each housekeeping step is guarded (LIVE-02).
+- Backfill (#87): orphan reclaim sweeps partial outputs (BF-01); a refused metadata request leaves a finished store marked
+  (BF-03); stray claims are reclaimed and restarts do not count as failures (BF-06); leftover MATLAB processes are killed before
+  a relaunch (BF-07); the hang check and consolidations run off the supervisor tick (BF-08); a missing timepoint leaves a blank
+  frame and the consolidation sidecar is kept while zarrs are missing (BF-09).
+- Processing (#88): ticket files are written atomically (PROC-F3); `dz_psf` is read from the PSF and sent to MATLAB (PROC-F4,
+  the `.m` files need an `opym-serve` restart); a complete processed store is not overwritten unless asked (PROC-F9);
+  `parse_z_step(strict=True)` refuses to guess (PROC-F10); `clean_stale_output` (PROC-F11); a full decon fingerprint is opt-in
+  with `OPYM_FULL_DECON_FINGERPRINT=1` (PROC-F12).
+- Live lane (#89): a session that cannot dispatch after `ended` finalizes as failed (LIVE-01); drained raw stores are kept while
+  live tickets need them (LIVE-04, ING-F8); the room check counts the view store and degrades to receiving without a live view
+  (LIVE-05); a superseding session cancels the old archives (LIVE-06); tickets already queued or claimed are adopted after a
+  resume (LIVE-09).
+- Tests (#79): the conftest redirects `PETAKIT_JOBS_DIR`, `OPYM_LIVE_VIEW_ROOT`, `OPYM_STREAM_STAGE_ROOT` and the registry path
+  into a per-session tmp dir and fails the session if one points at production; `_evict_views` keeps unfinished views (LIVE-07).
+- Hygiene (this change): root strays removed, `Notebooks/OPM_Interactive_Petakit_Tuner.ipynb` moved to `Notebooks/legacy/`,
+  `scripts/live_bench/stack.sh` finds CORE under `science/`, `PSFAverager` and `scripts/generate_synthetic_psfs.py` marked
+  legacy, ruff import-order and whitespace findings fixed (E501 and format drift left), ruff `src` set so the pre-commit pin
+  agrees with the current ruff.
 
 ## [0.5.0] - 2026-11-05
 
