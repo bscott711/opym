@@ -32,6 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
+from opym.store import VIEWER_DIR
+
 RAW_MS = "t"
 RAW_EPOCH = "t_epoch_s"
 ATTR = "opym_time"
@@ -44,12 +46,19 @@ OUTPUTS_MARKER = "/opym_backfill/outputs/"
 _MIN_EPOCH_S = 1e9
 
 
-def _known(v: float, i: int, raw: str) -> bool:
+def known_time(v: float, i: int, raw: str) -> bool:
+    """Is entry ``i`` (value ``v``) of the raw array named ``raw`` (`RAW_MS` or
+    `RAW_EPOCH`) a recorded time? NaN is not; an epoch must be a real unix time (a
+    0.0 from a client that never sets the timestamp is not); a ms entry of 0.0 is
+    not, except the first (the acquisition begins at 0)."""
     if not math.isfinite(v):
         return False
     if raw == RAW_EPOCH:
         return v > _MIN_EPOCH_S
     return not (i > 0 and v == 0.0)  # unwritten ms entries are 0
+
+
+_known = known_time  # the name consumers used before it was public
 
 
 class ArrayNeedsZarrError(ValueError):
@@ -140,29 +149,57 @@ def read_1d(array_dir, *, use_zarr: bool = True) -> list | None:
             return None
 
 
-def read_raw_times(raw_store, *, strict: bool = True) -> list | None:
+_ARG = {RAW_MS: "t_ms", RAW_EPOCH: "t_epoch_s"}
+
+
+def times_from_arrays(t_ms=None, t_epoch_s=None) -> list | None:
+    """Seconds of each timepoint of ONE raw store, from its ``t`` / ``t_epoch_s``
+    arrays that the caller has already read (any sequence of numbers).
+
+    The entry point for a consumer that has its own array reader (ChimeraX has no
+    zarr; the rig's ``t`` is blosc-compressed, which `read_f8_array` refuses).
+    ``t_ms`` (the rig's, milliseconds since the start) is preferred over
+    ``t_epoch_s`` (the receiver's, unix seconds); an array with no recorded time
+    falls through to the next. Entries not recorded are None. Returns None if
+    neither array has any time. Same rule as `read_raw_times`, which calls this.
+    """
+    for name, scale, vals in ((RAW_MS, 1e-3, t_ms), (RAW_EPOCH, 1.0, t_epoch_s)):
+        if vals is None:
+            continue
+        out = [
+            round(float(v) * scale, 4) if known_time(float(v), i, name) else None
+            for i, v in enumerate(vals)
+        ]
+        if any(v is not None for v in out):
+            return out
+    return None
+
+
+def read_raw_times(raw_store, *, strict: bool = True, reader=None) -> list | None:
     """Seconds of each timepoint in the raw store's own origin (None: not yet known).
 
     Returns None if the store has no times at all. Works without zarr for the
     stores the rig and the receiver write (see `read_f8_array`); a compressed one
     uses zarr when installed, else raises `ArrayNeedsZarrError` -- or, with
     ``strict=False``, reads as "no times" (a page that must render anyway).
+
+    ``reader`` replaces `read_1d` as the way to read the 1-D arrays: a callable
+    ``reader(array_dir: Path) -> sequence of numbers | None`` (None: no such array;
+    it may raise `ArrayNeedsZarrError`, handled as above). Use it where the arrays
+    need a reader of the caller's own, e.g. try `read_1d` and on
+    `ArrayNeedsZarrError` fall back to the host application's zarr reader.
     """
     raw_store = Path(raw_store)
-    for name, scale in ((RAW_MS, 1e-3), (RAW_EPOCH, 1.0)):
+    read = reader or read_1d
+    for name in (RAW_MS, RAW_EPOCH):  # the second is read only if the first has none
         try:
-            vals = read_1d(raw_store / name)
+            vals = read(raw_store / name)
         except ArrayNeedsZarrError:
             if strict:
                 raise
             continue
-        if vals is None:
-            continue
-        out = [
-            round(float(v) * scale, 4) if _known(float(v), i, name) else None
-            for i, v in enumerate(vals)
-        ]
-        if any(v is not None for v in out):
+        out = times_from_arrays(**{_ARG[name]: vals})
+        if out is not None:
             return out
     return None
 
@@ -208,13 +245,23 @@ def nominal_times(n_frames: int, step_s: float) -> list:
     return [round(i * float(step_s), 4) for i in range(int(n_frames))]
 
 
-def from_raw_stores(raw_stores, *, strict: bool = True) -> list | None:
-    """Times (seconds since the first volume) from whichever raw stores have them."""
-    lists = [t for t in (read_raw_times(s, strict=strict) for s in raw_stores) if t]
+def combine_stores(per_store: list) -> list | None:
+    """Times (seconds since the first volume) from the per-store lists that
+    `times_from_arrays` / `read_raw_times` return (None entries in the list, and
+    stores without times, are skipped). None if no store has any time."""
+    lists = [t for t in per_store if t]
     if not lists:
         return None
     times = relative(combine(lists))
     return times if any(v is not None for v in times) else None
+
+
+def from_raw_stores(raw_stores, *, strict: bool = True, reader=None) -> list | None:
+    """Times (seconds since the first volume) from whichever raw stores have them.
+    ``reader``: see `read_raw_times`."""
+    return combine_stores(
+        [read_raw_times(s, strict=strict, reader=reader) for s in raw_stores]
+    )
 
 
 def resolve_times(
@@ -224,6 +271,7 @@ def resolve_times(
     n_frames: int | None = None,
     axis_step_s: float | None = None,
     strict: bool = False,
+    reader=None,
 ) -> tuple[list | None, str | None]:
     """``(times_s, source)`` for a processed store, first that exists:
 
@@ -236,12 +284,12 @@ def resolve_times(
     ``(None, None)`` when nothing is known (the page then shows no time stamp).
     ``strict=False`` (default, for pages that must render): a raw store that needs
     zarr when none is installed counts as having no times; pass True to raise
-    `ArrayNeedsZarrError` instead.
+    `ArrayNeedsZarrError` instead. ``reader``: see `read_raw_times`.
     """
     rec = (attrs or {}).get(ATTR)
     if isinstance(rec, dict) and rec.get("times_s"):
         return rec["times_s"], "store:" + str(rec.get("source") or ATTR)
-    raw = from_raw_stores([Path(s) for s in raw_stores], strict=strict)
+    raw = from_raw_stores([Path(s) for s in raw_stores], strict=strict, reader=reader)
     if raw is not None:
         return raw, "raw"
     if axis_step_s is not None and axis_step_s > 0 and n_frames:
@@ -290,6 +338,48 @@ def _set_time_scale(attrs: dict, interval: float) -> bool:
     return changed
 
 
+def time_record(
+    times_s: list, *, source: str, complete: bool | None = None
+) -> dict | None:
+    """The ``opym_time`` record for per-timepoint ``times_s`` (seconds since the
+    first volume, None where not known yet); None if no time is known.
+
+    This is exactly what `write_times` stores in a processed store's root
+    ``.zattrs["opym_time"]``. ``complete`` defaults to "every time is known".
+    """
+    if not any(v is not None for v in times_s):
+        return None
+    record = {
+        "times_s": times_s,
+        "unit": "s",
+        "origin": "first volume",
+        "source": source,
+        "complete": (
+            all(v is not None for v in times_s) if complete is None else bool(complete)
+        ),
+    }
+    itv = interval_s(times_s)
+    if itv is not None:
+        record["interval_s"] = itv
+    return record
+
+
+def record_from_arrays(
+    per_store, *, source: str, complete: bool | None = None
+) -> dict | None:
+    """The ``opym_time`` record from raw arrays the caller has read itself.
+
+    ``per_store``: one ``(t_ms, t_epoch_s)`` pair per raw channel store (either may
+    be None). The stores' times are combined (earliest per timepoint) and made
+    relative to the first volume, as `sync_processed` does. None if no time is
+    known. No consumer needs the private helpers for this.
+    """
+    times = combine_stores([times_from_arrays(ms, ep) for ms, ep in per_store])
+    return (
+        None if times is None else time_record(times, source=source, complete=complete)
+    )
+
+
 def write_times(
     store, times_s: list, *, source: str, complete: bool | None = None
 ) -> bool:
@@ -300,22 +390,12 @@ def write_times(
     store = Path(store)
     if not (store / ".zgroup").is_file() and not (store / "zarr.json").is_file():
         return False
-    if not any(v is not None for v in times_s):
+    record = time_record(times_s, source=source, complete=complete)
+    if record is None:
         return False
-    itv = interval_s(times_s)
+    itv = record.get("interval_s")
     root = store / ".zattrs"
     attrs = _read_attrs(root)
-    record = {
-        "times_s": times_s,
-        "unit": "s",
-        "origin": "first volume",
-        "source": source,
-        "complete": (
-            all(v is not None for v in times_s) if complete is None else bool(complete)
-        ),
-    }
-    if itv is not None:
-        record["interval_s"] = itv
     changed = attrs.get(ATTR) != record
     attrs[ATTR] = record
     if itv is not None:
@@ -357,7 +437,7 @@ def sync_processed(processed_store, raw_stores, *, source: str | None = None) ->
 def dataset_dir(processed_store) -> Path:
     """<dataset>/viewer/<base>_dsr.ome.zarr -> <dataset>"""
     p = Path(processed_store)
-    return p.parent.parent if p.parent.name == "viewer" else p.parent
+    return p.parent.parent if p.parent.name == VIEWER_DIR else p.parent
 
 
 def original_dir(path) -> Path:

@@ -15,6 +15,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from opym.store import MIP_MOVIES_DIR, VIEWER_DIR
+
 # Output-directory names written by this pipeline (and the legacy one) --
 # pruned during the walk so a resumed backfill doesn't re-descend into
 # hundreds of already-written per-frame files on GPFS.
@@ -28,7 +30,7 @@ _OUTPUT_DIR_NAMES = frozenset(
         "DSR",
         "DSR_nodecon",
         "MIPs",
-        "mip_movies",
+        MIP_MOVIES_DIR,
         # KIND_ZARR_PRECROPPED's staging dirs (see
         # backfill/pipeline.py:zarr_deskew_data_dir) -- missing from this set
         # meant a resumed backfill would re-descend into its own staged
@@ -36,7 +38,7 @@ _OUTPUT_DIR_NAMES = frozenset(
         "zarr_mirror",
         "decon_stage",
         # Other convenience output written beside the crop/deskew stages.
-        "viewer",
+        VIEWER_DIR,
         "decon_qc",
         # The live lane's QC sidecars (per-frame projections, verdicts).
         "qc",
