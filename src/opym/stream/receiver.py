@@ -130,8 +130,8 @@ Client log: a client that sees "client_log" sends its own stream log
 Paused runs: SESSION_END reason "paused" means the client gave up
 streaming mid-run (it couldn't reach Argus for longer than its RAM buffer
 holds). The partial copy is kept on staging for the usual retention but
-never copied to raw_root, so the run's full local save can be sent there by
-Globus instead.
+never copied to raw_root, so the run's full local save can be sent there
+afterwards (`opym-backfill-send`) instead.
 """
 
 from __future__ import annotations
@@ -142,6 +142,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -206,6 +207,9 @@ _CLIENT_LOG_DIR_ENV_VAR = "OPYM_STREAM_CLIENT_LOG_DIR"
 _CLIENT_LOG_MAX_LINES = 5000
 POLL_TIMEOUT_MS = 100
 QC_CHECK_SEC = 0.5
+# A housekeeping step that keeps failing (a full tmpfs under the live lane's
+# ticket writes) is logged with its traceback this often, and counted every time.
+_STEP_LOG_EVERY_S = 60.0
 # `_resolve_base_name` tries `name`, `name_001`, ... up to this suffix. A
 # thousand earlier acquisitions under one name means something is wrong
 # with naming, not a genuine collision; reject the session and say so.
@@ -256,6 +260,40 @@ _ZAP_DOMAIN = b"opym-direct"
 # Unknown-session replies to FRAMEs are rate-limited per session: a client
 # resending hundreds of MB of slabs would otherwise get one per slab.
 _UNKNOWN_NOTICE_EVERY_S = 2.0
+
+
+# Bounds for the numbers a client declares, checked before anything is
+# allocated or indexed with them (ING-F3): a volume side, a volume's bytes, a
+# timepoint count. Far above any real acquisition, far below "kills the host".
+_MAX_DIM = 65536
+_MAX_VOLUME_BYTES = 64 * 1024**3
+_MAX_TIMEPOINTS = 10_000_000
+_MAX_CHANNELS = 64
+
+
+def _int_field(value: Any, what: str, lo: int, hi: int) -> int:
+    """`value` as an int in [lo, hi]; ValueError otherwise (bools and floats
+    are not ints here: they would silently index the wrong thing)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{what} must be an integer, got {value!r}")
+    if not lo <= value <= hi:
+        raise ValueError(f"{what} must be in [{lo}, {hi}], got {value}")
+    return value
+
+
+def _checked_shape(value: Any, what: str = "shape_zyx") -> tuple[int, int, int]:
+    """A declared (z, y, x) volume shape as three ints in [1, _MAX_DIM]."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{what} must be three integers, got {value!r}")
+    nz, ny, nx = (_int_field(v, f"{what} entry", 1, _MAX_DIM) for v in value)
+    return nz, ny, nx
+
+
+def _checked_dtype(value: Any) -> np.dtype:
+    try:
+        return np.dtype(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unusable dtype {value!r}") from exc
 
 
 def _env_list(name: str) -> list[str]:
@@ -349,6 +387,38 @@ class _StageShort(ValueError):
     """The RAM disk has no room for a session yet: a SESSION_START turned
     down for this is answered (with "rejected"), since a retry can succeed
     once a drain frees space. Other rejections stay silent."""
+
+
+def _check_raw_root_writable(raw_root: Path) -> None:
+    """OSError unless a file can be created in `raw_root` (made if missing).
+    Checked at SESSION_START, whether or not staging is on: with staging the
+    drain would otherwise find out only at the end of the run, after the
+    client had been told its data is safe (ING-F4). The SESSION_START is then
+    answered "rejected" and the client retries."""
+    try:
+        raw_root.mkdir(parents=True, exist_ok=True)
+        fd, probe = tempfile.mkstemp(prefix=".opym_write_check_", dir=raw_root)
+    except OSError as exc:
+        raise OSError(f"raw_root {raw_root} is not writable: {exc}") from exc
+    os.close(fd)
+    try:
+        os.unlink(probe)
+    except OSError:
+        logger.warning("Could not remove the write-check file %s", probe)
+
+
+def _check_session_numbers(header: dict[str, Any], channels: list[Any]) -> None:
+    """SESSION_START's declared counts and shape, in range (ValueError if not),
+    before any of them sizes a path, an array or a RAM-disk estimate."""
+    _int_field(header["num_timepoints"], "num_timepoints", 1, _MAX_TIMEPOINTS)
+    _checked_shape(header["shape_zyx"])
+    _checked_dtype(header["dtype"])
+    if not 1 <= len(channels) <= _MAX_CHANNELS:
+        raise ValueError(f"channels must hold 1..{_MAX_CHANNELS} entries")
+    for c in channels:
+        _int_field(c, "channel", 0, _MAX_CHANNELS * 1024)
+    if len(set(channels)) != len(channels):
+        raise ValueError(f"channels must be distinct, got {channels!r}")
 
 
 def _estimate_session_bytes(header: dict[str, Any]) -> int:
@@ -513,6 +583,10 @@ class StreamReceiver:
         self.idle_timeout_sec = idle_timeout_sec
         self.sessions: dict[str, SessionState] = {}
         self._unknown_noticed: dict[str, float] = {}
+        # Messages and housekeeping steps that failed without taking the receiver
+        # down, by kind (stream_health.json "errors"; ING-F3, LIVE-02).
+        self.errors: dict[str, int] = {}
+        self._step_logged: dict[str, float] = {}
         # Sessions closed for idling, by close time (see _handle_session_start).
         self._idle_closed: dict[str, float] = {}
         # Where each closed session's stream_status.json went, so a client's
@@ -531,6 +605,7 @@ class StreamReceiver:
             retention_s=drain_retention_s,
             high_water_bytes=drain_high_water_bytes,
             manifest_dir=stage_root / ".drain_manifests" if stage_root else None,
+            on_state=self._drain_state,
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
@@ -613,9 +688,8 @@ class StreamReceiver:
             self._direct_ctx.term()
         # Deliberately not draining the queue first: shutdown must not block
         # on GPFS copies. Any not-yet-drained session's staging copy stays
-        # on /dev/shm, untouched, and a restarted receiver process re-drains
-        # it once it's told to (not automatic today -- see drain.py's
-        # `_drain_one` docstring, same v1 scope as the RESUME design).
+        # on /dev/shm, untouched, and its pending record (see drain.py) makes
+        # the next receiver process drain it on start.
         self._drain_pool.stop()
 
     def __enter__(self) -> StreamReceiver:
@@ -641,20 +715,59 @@ class StreamReceiver:
         for sock in (self._socket, self._direct_socket):
             if sock is not None and sock in events:
                 self._handle_incoming(sock)
-        self._flush_pending_acks()
-        self._sweep_idle_sessions()
+        # Each step on its own: none of them may end the poll loop or starve the
+        # steps after it (LIVE-02: a full tmpfs made the live lane's pump() raise
+        # on a ticket write, which killed the receiver and, on restart, the same).
+        self._guarded("flush_acks", self._flush_pending_acks)
+        self._guarded("sweep_idle", self._sweep_idle_sessions)
         if time.monotonic() - self._last_health_write >= _HEALTH_EVERY_S:
-            self._write_health()
+            self._guarded("health", self._write_health)
         if time.monotonic() - self._last_space_check >= _SPACE_CHECK_EVERY_S:
-            self._check_stage_space()
+            self._guarded("stage_space", self._check_stage_space)
         # Held while any session is open; refreshed every few seconds so it
         # goes stale (and frees the GPUs) within a minute if we crash.
         if self._live is not None:
-            self._live.pump()
-            self._forward_qc()
+            self._guarded("live_pump", self._live.pump)
+            self._guarded("forward_qc", self._forward_qc)
         # The lease also covers live work still in flight after SESSION_END.
+        self._guarded("lease", self._update_lease)
+
+    def _update_lease(self) -> None:
         busy = set(self.sessions) | set(self._live.sessions if self._live else ())
         self._lease.update(busy if _live_lane_enabled() else ())
+
+    def _guarded(self, step: str, fn, *args) -> None:
+        """Run one housekeeping step; if it raises, count it
+        (`errors["<step>_failed"]`), log it (with the traceback at most every
+        `_STEP_LOG_EVERY_S`) and carry on."""
+        try:
+            fn(*args)
+        except Exception:
+            kind = f"{step}_failed"
+            self._count_error(kind)
+            now = time.monotonic()
+            if now - self._step_logged.get(step, float("-inf")) >= _STEP_LOG_EVERY_S:
+                self._step_logged[step] = now
+                logger.exception(
+                    "Receiver step %r failed (%d so far) -- carrying on",
+                    step,
+                    self.errors[kind],
+                )
+
+    def _lane_hook(self, what: str, session_id: str, fn, *args, **kwargs) -> None:
+        """Call into the live lane for one session. The live view is a
+        convenience, the acquisition is not: a lane that raises costs that view
+        a volume, never the frame, the ACK or the receiver."""
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            self._count_error(f"live_{what}_failed")
+            logger.exception(
+                "Session %s: live lane %s failed -- carrying on without it for "
+                "this call",
+                session_id,
+                what,
+            )
 
     def _running_live_sessions(self) -> set[str]:
         return set(self._live.sessions) if self._live is not None else set()
@@ -738,12 +851,65 @@ class StreamReceiver:
             )
         return True
 
+    def _count_error(self, kind: str) -> None:
+        self.errors[kind] = self.errors.get(kind, 0) + 1
+
     def _handle_incoming(self, sock: zmq.Socket) -> None:
+        """One message, whatever it holds. No exception from a handler may end
+        the poll loop: that would drop every open session's in-memory state and,
+        with the client resending after the restart, loop (ING-F3). A message
+        that fails is logged, counted (`errors`) and dropped; a SESSION_START is
+        also answered "rejected", so its client retries instead of waiting."""
         identity, *rest = sock.recv_multipart()
         try:
             msg_type, session_id, header, payload = unpack_message(rest)
         except ValueError as exc:
             logger.warning("Dropping malformed message from %r: %s", identity, exc)
+            self._count_error("malformed_message")
+            return
+        except Exception:
+            logger.exception("Dropping unreadable message from %r", identity)
+            self._count_error("unreadable_message")
+            return
+        try:
+            self._dispatch_message(
+                sock, identity, msg_type, session_id, header, payload
+            )
+        except Exception as exc:
+            logger.exception(
+                "Handling %s for session %s failed -- message dropped, receiver "
+                "carries on",
+                msg_type.decode(errors="replace"),
+                session_id,
+            )
+            self._count_error(f"{msg_type.decode(errors='replace')}_failed")
+            if msg_type == MSG_SESSION_START:
+                try:
+                    self._send_unknown(
+                        sock,
+                        identity,
+                        session_id,
+                        rejected=f"receiver error ({type(exc).__name__}): {exc}",
+                    )
+                except Exception:
+                    logger.exception("Could not answer the rejected SESSION_START")
+
+    def _dispatch_message(
+        self,
+        sock: zmq.Socket,
+        identity: bytes,
+        msg_type: str,
+        session_id: str,
+        header: dict[str, Any],
+        payload: bytes | None,
+    ) -> None:
+        try:
+            rawmirror.check_session_id(session_id)
+        except ValueError as exc:
+            # It names files here (drain manifests, live view stores): never
+            # let a client choose one that is not a plain name (ING-F5).
+            logger.warning("Dropping %s: %s", msg_type.decode(errors="replace"), exc)
+            self._count_error("bad_session_id")
             return
 
         # The DEALER client is required to set zmq.IDENTITY == session_id,
@@ -826,16 +992,22 @@ class StreamReceiver:
         # this process is holding -- log and drop rather than let a
         # KeyError/ValueError propagate out of _run_once.
         try:
-            raw_root = Path(header["raw_root"])
+            raw_root = rawmirror.check_raw_root(header["raw_root"])
             if sock is self._direct_socket and not self._raw_root_allowed(raw_root):
                 raise ValueError(
                     f"raw_root {raw_root} is outside {_RAW_ROOTS_ENV_VAR} "
                     f"({', '.join(map(str, self.raw_roots))}), which is all "
                     "the direct endpoint may write to"
                 )
-            base_name = header["base_name"]
+            _check_raw_root_writable(raw_root)
+            base_name = rawmirror.check_path_component(header["base_name"], "base_name")
             channels = list(header["channels"])
             channel_names = list(header.get("channel_names") or [])
+            _check_session_numbers(header, channels)
+            for name in channel_names:
+                rawmirror.check_path_component(name, "channel name")
+            if len(set(channel_names)) != len(channel_names):
+                raise ValueError(f"channel_names must be distinct, got {channel_names}")
             if len(channel_names) != len(channels):
                 raise ValueError(
                     f"channel_names (got {len(channel_names)}) must have exactly "
@@ -884,6 +1056,20 @@ class StreamReceiver:
                 c: rawmirror.store_path_for_channel(write_root, base_name, name)
                 for c, name in zip(channels, channel_names)
             }
+            if sock is self._direct_socket:
+                # Names are plain components now; this also catches a symlink
+                # inside an allowed root that points out of it.
+                for dest in (
+                    raw_root / base_name,
+                    *(
+                        rawmirror.store_path_for_channel(raw_root, base_name, n)
+                        for n in channel_names
+                    ),
+                ):
+                    if not self._raw_root_allowed(dest):
+                        raise ValueError(
+                            f"{dest} resolves outside {_RAW_ROOTS_ENV_VAR}"
+                        )
             sorted_paths = sorted(channel_store_paths.values())
             channel_cidx = {
                 c: sorted_paths.index(p) for c, p in channel_store_paths.items()
@@ -911,11 +1097,12 @@ class StreamReceiver:
                 ack_floor=-1 if resume_through is None else resume_through,
                 resumed=resume_through is not None,
             )
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, OSError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
-            if isinstance(exc, _StageShort):
+            if isinstance(exc, (_StageShort, OSError)):
                 # Answer, so the client knows why and retries (space may
-                # come back once a drain ends) instead of waiting on a
+                # come back once a drain ends; a destination that cannot be
+                # used right now may be fixed) instead of waiting on a
                 # silent socket.
                 self._send_unknown(sock, identity, session_id, rejected=str(exc))
             return
@@ -1317,8 +1504,13 @@ class StreamReceiver:
                 session.received_pairs.add((t, c))
                 n += 1
                 if session.live and self._live is not None:
-                    self._live.frame_staged(
-                        session.session_id, t, session.channel_cidx[c]
+                    self._lane_hook(
+                        "frame_staged",
+                        session.session_id,
+                        self._live.frame_staged,
+                        session.session_id,
+                        t,
+                        session.channel_cidx[c],
                     )
         return n
 
@@ -1351,11 +1543,16 @@ class StreamReceiver:
                 "FRAME with no payload for session %s -- dropped", session_id
             )
             return
+        try:
+            t, c, frame_index = self._frame_coordinates(session, header)
+        except (KeyError, ValueError) as exc:
+            logger.warning("Dropping a bad FRAME for session %s: %s", session_id, exc)
+            self._count_error("bad_frame")
+            return
         if self._held_back(session):
             return
 
         recv_s = time.time()
-        t, c, frame_index = header["t"], header["c"], header["frame_index"]
         wire_bytes = len(payload)
         if header.get("codec") == "blosc":
             try:
@@ -1416,6 +1613,51 @@ class StreamReceiver:
         ):
             self._send_ack(session)
 
+    @staticmethod
+    def _frame_coordinates(
+        session: SessionState, header: dict[str, Any]
+    ) -> tuple[int, int, int]:
+        """A FRAME's `(t, c, frame_index)`, checked against the session: `t`
+        inside the declared timepoints (a negative one would index from the
+        end of the array) and `c` one of its channels (ING-F3)."""
+        t = _int_field(header["t"], "t", 0, session.num_timepoints - 1)
+        c = header["c"]
+        if isinstance(c, bool) or c not in session.channel_store_paths:
+            raise ValueError(f"c={c!r} is not one of this session's channels")
+        frame_index = _int_field(header["frame_index"], "frame_index", 0, 2**62)
+        return t, c, frame_index
+
+    def _slab_geometry(
+        self,
+        session: SessionState,
+        header: dict[str, Any],
+        payload: bytes,
+        asm: _SlabAssembly | None,
+    ) -> tuple[np.dtype, tuple[int, int, int], int, int]:
+        """A slab's `(dtype, shape, nz, z0)`, checked before the volume is
+        allocated: ValueError if the planes do not fit the volume, the payload
+        is not exactly the declared planes, or an earlier slab of this volume
+        declared something else (ING-F3)."""
+        dtype = _checked_dtype(header.get("dtype") or session.dtype)
+        shape = _checked_shape(header["shape_zyx"])
+        nz = _int_field(header["nz"], "nz", shape[0], _MAX_DIM)
+        z0 = _int_field(header["z0"], "z0", 0, nz - shape[0])
+        if nz * shape[1] * shape[2] * dtype.itemsize > _MAX_VOLUME_BYTES:
+            raise ValueError(f"a volume of {nz} x {shape[1]} x {shape[2]} is too big")
+        want = shape[0] * shape[1] * shape[2] * dtype.itemsize
+        if len(payload) != want:
+            raise ValueError(
+                f"slab payload is {len(payload)} bytes, its header declares {want}"
+            )
+        if asm is not None and (
+            asm.have is None
+            or len(asm.have) != nz
+            or asm.volume.shape[1:] != shape[1:]
+            or asm.volume.dtype != dtype
+        ):
+            raise ValueError("slab disagrees with the earlier slabs of its volume")
+        return dtype, shape, nz, z0
+
     def _handle_slab(
         self,
         session: SessionState,
@@ -1445,11 +1687,21 @@ class StreamReceiver:
             session.processed_frame_indices.add(frame_index)
             self._advance_ack_floor(session)
             return
-        dtype = np.dtype(header.get("dtype") or session.dtype)
-        slab = np.frombuffer(payload, dtype=dtype).reshape(header["shape_zyx"])
         asm = session.slabs.get((t, c))
+        try:
+            dtype, shape, nz, _ = self._slab_geometry(session, header, payload, asm)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Dropping a bad slab (t=%s, c=%s) for session %s: %s",
+                t,
+                c,
+                session.session_id,
+                exc,
+            )
+            self._count_error("bad_slab")
+            return
+        slab = np.frombuffer(payload, dtype=dtype).reshape(shape)
         if asm is None:
-            nz = int(header["nz"])
             asm = _SlabAssembly(
                 volume=np.empty((nz, *slab.shape[1:]), dtype=dtype),
                 have=np.zeros(nz, dtype=bool),
@@ -1576,9 +1828,9 @@ class StreamReceiver:
     ) -> None:
         """A whole (t, c) volume in one FRAME: raw store, then processing."""
         t, c = header["t"], header["c"]
-        shape_zyx = tuple(header.get("shape_zyx") or session.shape_zyx)
+        shape_zyx = _checked_shape(header.get("shape_zyx") or session.shape_zyx)
         dtype = header.get("dtype") or session.dtype
-        raw = np.frombuffer(payload, dtype=np.dtype(dtype)).reshape(shape_zyx)
+        raw = np.frombuffer(payload, dtype=_checked_dtype(dtype)).reshape(shape_zyx)
         t_start = time.perf_counter()
         arr = self._raw_array(session, c, shape_zyx, dtype)
         rawmirror.write_timepoint(arr, t, raw)
@@ -1607,8 +1859,14 @@ class StreamReceiver:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 write_decon_staged_tiff(raw, dst)
             if session.live:
-                self._live.frame_staged(
-                    session.session_id, t, session.channel_cidx[c], raw=raw
+                self._lane_hook(
+                    "frame_staged",
+                    session.session_id,
+                    self._live.frame_staged,
+                    session.session_id,
+                    t,
+                    session.channel_cidx[c],
+                    raw=raw,
                 )
         session.stage_raw_s.append(raw_write_s)
         session.stage_tiff_s.append(time.perf_counter() - t_start)
@@ -1669,30 +1927,33 @@ class StreamReceiver:
     def _forward_qc(self) -> None:
         """Send each open session's newest QC verdict to its client, once."""
         now = time.monotonic()
-        for session in self.sessions.values():
+        for session in list(self.sessions.values()):
             if not (session.accepts_qc and session.live) or session.ended:
                 continue
             if now - session.qc_checked_at < QC_CHECK_SEC:
                 continue
             session.qc_checked_at = now
-            path = self._live.qc_latest_path(session.session_id)
-            try:
-                mtime = path.stat().st_mtime
-                if mtime == session.qc_mtime:
-                    continue
-                record = json.loads(path.read_text())
-            except (AttributeError, OSError, ValueError):
-                continue
-            session.qc_mtime = mtime
-            seq = record.get("seq", -1)
-            if record.get("session_id") != session.session_id:
-                continue
-            if not isinstance(seq, int) or seq <= session.qc_seq_sent:
-                continue
-            session.sock.send_multipart(
-                [session.identity, *pack_message(MSG_QC, session.session_id, record)]
-            )
-            session.qc_seq_sent = seq
+            self._guarded("forward_qc_session", self._forward_qc_one, session)
+
+    def _forward_qc_one(self, session: SessionState) -> None:
+        path = self._live.qc_latest_path(session.session_id)
+        try:
+            mtime = path.stat().st_mtime
+            if mtime == session.qc_mtime:
+                return
+            record = json.loads(path.read_text())
+        except (AttributeError, OSError, ValueError):
+            return
+        session.qc_mtime = mtime
+        seq = record.get("seq", -1)
+        if record.get("session_id") != session.session_id:
+            return
+        if not isinstance(seq, int) or seq <= session.qc_seq_sent:
+            return
+        session.sock.send_multipart(
+            [session.identity, *pack_message(MSG_QC, session.session_id, record)]
+        )
+        session.qc_seq_sent = seq
 
     def _handle_session_end(self, session_id: str, header: dict[str, Any]) -> None:
         session = self.sessions.get(session_id)
@@ -1731,10 +1992,17 @@ class StreamReceiver:
         log(
             "Session %s (%s): %s", session.session_id, session.base_name, end["summary"]
         )
+        self._discard_partial_volumes(session)
         _write_stage_profile(session, reason, end)
         self._record_end(session, end)
         if session.live:
-            self._live.end_session(session.session_id, end)
+            self._lane_hook(
+                "end_session",
+                session.session_id,
+                self._live.end_session,
+                session.session_id,
+                end,
+            )
         # Bug fix: a client's `wait_for_all_acked()` (its durability signal --
         # see protocol.py's ACK docs) previously had no way to learn about
         # this session's LAST batch of frames if SESSION_END arrived before
@@ -1802,7 +2070,11 @@ class StreamReceiver:
                 # loop, so a slow/loaded GPFS write can never delay ingest
                 # for the NEXT session.
                 self._drain_pool.enqueue(
-                    drain.DrainJob(session_id=session.session_id, items=items)
+                    drain.DrainJob(
+                        session_id=session.session_id,
+                        items=items,
+                        status_leaf=session.dest_leaf_dir,
+                    )
                 )
                 logger.info(
                     "Session %s: queued %d item(s) for drain to %s",
@@ -1817,15 +2089,52 @@ class StreamReceiver:
         # either way nothing else needs triggering here.
         del self.sessions[session.session_id]
 
+    def _discard_partial_volumes(self, session: SessionState) -> int:
+        """Remove the planes of every volume still arriving slab by slab (a
+        session that ended mid-volume: abort, error, idle, stall) from its raw
+        store, and forget the volume. A partial volume left on disk is counted
+        as a written timepoint downstream and processed with its missing
+        planes as zeros (ING-F2); an absent one is simply not there. Each
+        discarded volume is logged. Returns how many."""
+        discarded = 0
+        for (t, c), asm in list(session.slabs.items()):
+            planes = int(asm.have.sum()) if asm.have is not None else 0
+            try:
+                rawmirror.discard_timepoint(session.channel_store_paths[c], t)
+            except OSError:
+                logger.exception(
+                    "Session %s: could not remove the partial volume (t=%d, c=%d) "
+                    "from %s -- delete p0/%d by hand before processing it",
+                    session.session_id,
+                    t,
+                    c,
+                    session.channel_store_paths[c],
+                    t,
+                )
+                continue
+            del session.slabs[(t, c)]
+            discarded += 1
+            logger.warning(
+                "Session %s: discarded the unfinished volume (t=%d, c=%d): %d of "
+                "%d planes had arrived",
+                session.session_id,
+                t,
+                c,
+                planes,
+                0 if asm.have is None else len(asm.have),
+            )
+        return discarded
+
     def _retain_paused(self, session: SessionState) -> None:
         """The client gave up streaming this run mid-way (SESSION_END reason
-        "paused"): its full local save goes to Argus by Globus, into the
-        same raw_root, so the partial streamed copy must not land there."""
+        "paused"): its full local save is sent to Argus afterwards
+        (`opym-backfill-send`), into the same raw_root, so the partial
+        streamed copy must not land there."""
         if session.write_root == session.raw_root:
             logger.error(
                 "Session %s was PAUSED by the client after %d (t,c) pair(s); "
                 "staging is off, so its partial raw copy is already in %s -- "
-                "remove it before sending the run by Globus",
+                "remove it before re-sending the run with opym-backfill-send",
                 session.session_id,
                 len(session.received_pairs),
                 session.dest_leaf_dir,
@@ -1836,7 +2145,8 @@ class StreamReceiver:
         logger.error(
             "Session %s was PAUSED by the client (link down longer than its "
             "buffer) after %d of %d (t,c) pair(s): the partial copy stays on "
-            "staging and is NOT copied to %s -- send this run by Globus",
+            "staging and is NOT copied to %s -- re-send this run with "
+            "opym-backfill-send",
             session.session_id,
             len(session.received_pairs),
             session.num_timepoints * len(session.channels),
@@ -1996,6 +2306,26 @@ class StreamReceiver:
         self._closed_status[session.session_id] = path
         _write_status_async(path, record)
 
+    def _drain_state(self, job: drain.DrainJob, state: str, detail: str) -> None:
+        """The drain pool's report on one session's copy to GPFS (called on a
+        drain thread): put it in the run's `stream_status.json` as `drain`, so
+        a run that ended "complete" but never reached GPFS says so. Best
+        effort; every failed attempt writes it again."""
+        if job.status_leaf is None:
+            return
+        try:
+            record = outcome.read_status(job.status_leaf) or {}
+            record["drain"] = {"state": state, "detail": detail, "at": time.time()}
+            outcome.write_status(job.status_leaf, record)
+        except OSError:
+            logger.warning(
+                "Could not record the drain state (%s) of session %s in %s",
+                state,
+                job.session_id,
+                job.status_leaf,
+                exc_info=True,
+            )
+
     def _late_session_end(self, session_id: str, header: dict[str, Any]) -> None:
         """A SESSION_END for a session already closed here: log what the
         client says, and add it to the run's stream_status.json."""
@@ -2053,6 +2383,8 @@ class StreamReceiver:
             "idle_timeout_s": self.idle_timeout_sec,
             "sessions": sessions,
             "recent_ends": self._recent_ends,
+            "errors": dict(self.errors),
+            "drain": self._drain_pool.status(),
         }
         try:
             path = outcome.health_path()

@@ -14,13 +14,18 @@ does nothing when it's unset.
 
 Verification is a full file-count + byte-count comparison between source and
 destination trees (not a spot check) before the drained copy is atomically
-renamed into place and the staging copy becomes eligible for eviction. A
-failed drain is logged loudly and retried on the next receiver restart is
-NOT automatic -- see ``DrainPool._drain_one``'s docstring; this deliberately
-does not swallow failures the way ``run_napari_opym.py``'s
-``_write_behind_worker`` does (``except Exception: pass`` there silently
-loses data and orphans the staging copy -- see the design plan this module
-implements, "Stage 3").
+renamed into place and the staging copy becomes eligible for eviction.
+
+A failed drain is never dropped: it is logged at ERROR, reported through the
+pool's ``on_state`` hook and ``status()`` (the receiver puts it in
+``stream_health.json`` and the run's ``stream_status.json``), and retried with
+a growing delay until it lands. Every queued job is also recorded in a pending
+manifest on the staging root, so a receiver restart re-enqueues whatever had
+not landed (ING-F4; before, a failed drain was logged once and a restart
+forgot the queue, while the client had already been told ``ended``). This
+deliberately does not swallow failures the way the retired napari write-behind
+worker did (``except Exception: pass`` silently lost data and orphaned the
+staging copy -- see the design plan this module implements, "Stage 3").
 """
 
 from __future__ import annotations
@@ -31,8 +36,11 @@ import queue
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .rawmirror import check_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +56,12 @@ DEFAULT_RETENTION_S = 4 * 3600.0
 # PetaKit5D's own /dev/shm/petakit_jobs queue and other tmpfs users.
 DEFAULT_HIGH_WATER_BYTES = 200 * (1024**3)
 DEFAULT_DRAIN_WORKERS = 4
+# A failed drain is tried again after this long, doubling per attempt up to the
+# cap: long enough not to hammer a full or unreachable GPFS, short enough that a
+# fixed quota or remounted disk is picked up within minutes.
+DEFAULT_RETRY_INITIAL_S = 60.0
+DEFAULT_RETRY_MAX_S = 900.0
+PENDING_DIR_NAME = "pending"
 
 
 @dataclass
@@ -66,6 +80,9 @@ class DrainJob:
 
     session_id: str
     items: list[tuple[Path, Path]]
+    status_leaf: Path | None = None
+    """The run's folder on GPFS (where its ``stream_status.json`` lives); only
+    passed back to ``on_state`` so the receiver knows which file to update."""
 
 
 @dataclass
@@ -92,13 +109,31 @@ class DrainPool:
         retention_s: float = DEFAULT_RETENTION_S,
         high_water_bytes: int = DEFAULT_HIGH_WATER_BYTES,
         manifest_dir: Path | None = None,
+        retry_initial_s: float = DEFAULT_RETRY_INITIAL_S,
+        retry_max_s: float = DEFAULT_RETRY_MAX_S,
+        on_state: Callable[[DrainJob, str, str], None] | None = None,
     ) -> None:
         """`manifest_dir` (the receiver passes `<stage root>/.drain_manifests`)
         makes retention survive a restart: each drained session is recorded
         there until its staging copies are evicted, and `start()` reloads the
         records. Without it, retention lives only in this process, and on
         2026-09-24 one opym-receive restart left 110 GB of drained copies on
-        /dev/shm with nothing to evict them."""
+        /dev/shm with nothing to evict them.
+
+        The same directory's `pending/` holds one record per job that is queued
+        or being retried, removed once it lands; `start()` re-enqueues them.
+
+        `on_state(job, state, detail)` is called from a drain thread with state
+        "failed" (detail: the error) after each failed attempt, and "drained"
+        once a job lands. It must not raise (the pool guards it anyway)."""
+        self._retry_initial_s = retry_initial_s
+        self._retry_max_s = retry_max_s
+        self._on_state = on_state
+        # Failed jobs waiting for their next attempt: (due, job).
+        self._retries: list[tuple[float, DrainJob]] = []
+        # session_id -> what is wrong with its drain right now.
+        self._failed: dict[str, dict[str, object]] = {}
+        self._attempts: dict[str, int] = {}
         self._manifest_dir = Path(manifest_dir) if manifest_dir else None
         self._num_workers = num_workers
         self._retention_s = retention_s
@@ -113,6 +148,7 @@ class DrainPool:
         if self._threads:
             return
         self._load_manifests()
+        self._load_pending()
         for i in range(self._num_workers):
             t = threading.Thread(
                 target=self._worker_loop, name=f"OpymDrainWorker-{i}", daemon=True
@@ -130,21 +166,51 @@ class DrainPool:
         self._threads = []
 
     def enqueue(self, job: DrainJob) -> None:
+        """Record the job durably, then queue it. A newer job for the same
+        session replaces one still waiting to be retried."""
+        with self._lock:
+            self._retries = [
+                (due, j) for due, j in self._retries if j.session_id != job.session_id
+            ]
+            self._failed.pop(job.session_id, None)
+            self._attempts[job.session_id] = 0
+        self._write_pending(job)
         self._queue.put(job)
 
     @property
     def pending_count(self) -> int:
         return self._queue.qsize()
 
+    def status(self) -> dict[str, object]:
+        """What the drain is doing, for stream_health.json: jobs queued, jobs
+        waiting for a retry, and every session whose drain is failing."""
+        with self._lock:
+            return {
+                "queued": self._queue.qsize(),
+                "retrying": len(self._retries),
+                "failed": {sid: dict(info) for sid, info in self._failed.items()},
+            }
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 job = self._queue.get(timeout=1.0)
             except queue.Empty:
+                self._requeue_due_retries()
                 self._sweep_retention()
                 continue
             self._drain_one(job)
+            self._requeue_due_retries()
             self._sweep_retention()
+
+    def _requeue_due_retries(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            due = [j for t, j in self._retries if t <= now]
+            self._retries = [(t, j) for t, j in self._retries if t > now]
+        for job in due:
+            logger.info("Retrying the drain of session %s", job.session_id)
+            self._queue.put(job)
 
     def _drain_one(self, job: DrainJob) -> None:
         """Copies every ``(stage_path, dest_path)`` in `job.items` to a
@@ -155,12 +221,9 @@ class DrainPool:
         partially-drained dataset (some channel stores present, others not).
 
         On any failure, logs at ERROR (never silently drops -- see module
-        docstring) and leaves every staging copy untouched so nothing is
-        lost; this receiver process does not currently persist a retry
-        queue across restarts (matching the existing RESUME design's own v1
-        degradation noted in `opym.stream.protocol`), so a failed drain
-        needs operator attention (check `~/projects/science/opym_local` receiver
-        logs).
+        docstring), leaves every staging copy untouched so nothing is lost,
+        and schedules another attempt (`_schedule_retry`); the job stays in
+        its pending manifest until it lands.
         """
         pending_renames: list[tuple[Path, Path]] = []  # (tmp_dest, dest_path)
         total_bytes = 0
@@ -188,14 +251,8 @@ class DrainPool:
                 if dest_path.exists():
                     shutil.rmtree(dest_path)
                 tmp_dest.replace(dest_path)
-        except Exception:
-            logger.exception(
-                "Drain FAILED for session %s -- staging copies on /dev/shm "
-                "retained untouched; this will NOT auto-retry, needs "
-                "operator attention. Items: %s",
-                job.session_id,
-                [str(s) for s, _ in job.items],
-            )
+        except Exception as exc:
+            self._schedule_retry(job, exc)
             return
 
         with self._lock:
@@ -204,13 +261,53 @@ class DrainPool:
                 drained_at=time.monotonic(),
                 size_bytes=total_bytes,
             )
+            was_failing = self._failed.pop(job.session_id, None) is not None
+            self._attempts.pop(job.session_id, None)
         self._write_manifest(job.session_id, [s for s, _ in job.items], total_bytes)
+        self._clear_pending(job.session_id)
+        if was_failing:
+            logger.warning("Drain of session %s landed after failing", job.session_id)
+        self._notify(job, "drained", "")
         logger.info(
             "Drained session %s: %d item(s), %.2f GB, verified byte-for-byte",
             job.session_id,
             len(job.items),
             total_bytes / 1e9,
         )
+
+    def _schedule_retry(self, job: DrainJob, exc: BaseException) -> None:
+        with self._lock:
+            attempts = self._attempts.get(job.session_id, 0) + 1
+            self._attempts[job.session_id] = attempts
+            delay = min(self._retry_max_s, self._retry_initial_s * 2 ** (attempts - 1))
+            self._retries.append((time.monotonic() + delay, job))
+            error = f"{type(exc).__name__}: {exc}"
+            self._failed[job.session_id] = {
+                "error": error,
+                "attempts": attempts,
+                "since": self._failed.get(job.session_id, {}).get("since", time.time()),
+                "retry_in_s": delay,
+            }
+        logger.error(
+            "Drain FAILED for session %s (attempt %d): %s -- staging copies on "
+            "/dev/shm retained untouched, trying again in %.0f s. Items: %s",
+            job.session_id,
+            attempts,
+            error,
+            delay,
+            [str(s) for s, _ in job.items],
+            exc_info=exc,
+        )
+        self._write_pending(job, attempts=attempts, last_error=error)
+        self._notify(job, "failed", f"{error} (attempt {attempts})")
+
+    def _notify(self, job: DrainJob, state: str, detail: str) -> None:
+        if self._on_state is None:
+            return
+        try:
+            self._on_state(job, state, detail)
+        except Exception:
+            logger.exception("Drain state hook failed for %s", job.session_id)
 
     def release(self, stage_paths: list[Path]) -> None:
         """Evicts now, instead of when retention expires, every drained
@@ -238,7 +335,7 @@ class DrainPool:
         """Evicts drained sessions, oldest first, until `bytes_wanted` are
         freed or none is left; returns the bytes freed. For when the RAM
         disk runs short before retention expires: each one is already safe
-        on GPFS (or, if paused, its full local save goes there by Globus)."""
+        on GPFS (or, if paused, its full local save is sent there afterwards)."""
         with self._lock:
             picked: list[tuple[str, _DrainedEntry]] = []
             freed = 0
@@ -287,9 +384,10 @@ class DrainPool:
             ]
             for sid in hits:
                 del self._drained[sid]
-        if self._manifest_dir is not None:
-            for sid in hits:
-                (self._manifest_dir / f"{sid}.json").unlink(missing_ok=True)
+        for sid in hits:
+            path = self._manifest_file(sid)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     def _sweep_retention(self) -> None:
         now = time.monotonic()
@@ -341,8 +439,9 @@ class DrainPool:
             with self._lock:
                 self._drained.setdefault(session_id, entry)
             return
-        if self._manifest_dir is not None:
-            (self._manifest_dir / f"{session_id}.json").unlink(missing_ok=True)
+        path = self._manifest_file(session_id)
+        if path is not None:
+            path.unlink(missing_ok=True)
         logger.debug(
             "Evicted RAM disk staging copies for %s (%d item(s))",
             session_id,
@@ -351,14 +450,27 @@ class DrainPool:
 
     # --- restart-safe retention ------------------------------------------------
 
+    def _manifest_file(self, session_id: str) -> Path | None:
+        """`<manifest_dir>/<session_id>.json`, or None without a manifest dir
+        or for a session id that is not a plain name (it must never steer a
+        write or an unlink out of the manifest dir; ING-F5)."""
+        if self._manifest_dir is None:
+            return None
+        try:
+            check_session_id(session_id)
+        except ValueError:
+            logger.warning("No drain manifest for unsafe session id %r", session_id)
+            return None
+        return self._manifest_dir / f"{session_id}.json"
+
     def _write_manifest(
         self, session_id: str, stage_dirs: list[Path], size: int
     ) -> None:
-        if self._manifest_dir is None:
+        path = self._manifest_file(session_id)
+        if path is None:
             return
         try:
-            self._manifest_dir.mkdir(parents=True, exist_ok=True)
-            path = self._manifest_dir / f"{session_id}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f".{path.name}.tmp")
             tmp.write_text(
                 json.dumps(
@@ -372,6 +484,104 @@ class DrainPool:
             tmp.replace(path)
         except OSError:
             logger.exception("Could not record drain manifest for %s", session_id)
+
+    def _pending_file(self, session_id: str) -> Path | None:
+        path = self._manifest_file(session_id)
+        if path is None:
+            return None
+        return path.parent / PENDING_DIR_NAME / path.name
+
+    def _write_pending(
+        self, job: DrainJob, attempts: int = 0, last_error: str | None = None
+    ) -> None:
+        """Record a job that has not landed yet, so a restart can re-enqueue
+        it. Failing to record it is logged, never fatal: the job still runs."""
+        path = self._pending_file(job.session_id)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "session_id": job.session_id,
+                        "items": [[str(s), str(d)] for s, d in job.items],
+                        "status_leaf": None
+                        if job.status_leaf is None
+                        else str(job.status_leaf),
+                        "attempts": attempts,
+                        "last_error": last_error,
+                        "recorded_at": time.time(),
+                    }
+                )
+            )
+            tmp.replace(path)
+        except OSError:
+            logger.exception(
+                "Could not record the pending drain of %s -- it will run, but a "
+                "restart would forget it",
+                job.session_id,
+            )
+
+    def _clear_pending(self, session_id: str) -> None:
+        path = self._pending_file(session_id)
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove the pending drain of %s", session_id)
+
+    def _load_pending(self) -> None:
+        """Re-enqueue every drain a previous process had queued or was retrying
+        and had not finished. A job whose staging copy is gone (a reboot wipes
+        the RAM disk) cannot be drained: it is reported as failed and its
+        record dropped, so it is not retried forever."""
+        if self._manifest_dir is None:
+            return
+        pending_dir = self._manifest_dir / PENDING_DIR_NAME
+        if not pending_dir.is_dir():
+            return
+        for path in sorted(pending_dir.glob("*.json")):
+            try:
+                rec = json.loads(path.read_text())
+                check_session_id(rec["session_id"])
+                job = DrainJob(
+                    session_id=rec["session_id"],
+                    items=[(Path(s), Path(d)) for s, d in rec["items"]],
+                    status_leaf=Path(rec["status_leaf"])
+                    if rec.get("status_leaf")
+                    else None,
+                )
+                attempts = int(rec.get("attempts") or 0)
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("Ignoring unreadable pending-drain record %s", path)
+                continue
+            missing = [str(s) for s, _ in job.items if not s.exists()]
+            if missing:
+                error = f"staging copy gone, cannot drain: {', '.join(missing)}"
+                logger.error(
+                    "Pending drain of session %s dropped: %s", job.session_id, error
+                )
+                with self._lock:
+                    self._failed[job.session_id] = {
+                        "error": error,
+                        "attempts": attempts,
+                        "since": time.time(),
+                        "retry_in_s": None,
+                    }
+                self._notify(job, "failed", error)
+                self._clear_pending(job.session_id)
+                continue
+            with self._lock:
+                self._attempts[job.session_id] = attempts
+            logger.warning(
+                "Re-enqueuing the drain of session %s that a previous receiver "
+                "process had not finished (%d item(s))",
+                job.session_id,
+                len(job.items),
+            )
+            self._queue.put(job)
 
     def _load_manifests(self) -> None:
         """Re-adopt sessions a previous process drained but hadn't evicted
