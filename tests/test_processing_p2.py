@@ -337,3 +337,42 @@ def test_bad_on_complete_value_is_rejected(tmp_path):
         w.create_processed_store(
             tmp_path / "x.ome.zarr", on_complete="x", **_store_kw()
         )
+
+
+# --------------------------------------------------------------------------
+# PROC-F10: the legacy TIFF path can refuse to guess dz
+# --------------------------------------------------------------------------
+
+
+def test_parse_z_step_reads_the_measured_step_either_way(tmp_path):
+    from opym.metadata import parse_z_step
+
+    (tmp_path / "AcqSettings.txt").write_text(json.dumps({"stepSizeUm": 0.4}))
+    meta = tmp_path / "x_metadata.txt"
+    assert parse_z_step(meta) == 0.4
+    assert parse_z_step(meta, strict=True) == 0.4
+
+
+def test_parse_z_step_missing_file_default_is_unchanged(tmp_path):
+    from opym.metadata import parse_z_step
+
+    meta = tmp_path / "x_metadata.txt"
+    assert parse_z_step(meta, default_z_step=0.3) == 0.3
+    assert parse_z_step(meta) == 1.0
+
+
+def test_parse_z_step_strict_refuses_a_missing_file(tmp_path):
+    from opym.metadata import ZStepUnknown, parse_z_step
+
+    with pytest.raises(ZStepUnknown, match="refusing to guess"):
+        parse_z_step(tmp_path / "x_metadata.txt", default_z_step=0.3, strict=True)
+
+
+@pytest.mark.parametrize("body", ["{}", '{"useTimepoints": true}', "not json"])
+def test_parse_z_step_strict_refuses_a_file_without_a_step(tmp_path, body):
+    from opym.metadata import ZStepUnknown, parse_z_step
+
+    (tmp_path / "AcqSettings.txt").write_text(body)
+    assert parse_z_step(tmp_path / "m.txt", default_z_step=0.3) == 0.3
+    with pytest.raises(ZStepUnknown):
+        parse_z_step(tmp_path / "m.txt", default_z_step=0.3, strict=True)

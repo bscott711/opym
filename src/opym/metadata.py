@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, overload
 
@@ -77,8 +77,16 @@ def _get_spim_settings(metadata_file: Path) -> dict[str, Any]:
         return {}
 
 
+class ZStepUnknown(ValueError):
+    """The acquisition's z step could not be read and the caller asked not to
+    guess (`parse_z_step(strict=True)`; PROC-F10)."""
+
+
 def parse_z_step(
-    metadata_file: Path, default_z_step: float = LEGACY_DEFAULT_Z_STEP_UM
+    metadata_file: Path,
+    default_z_step: float = LEGACY_DEFAULT_Z_STEP_UM,
+    *,
+    strict: bool = False,
 ) -> float:
     """
     Parses the 'AcqSettings.txt' file to extract the Z-step size.
@@ -86,6 +94,13 @@ def parse_z_step(
     Args:
         metadata_file: Path to the '_metadata.txt' file.
         default_z_step: A fallback value if parsing fails.
+        strict: Refuse to guess, as the zarr path does (`zarr_fallback_z_step`
+            with no fallback defers the dataset): raise `ZStepUnknown` when
+            AcqSettings.txt is missing, unreadable, or has no step, instead
+            of returning ``default_z_step``. Default False keeps every
+            existing caller's behaviour (a silent default; PROC-F10 is the
+            legacy TIFF backfill falling back to 0.3 um when the file is
+            missing, which a wrong guess turns into a mis-sheared volume).
 
     Returns:
         The Z-step size in microns.
@@ -106,11 +121,21 @@ def parse_z_step(
             file=sys.stderr,
         )
     except Exception as e:
+        if strict:
+            acq = metadata_file.parent / "AcqSettings.txt"
+            raise ZStepUnknown(f"Could not read the z step from {acq}: {e}") from e
         print(
             f"CRITICAL: Error parsing Z-step: {e}. Using default.",
             file=sys.stderr,
         )
 
+    if strict:
+        acq = metadata_file.parent / "AcqSettings.txt"
+        raise ZStepUnknown(
+            f"No z step ('stepSizeUm' or 'zStep_um') in {acq}; refusing to guess "
+            "one. Pass the real step, or call parse_z_step without strict=True "
+            "to accept a default."
+        )
     print(f"  Using default Z-step: {default_z_step} µm")
     return default_z_step
 
