@@ -524,7 +524,7 @@ class SessionState:
     """Volumes still arriving slab by slab, by (t, c)."""
     resumed: bool = False
     """Re-opened by a SESSION_START with `resume_through` (see the module
-    docstring's "Recovery"); never live."""
+    docstring's "Recovery"). Live with the one-format lane, else batch."""
     qc_seq_sent: int = -1
     qc_mtime: float = 0.0
     qc_checked_at: float = 0.0

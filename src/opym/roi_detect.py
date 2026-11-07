@@ -4,11 +4,12 @@ Consolidated ROI auto-detection: finds the biological-sample subregion
 within each half (top camera / bottom camera) of a raw OPM frame and
 returns a same-size (top_roi, bottom_roi) crop pair.
 
-Before this module, two near-duplicate implementations existed:
-- `auto_detect_rois()` in bioimaging/run_pipeline_cli.py -- force-fit a
+Before this module, two near-duplicate implementations existed (both since
+removed from bioimaging):
+- `auto_detect_rois()` in bioimaging's `run_pipeline_cli.py` -- force-fit a
   FIXED 576x1152 box regardless of actual detected signal extent, risking
   silently clipping real signal on an outlier dataset.
-- `_auto_detect_rois()` in bioimaging/run_napari_opym.py -- regionprops/
+- `_auto_detect_rois()` in bioimaging's `run_napari_opym.py` -- regionprops/
   connected-components with an area filter, sizing the box as
   max(detected_extent, expected) -- only grows past the fixed box, never
   shrinks below real signal.

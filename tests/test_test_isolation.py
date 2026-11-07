@@ -7,9 +7,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import conftest
 import pytest
 
+import conftest
 from opym import lanes
 from opym.stream import live_zarr
 

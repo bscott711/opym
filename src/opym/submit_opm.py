@@ -97,7 +97,7 @@ def main():
     parser.add_argument(
         "--method", type=str, default=DEFAULTS["method"], choices=["simple", "omw"], help="Deconvolution method"
     )
-    
+
     # Debug
     parser.add_argument(
         "--debug", action="store_true", help="Enable deep profiling in Matlab workers"

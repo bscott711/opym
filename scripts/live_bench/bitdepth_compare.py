@@ -68,6 +68,7 @@ def main() -> None:
     args = ap.parse_args()
 
     import zarr
+
     from opym import lanes
 
     store = args.store

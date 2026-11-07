@@ -35,14 +35,14 @@ import numpy as np
 import pytest
 
 from test_gpu_pipeline_regression import (
+    N_TOP_PEAKS,
     PIPELINE_KWARGS,
     PSF_PATH,
     SYNTHETIC_RAW_PATH,
-    N_TOP_PEAKS,
     _run_pipeline,
     _top_peak_coords,
-    _write_shm_zarr,
     _wait_for_zarr,
+    _write_shm_zarr,
 )
 
 # `matlab_engine` is no longer imported here: it now lives in conftest.py,

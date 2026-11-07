@@ -6,6 +6,10 @@ import logging
 
 import numpy as np
 import zarr
+
+from opym import timeline
+from opym.stream.protocol import MSG_FRAME, MSG_SESSION_START, pack_message
+from opym.testing import stream as golden
 from test_stream_transport import (
     SHAPE_ZYX,
     _dealer,
@@ -16,10 +20,6 @@ from test_stream_transport import (
     _slab,
     _volume,
 )
-
-from opym import timeline
-from opym.stream.protocol import MSG_FRAME, MSG_SESSION_START, pack_message
-from opym.testing import stream as golden
 
 EPOCH = 1_792_000_000.0  # a 2026 unix time on the rig's clock
 
