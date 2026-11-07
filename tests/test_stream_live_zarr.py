@@ -510,6 +510,48 @@ def test_tickets_nothing_claims_after_the_end_are_given_up(tmp_path, psf):
     assert 1 - tk["parameters"]["t"] in read_live_status(s.dsr_dir)["timepoints_failed"]
 
 
+def test_a_superseding_session_stops_the_old_sessions_archive_copies(tmp_path, psf):
+    """LIVE-06: a re-run with the same name re-creates the GPFS store while
+    the old session's archive copy is still running; the copy used to land
+    in the new store, leaving the old run's chunks behind."""
+    import threading
+
+    lane, jobs = _lane(tmp_path, psf)
+    old = _session(lane, tmp_path, n_t=1, n_c=1)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    gate = threading.Event()
+    real_archive = lane._archive
+
+    def slow_archive(session, t, c):
+        gate.wait(10)
+        real_archive(session, t, c)
+
+    lane._archive = slow_archive
+    lane.frame_staged("sess", 0, 0)
+    lane.pump()
+    [(path, tk)] = _tickets(jobs)
+    _complete(jobs, path, tk, shape)
+    assert _pump_until(lane, lambda: old.archiving)
+    assert (old.view_arrays.levels[0] / "0" / "0").is_dir()  # something to copy
+
+    def let_it_go():  # once the new session has taken over
+        while not old.superseded:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        gate.set()
+
+    threading.Thread(target=let_it_go, daemon=True).start()
+    new = _session(lane, tmp_path, n_t=1, n_c=1, sid="sess2")
+    lane.close()  # every copy has run (or stopped) by now
+    level0 = new.archive_store / new.view_arrays.levels[0].relative_to(new.view_store)
+    assert (level0 / ".zarray").exists()
+    assert not (level0 / "0").exists()  # nothing of t=0 from the old run
+    assert not list(new.archive_store.rglob("*.copying"))
+    lane.pump()
+    assert "sess" not in lane.sessions
+    assert w.read_progress(new.archive_store)["done"] == []
+
+
 def test_finalize_keeps_the_view_until_a_later_session(tmp_path, psf):
     lane, jobs = _lane(tmp_path, psf)
     s = _session(lane, tmp_path, n_t=1, n_c=1)

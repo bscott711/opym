@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import shutil
+from concurrent.futures import wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,6 +107,9 @@ PSF_CACHE_DIR = "psf_cache"
 # finalize as failed and release the live lease and the dataset to the
 # backfill (LIVE-01). Any ticket finishing or failing counts as progress.
 POST_END_STALL_S = 1800.0
+# How long a superseding session waits for the old session's running archive
+# copies to notice and stop (each checks between files).
+ARCHIVE_STOP_WAIT_S = 60.0
 
 
 def _view_dir_finished(d: Path) -> bool:
@@ -330,6 +334,11 @@ class ZarrLiveLane(LiveLane):
         for other in self.sessions.values():
             if other.dsr_dir == session.dsr_dir and not other.superseded:
                 self._supersede(other, by=session_id)
+        # Their archive copies write into the GPFS store this session is about
+        # to re-create: stop them first, or stale chunks land in the new one.
+        self._stop_archives(
+            [o for o in self.sessions.values() if o.superseded and o.archiving]
+        )
         self._evict_views(keep={session_id, *self.sessions})
 
         shape = dsr_shape_zyx(
@@ -643,6 +652,20 @@ class ZarrLiveLane(LiveLane):
                     session.failed.add(ticket.t)
         self._trim_buffers(session)
 
+    @staticmethod
+    def _stop_archives(sessions: list[ZarrLiveSession]) -> None:
+        """Cancel the archive copies not started and wait for those running
+        (`_archive` stops at its next file once its session is superseded), so
+        nothing of these sessions writes to GPFS afterwards (LIVE-06)."""
+        futures = [f for s in sessions for f in s.archiving.values()]
+        for fut in futures:
+            fut.cancel()
+        wait([f for f in futures if not f.cancelled()], timeout=ARCHIVE_STOP_WAIT_S)
+        for s in sessions:
+            for tc, fut in list(s.archiving.items()):
+                if fut.cancelled():
+                    del s.archiving[tc]
+
     def _archive(self, session: ZarrLiveSession, t: int, c: int) -> None:
         """Copy (t, c)'s chunk files, unchanged, from the RAM-disk store to
         the GPFS one. Each file lands under a temp name and is renamed into
@@ -657,6 +680,8 @@ class ZarrLiveLane(LiveLane):
             dst_dir = session.archive_store / arr.relative_to(session.view_store)
             dst_dir = dst_dir / str(t) / str(c)
             for src in src_dir.rglob("*"):
+                if session.superseded:
+                    return  # a newer session owns the store now (LIVE-06)
                 if not src.is_file():
                     continue
                 dst = dst_dir / src.relative_to(src_dir)
@@ -683,6 +708,8 @@ class ZarrLiveLane(LiveLane):
                 )
                 session.failed.add(tc[0])
                 continue
+            if session.superseded:
+                continue  # its store is the newer session's now
             session.archived.add(tc)
             changed = True
             if self._all_channels(session, session.archived, tc[0]):
