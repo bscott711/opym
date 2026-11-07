@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 import zarr
 import zmq
 
-from opym.stream import outcome
+from opym.stream import outcome, rawmirror
 from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
@@ -433,3 +434,157 @@ def test_a_lane_that_raises_on_a_frame_costs_the_view_not_the_frame(
     _send(recv, sock, MSG_SESSION_END, {"reason": "complete"})
     assert SID not in recv.sessions  # end_session raised too; the end completed
     assert recv.errors["live_end_session_failed"] == 1
+
+
+# --- ING-F5: names that go into paths are plain components --------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", ".", "..", "a/b", "a\\b", "../x", "/abs", "nul\0x", "new\nline", "x" * 101, 5],
+)
+def test_path_components_reject_separators_traversal_and_oddities(bad):
+    with pytest.raises(ValueError):
+        rawmirror.check_path_component(bad)
+    with pytest.raises(ValueError):
+        rawmirror.store_path_for_channel("/data", bad, "GFP_488")
+    with pytest.raises(ValueError):
+        rawmirror.store_path_for_channel("/data", "Cell_001", bad)
+
+
+@pytest.mark.parametrize("good", ["Cell_001", "Cell_001_002", "GFP_488", "a.b-c", "é"])
+def test_path_components_keep_real_names(good):
+    assert rawmirror.check_path_component(good) == good
+    assert rawmirror.store_path_for_channel("/data", good, "GFP_488").parent.name == (
+        "data"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", ".", "..", "a/b", "a b", "a\0b", "../x", "x" * 129, None, 7, "é"],
+)
+def test_session_ids_are_plain_names(bad):
+    with pytest.raises(ValueError):
+        rawmirror.check_session_id(bad)
+
+
+def test_session_ids_keep_uuids_and_link_ids():
+    assert rawmirror.check_session_id("0b1f3c52-9d84-4f0e-a3a2-6f1d7b2c9e10")
+    assert rawmirror.check_session_id("sess-1#2")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "raw", "./raw", "D:\\data\\raw", "/data/../etc", "/data/raw\0", 3, None],
+)
+def test_raw_root_must_be_an_absolute_posix_path_without_dotdot(bad):
+    with pytest.raises(ValueError):
+        rawmirror.check_raw_root(bad)
+
+
+def test_raw_root_keeps_an_absolute_path():
+    assert rawmirror.check_raw_root("/mmfs1/scratch/raw") == Path("/mmfs1/scratch/raw")
+
+
+def test_a_traversing_base_name_is_refused_and_touches_nothing(tmp_path, recv, dealer):
+    """Review repro: base_name "../../victim" made _supersede rename an
+    unrelated directory away."""
+    raw = tmp_path / "a" / "b" / "raw"
+    raw.mkdir(parents=True)
+    victim = tmp_path / "a" / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("mine")
+    sock = dealer()
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, SID, _header(raw, base_name="../../victim"))
+    )
+    _drive(recv)
+    assert SID not in recv.sessions
+    assert (victim / "keep.txt").read_text() == "mine"
+    assert not (raw / ".superseded").exists()
+    _still_serving(recv, dealer, tmp_path)
+
+
+@pytest.mark.parametrize("name", ["../../x", "a/b", "..", ""])
+def test_a_traversing_channel_name_is_refused(tmp_path, recv, dealer, name):
+    sock = dealer()
+    sock.send_multipart(
+        pack_message(
+            MSG_SESSION_START, SID, _header(tmp_path / "raw", channel_names=[name])
+        )
+    )
+    _drive(recv)
+    assert SID not in recv.sessions
+    assert not (tmp_path / "raw").exists() or not list((tmp_path / "raw").iterdir())
+
+
+def test_duplicate_channel_names_are_refused(tmp_path, recv, dealer):
+    sock = dealer()
+    sock.send_multipart(
+        pack_message(
+            MSG_SESSION_START,
+            SID,
+            _header(
+                tmp_path / "raw", channels=[0, 1], channel_names=["GFP_488", "GFP_488"]
+            ),
+        )
+    )
+    _drive(recv)
+    assert SID not in recv.sessions
+
+
+@pytest.mark.parametrize(
+    "raw_root",
+    ["relative/raw", "D:\\acq\\raw", "/tmp/x/../../etc", "/tmp/x\0y"],
+)
+def test_a_raw_root_that_is_not_an_absolute_posix_path_is_refused(
+    tmp_path, recv, dealer, raw_root
+):
+    header = _header(tmp_path / "raw")
+    header["raw_root"] = raw_root
+    sock = dealer()
+    sock.send_multipart(pack_message(MSG_SESSION_START, SID, header))
+    _drive(recv)
+    assert SID not in recv.sessions
+
+
+@pytest.mark.parametrize("bad_id", ["..", "a/b", "x y"])
+def test_a_message_with_an_unsafe_session_id_is_dropped(tmp_path, recv, dealer, bad_id):
+    sock = dealer(bad_id)
+    sock.send_multipart(
+        pack_message(MSG_SESSION_START, bad_id, _header(tmp_path / "raw"), None)
+    )
+    _drive(recv)
+    assert bad_id not in recv.sessions
+    assert recv.errors == {"bad_session_id": 1}
+    assert sock.poll(100) == 0  # nothing was answered
+
+
+def test_the_direct_endpoint_refuses_a_dotdot_escape_from_its_allowlist(tmp_path):
+    allowed = tmp_path / "raw"
+    allowed.mkdir()
+    recv = StreamReceiver(
+        bind_addr="tcp://127.0.0.1:0",
+        ack_every_n_frames=1,
+        ack_every_sec=9999,
+        idle_timeout_sec=9999,
+        direct_bind="tcp://127.0.0.1:0",
+        allow_ips=["127.0.0.1"],
+        raw_roots=[allowed],
+    )
+    try:
+        endpoint = recv._direct_socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+        sock = zmq.Context.instance().socket(zmq.DEALER)
+        sock.setsockopt(zmq.IDENTITY, SID.encode())
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(endpoint)
+        sock.send_multipart(
+            pack_message(MSG_SESSION_START, SID, _header(f"{allowed}/../outside"))
+        )
+        _drive(recv)
+        assert SID not in recv.sessions
+        assert not (tmp_path / "outside").exists()
+        sock.close()
+    finally:
+        recv.close()

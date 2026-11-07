@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .rawmirror import check_session_id
+
 logger = logging.getLogger(__name__)
 
 # Keep a drained (GPFS-verified) session's RAM-disk copy around for this
@@ -287,9 +289,10 @@ class DrainPool:
             ]
             for sid in hits:
                 del self._drained[sid]
-        if self._manifest_dir is not None:
-            for sid in hits:
-                (self._manifest_dir / f"{sid}.json").unlink(missing_ok=True)
+        for sid in hits:
+            path = self._manifest_file(sid)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     def _sweep_retention(self) -> None:
         now = time.monotonic()
@@ -341,8 +344,9 @@ class DrainPool:
             with self._lock:
                 self._drained.setdefault(session_id, entry)
             return
-        if self._manifest_dir is not None:
-            (self._manifest_dir / f"{session_id}.json").unlink(missing_ok=True)
+        path = self._manifest_file(session_id)
+        if path is not None:
+            path.unlink(missing_ok=True)
         logger.debug(
             "Evicted RAM disk staging copies for %s (%d item(s))",
             session_id,
@@ -351,14 +355,27 @@ class DrainPool:
 
     # --- restart-safe retention ------------------------------------------------
 
+    def _manifest_file(self, session_id: str) -> Path | None:
+        """`<manifest_dir>/<session_id>.json`, or None without a manifest dir
+        or for a session id that is not a plain name (it must never steer a
+        write or an unlink out of the manifest dir; ING-F5)."""
+        if self._manifest_dir is None:
+            return None
+        try:
+            check_session_id(session_id)
+        except ValueError:
+            logger.warning("No drain manifest for unsafe session id %r", session_id)
+            return None
+        return self._manifest_dir / f"{session_id}.json"
+
     def _write_manifest(
         self, session_id: str, stage_dirs: list[Path], size: int
     ) -> None:
-        if self._manifest_dir is None:
+        path = self._manifest_file(session_id)
+        if path is None:
             return
         try:
-            self._manifest_dir.mkdir(parents=True, exist_ok=True)
-            path = self._manifest_dir / f"{session_id}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f".{path.name}.tmp")
             tmp.write_text(
                 json.dumps(

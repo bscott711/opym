@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -280,11 +281,72 @@ def discard_timepoint(store_path: Path, t: int) -> bool:
     return True
 
 
+# Names a client sends go into paths. Whatever the trust model (loopback on a
+# shared host, or the direct endpoint), none of them may leave the folder they
+# are meant for (ING-F5).
+NAME_MAX_CHARS = 100
+SESSION_ID_MAX_CHARS = 128
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._#-]+")
+
+
+def check_path_component(value: object, what: str = "name") -> str:
+    """`value` as ONE safe path component, or ValueError: a non-empty string of
+    at most `NAME_MAX_CHARS` with no `/`, no `\\`, no NUL or other control
+    character, and not `.` or `..`."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{what} must be a non-empty string, got {value!r}")
+    if len(value) > NAME_MAX_CHARS:
+        raise ValueError(f"{what} is longer than {NAME_MAX_CHARS} characters")
+    if value in (".", ".."):
+        raise ValueError(f"{what} may not be {value!r}")
+    if any(ch in "/\\" or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(
+            f"{what} {value!r} may not hold a path separator or control character"
+        )
+    return value
+
+
+def check_session_id(value: object) -> str:
+    """`value` as a session id: `[A-Za-z0-9._#-]`, at most `SESSION_ID_MAX_CHARS`
+    long, not made of dots only (it names drain-manifest files)."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > SESSION_ID_MAX_CHARS
+        or _SESSION_ID_RE.fullmatch(value) is None
+        or not value.strip(".")
+    ):
+        raise ValueError(
+            f"session_id must be 1..{SESSION_ID_MAX_CHARS} characters of "
+            f"[A-Za-z0-9._#-], got {value!r}"
+        )
+    return value
+
+
+def check_raw_root(value: object) -> Path:
+    """`value` as an absolute POSIX directory path with no NUL and no `..`
+    part, or ValueError. A relative path would land wherever this service's
+    working directory is; a Windows path (`D:\\data`) is not one on this host."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"raw_root must be a non-empty string, got {value!r}")
+    if "\0" in value:
+        raise ValueError("raw_root may not hold a NUL")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"raw_root must be an absolute path, got {value!r}")
+    if ".." in path.parts:
+        raise ValueError(f"raw_root may not hold '..', got {value!r}")
+    return path
+
+
 def store_path_for_channel(raw_root: Path, base_name: str, channel_name: str) -> Path:
     """The canonical per-channel store path for `channel_name` (e.g.
     "GFP_488") under `raw_root`, matching
     `opym.discovery._ZARR_CHANNEL_SUFFIX_RE` / `parse_zarr_group_prefix` so
     the store this module writes is grouped back under `base_name` exactly
-    the way a Globus-landed one would be.
+    the way a Globus-landed one would be. `base_name` and `channel_name` must
+    each be one safe path component (`check_path_component`).
     """
+    check_path_component(base_name, "base_name")
+    check_path_component(channel_name, "channel name")
     return Path(raw_root) / f"{base_name}_{channel_name}.ome.zarr"

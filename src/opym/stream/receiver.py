@@ -884,6 +884,14 @@ class StreamReceiver:
         header: dict[str, Any],
         payload: bytes | None,
     ) -> None:
+        try:
+            rawmirror.check_session_id(session_id)
+        except ValueError as exc:
+            # It names files here (drain manifests, live view stores): never
+            # let a client choose one that is not a plain name (ING-F5).
+            logger.warning("Dropping %s: %s", msg_type.decode(errors="replace"), exc)
+            self._count_error("bad_session_id")
+            return
 
         # The DEALER client is required to set zmq.IDENTITY == session_id,
         # or "<session_id>#<k>" for its extra links (see protocol.py) --
@@ -965,17 +973,21 @@ class StreamReceiver:
         # this process is holding -- log and drop rather than let a
         # KeyError/ValueError propagate out of _run_once.
         try:
-            raw_root = Path(header["raw_root"])
+            raw_root = rawmirror.check_raw_root(header["raw_root"])
             if sock is self._direct_socket and not self._raw_root_allowed(raw_root):
                 raise ValueError(
                     f"raw_root {raw_root} is outside {_RAW_ROOTS_ENV_VAR} "
                     f"({', '.join(map(str, self.raw_roots))}), which is all "
                     "the direct endpoint may write to"
                 )
-            base_name = header["base_name"]
+            base_name = rawmirror.check_path_component(header["base_name"], "base_name")
             channels = list(header["channels"])
             channel_names = list(header.get("channel_names") or [])
             _check_session_numbers(header, channels)
+            for name in channel_names:
+                rawmirror.check_path_component(name, "channel name")
+            if len(set(channel_names)) != len(channel_names):
+                raise ValueError(f"channel_names must be distinct, got {channel_names}")
             if len(channel_names) != len(channels):
                 raise ValueError(
                     f"channel_names (got {len(channel_names)}) must have exactly "
@@ -1024,6 +1036,20 @@ class StreamReceiver:
                 c: rawmirror.store_path_for_channel(write_root, base_name, name)
                 for c, name in zip(channels, channel_names)
             }
+            if sock is self._direct_socket:
+                # Names are plain components now; this also catches a symlink
+                # inside an allowed root that points out of it.
+                for dest in (
+                    raw_root / base_name,
+                    *(
+                        rawmirror.store_path_for_channel(raw_root, base_name, n)
+                        for n in channel_names
+                    ),
+                ):
+                    if not self._raw_root_allowed(dest):
+                        raise ValueError(
+                            f"{dest} resolves outside {_RAW_ROOTS_ENV_VAR}"
+                        )
             sorted_paths = sorted(channel_store_paths.values())
             channel_cidx = {
                 c: sorted_paths.index(p) for c, p in channel_store_paths.items()
