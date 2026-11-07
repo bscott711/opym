@@ -43,11 +43,13 @@ import re
 import shutil
 import signal
 import subprocess  # nosec B404
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from opym import lanes
 from opym.consolidate import run_pending_consolidations
@@ -334,6 +336,41 @@ def oldest_claimable_age(queue_dir: Path, now: float) -> float | None:
     return now - min(mtimes) if mtimes else None
 
 
+def spawn_thread(fn: Callable[[], Any]) -> Future:
+    """Run `fn` on a daemon thread; the Future carries its result. The slow
+    GPFS work of a tick (the hang-check walk, consolidation) goes through
+    this, so live deadline, preemption and launches never wait on it."""
+    fut: Future = Future()
+
+    def run() -> None:
+        try:
+            fut.set_result(fn())
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            fut.set_exception(exc)
+
+    threading.Thread(target=run, name="opym-serve-worker", daemon=True).start()
+    return fut
+
+
+def run_inline(fn: Callable[[], Any]) -> Future:
+    """`spawn_thread` without the thread: for tests that need a tick to finish
+    its work before they look."""
+    fut: Future = Future()
+    try:
+        fut.set_result(fn())
+    except Exception as exc:  # noqa: BLE001
+        fut.set_exception(exc)
+    return fut
+
+
+class HangWalk(NamedTuple):
+    """A newest-file walk of a claimed ticket's dataDir, running off the tick."""
+
+    future: Future
+    claim: "Claim"
+    data_dir: str
+
+
 @dataclass
 class ServerSlot:
     server_id: str
@@ -346,13 +383,15 @@ class ServerSlot:
     hang_flagged_ticket: str | None = None
     preempting: bool = False
     last_exit_code: int | None = None
+    hang_walk: HangWalk | None = None
 
 
 class ServerSupervisor:
     """Drives the servers one `tick()` at a time; `process_queue` loops it.
 
     `launch(slot) -> Popen`, `clock() -> float`, `any_server_alive()`,
-    `lease_active()` and `warm_active()` are injectable for tests.
+    `lease_active()`, `warm_active()` and `spawn()` (how slow work leaves the
+    tick) are injectable for tests.
     """
 
     def __init__(
@@ -370,6 +409,7 @@ class ServerSupervisor:
         lease_active: Callable[[], bool] | None = None,
         warm_active: Callable[[], bool] | None = None,
         live_deadline_s: float | None = DEFAULT_LIVE_DEADLINE_S,
+        spawn: Callable[[Callable[[], Any]], Future] = spawn_thread,
     ) -> None:
         self.base_dir = Path(base_dir)
         self.queue_dir = lanes.backfill_queue_dir(self.base_dir)
@@ -390,6 +430,8 @@ class ServerSupervisor:
         self.kill_hung = kill_hung
         self.slots = [ServerSlot(sid, dev) for sid, dev in SERVERS]
         self._launch = launch or self._launch_matlab
+        self._spawn = spawn
+        self._consolidation: Future | None = None
         self._clock = clock
         self._any_server_alive = any_server_alive
         self._clean_exit_pending_consolidation = False
@@ -421,9 +463,12 @@ class ServerSupervisor:
         if (
             not any(s.proc is not None for s in self.slots)
             and self._clean_exit_pending_consolidation
+            and (self._consolidation is None or self._consolidation.done())
         ):
+            # Off the tick: it walks GPFS for minutes, and a live lease
+            # appearing meanwhile must still get its servers.
             self._clean_exit_pending_consolidation = False
-            self._run_consolidations()
+            self._consolidation = self._spawn(self._run_consolidations)
 
         # A fresh live or warm lease starts servers before the first ticket
         # lands: Matlab takes ~16 s to come up, then warms for the shape.
@@ -450,6 +495,7 @@ class ServerSupervisor:
             ):
                 slot.last_hang_check = now
                 self._check_hang(slot, now)
+            self._collect_hang_walk(slot, now)
 
         if self.live_deadline_s and self.live_deadline_s > 0:
             self._check_live_deadline(now)
@@ -467,6 +513,7 @@ class ServerSupervisor:
         slot.last_exit_code = rc
         slot.idle_s = None
         slot.hang_flagged_ticket = None
+        slot.hang_walk = None
         # Before the ticket goes back (and its partial outputs go): the exit of
         # the `bash -c` wrapper does not mean MATLAB is gone.
         self._kill_leftovers(slot)
@@ -648,18 +695,39 @@ class ServerSupervisor:
     # --- hang detection -------------------------------------------------------
 
     def _check_hang(self, slot: ServerSlot, now: float) -> None:
+        """Start the newest-file walk of the claimed ticket's dataDir. The walk
+        covers the whole tree on GPFS, so it runs off the tick;
+        `_collect_hang_walk` acts on its result."""
+        if slot.hang_walk is not None:
+            return  # the last one is still walking
         claim = self._read_claim(slot)
         if claim is None:
             slot.idle_s = None
             return
-        ticket, claimed_at = claim.ticket, claim.claimed_at
         try:
             data_dir = json.loads(claim.active_path(self.base_dir).read_text())[
                 "dataDir"
             ]
         except (OSError, ValueError, KeyError, TypeError):
             return
-        last_write = max(claimed_at, newest_mtime(Path(data_dir)) or 0.0)
+        slot.hang_walk = HangWalk(
+            self._spawn(lambda: newest_mtime(Path(data_dir))), claim, data_dir
+        )
+
+    def _collect_hang_walk(self, slot: ServerSlot, now: float) -> None:
+        walk = slot.hang_walk
+        if walk is None or not walk.future.done():
+            return
+        slot.hang_walk = None
+        try:
+            newest = walk.future.result()
+        except Exception:  # noqa: BLE001 - an unreadable tree is not a hang
+            return
+        current = self._read_claim(slot)
+        if current is None or current.ticket != walk.claim.ticket:
+            return  # the server moved on while we walked
+        ticket, data_dir = walk.claim.ticket, walk.data_dir
+        last_write = max(walk.claim.claimed_at, newest or 0.0)
         slot.idle_s = now - last_write
         if slot.idle_s < self.hang_after_s or slot.hang_flagged_ticket == ticket:
             return

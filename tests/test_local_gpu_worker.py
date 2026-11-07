@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,8 @@ def _make_supervisor(tmp_path, **kwargs):
         return proc
 
     clock = kwargs.pop("clock", _Clock())
+    # Slow work runs inline so a tick has finished it by the time a test looks.
+    kwargs.setdefault("spawn", local_gpu_worker.run_inline)
     sup = ServerSupervisor(
         tmp_path / "petakit_jobs",
         launch=launch,
@@ -887,3 +890,106 @@ def test_another_servers_process_is_not_killed_with_a_dead_one(tmp_path):
     finally:
         other.kill()
         other.wait()
+
+
+# --- BF-08: slow GPFS work stays off the supervisor tick ----------------------
+
+
+def test_the_hang_walk_does_not_hold_up_the_tick(tmp_path, monkeypatch):
+    """BF-08: the full os.walk of a dataDir (every 5 min, GPFS) and inline
+    consolidation ran inside tick(); live deadline, preemption and launches
+    waited meanwhile."""
+    import threading
+
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow_walk(root):
+        started.set()
+        gate.wait(10)
+        return None
+
+    monkeypatch.setattr(local_gpu_worker, "newest_mtime", slow_walk)
+    sup, launched, clock = _make_supervisor(
+        tmp_path, hang_after_s=600, spawn=local_gpu_worker.spawn_thread
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    _ticket(sup.queue_dir, "job.json", data_dir=data)
+    sup.tick()
+    _claim(sup, "1", "job.json")
+    rec = sup.claims_dir / "S1.json"
+    os.utime(rec, (clock.t - 7200, clock.t - 7200))  # claimed two hours ago
+    clock.t += local_gpu_worker.HANG_CHECK_EVERY_S
+    t0 = time.monotonic()
+    sup.tick()  # starts the walk and returns
+    assert time.monotonic() - t0 < 2
+    assert started.wait(5)
+    assert sup.slots[0].hang_walk is not None
+    clock.t += 3600
+    sup.tick()  # walk still running: nothing decided, nothing blocked
+    assert not sup.slots[0].hang_flagged_ticket
+    gate.set()
+    sup.slots[0].hang_walk.future.result(timeout=5)
+    sup.tick()
+    assert sup.slots[0].hang_flagged_ticket == "job.json"  # the verdict arrives later
+
+
+def test_a_walk_for_a_ticket_the_server_has_left_is_discarded(tmp_path):
+    sup, launched, clock = _make_supervisor(tmp_path, hang_after_s=600)
+    data = tmp_path / "data"
+    data.mkdir()
+    _ticket(sup.queue_dir, "job.json", data_dir=data)
+    sup.tick()
+    _claim(sup, "1", "job.json")
+    release = []
+    def spawn(fn):
+        from concurrent.futures import Future
+
+        fut = Future()
+        release.append(lambda: fut.set_result(fn()))
+        return fut
+
+    sup._spawn = spawn
+    clock.t += local_gpu_worker.HANG_CHECK_EVERY_S + 7200
+    sup.tick()
+    (sup.claims_dir / "S1.json").unlink()  # the ticket resolved meanwhile
+    release[0]()
+    sup.tick()
+    assert not sup.slots[0].hang_flagged_ticket
+
+
+def test_consolidation_runs_off_the_tick_and_never_twice_at_once(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    def slow(base):
+        calls.append(base)
+        started.set()
+        gate.wait(10)
+        return 0
+
+    monkeypatch.setattr(local_gpu_worker, "run_pending_consolidations", slow)
+    sup, launched, clock = _make_supervisor(tmp_path, spawn=local_gpu_worker.spawn_thread)
+    _ticket(sup.queue_dir, "job.json")
+    sup.tick()
+    (sup.queue_dir / "job.json").unlink()
+    for _, proc in launched:
+        proc.exit(0)
+    t0 = time.monotonic()
+    sup.tick()
+    assert time.monotonic() - t0 < 2
+    assert started.wait(5)
+    # a live lease appears while consolidation walks GPFS: servers launch anyway
+    sup._lease_active = lambda: True
+    clock.t += local_gpu_worker.FAILURE_BACKOFF_BASE_SEC
+    launched.clear()
+    sup._clean_exit_pending_consolidation = True  # another spin-down meanwhile
+    sup.tick()
+    assert launched, "servers must not wait for the consolidation"
+    assert len(calls) == 1
+    gate.set()
+    sup._consolidation.result(timeout=5)

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -306,14 +307,20 @@ def run_pending_consolidations(base_dir: Path) -> int:
 
 
 class _TeeWriter:
-    """Write to two streams simultaneously (stdout + log file)."""
+    """Write to two streams simultaneously (stdout + log file).
+
+    The supervisor runs consolidation on a worker thread while its own thread
+    keeps printing to the same `sys.stdout`: only the thread that made the tee
+    writes to the log, every thread still reaches the original stream."""
 
     def __init__(self, *streams):
         self._streams = streams
+        self._owner = threading.get_ident()
 
     def write(self, data: str) -> int:
-        for s in self._streams:
-            s.write(data)
+        for i, s in enumerate(self._streams):
+            if i == 0 or threading.get_ident() == self._owner:
+                s.write(data)
         return len(data)
 
     def flush(self):

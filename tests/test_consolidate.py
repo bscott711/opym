@@ -87,3 +87,22 @@ def test_consolidate_rejects_mismatched_channel_shapes(tmp_path):
 
     # Refuses to write anything, rather than a partially-correct store.
     assert not (tmp_path / f"{base_name}.ome.zarr").exists()
+
+
+def test_the_log_tee_only_takes_the_consolidating_threads_output(tmp_path):
+    """BF-08: consolidation runs on a worker thread while the supervisor's own
+    thread keeps printing to the same sys.stdout: those lines are not
+    consolidation log lines."""
+    import io
+    import threading
+
+    from opym.consolidate import _TeeWriter
+
+    out, log = io.StringIO(), io.StringIO()
+    tee = _TeeWriter(out, log)
+    tee.write("mine\n")
+    t = threading.Thread(target=lambda: tee.write("supervisor\n"))
+    t.start()
+    t.join()
+    assert out.getvalue() == "mine\nsupervisor\n"
+    assert log.getvalue() == "mine\n"
