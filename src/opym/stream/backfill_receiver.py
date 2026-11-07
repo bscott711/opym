@@ -124,8 +124,8 @@ def _benign_meta_diff(rel: str, have: bytes, data: bytes, main_rel: str | None) 
 
 
 _PIXEL_KEYS = ("shape", "chunks", "dtype", "compressor", "filters", "order", "dimension_separator")
-DEFAULT_SETTLE_S = 900.0
-LOCK_STALE_S = 600.0
+DEFAULT_SETTLE_S = bfill.DEFAULT_SETTLE_S
+LOCK_STALE_S = bfill.LOCK_STALE_S
 # Requests in flight at once: slabs from every link, plus a control request or two.
 _REQUEST_WORKERS = 16
 # A request that takes this long is logged: the 2026-10-24 stall left no trace at all.

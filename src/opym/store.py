@@ -106,6 +106,27 @@ def level_path(store: Path | str, series: str = DSR_SERIES, level: int = 0) -> P
     return Path(store) / series / str(level)
 
 
+def frame_count(store: Path | str, series: str = DSR_SERIES) -> int | None:
+    """The number of timepoints (t, the first axis) in `series`' full-resolution
+    image, read from the level-0 array's `.zarray` (v2) or `zarr.json` (v3)
+    metadata without zarr; None if the store, the series or the metadata is
+    missing. Works for a processed (layout 3) store and a legacy flat one."""
+    store = Path(store)
+    if LAYOUT_KEY in read_attrs(store):
+        level0 = level_path(store, series, 0)
+    elif series == DSR_SERIES:
+        level0 = store / "0"  # legacy: the multiscales sit at the root
+    else:
+        return None
+    for name in (".zarray", "zarr.json"):
+        meta = _read_json(level0 / name)
+        try:
+            return int(meta["shape"][0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return None
+
+
 def _image_attrs(store: Path | str, series: str = DSR_SERIES) -> dict:
     """The attributes of the group holding `series`' image (the series group of
     a processed store, the root of a legacy one)."""

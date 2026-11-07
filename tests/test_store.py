@@ -147,3 +147,39 @@ def test_complete_timepoints():
 def test_mip_stacks_reads_completed_timepoints_only(real_store):
     got = w.mip_stacks(real_store)
     assert set(got) == {0, 1} and got[0].shape == (2, 16, 16)
+
+
+def test_frame_count_on_real_and_json_only_stores(real_store, tmp_path):
+    light = golden.write_golden_attrs(tmp_path / "light.ome.zarr")
+    for path in (real_store, light):
+        assert store.frame_count(path) == golden.GOLDEN_FRAME_COUNT == 3
+        assert store.frame_count(path, store.MIP_SERIES) == golden.GOLDEN_FRAME_COUNT
+        assert store.frame_count(path, "7") is None
+
+
+def test_frame_count_on_a_legacy_flat_store(tmp_path):
+    out = tmp_path / "legacy.ome.zarr"
+    w.create_store(
+        out,
+        n_t=2,
+        n_c=2,
+        shape_zyx=(4, 8, 8),
+        dtype=np.uint16,
+        channel_labels=["a", "b"],
+        time_interval_s=3.0,
+    )
+    assert store.frame_count(out) == 2
+    assert store.frame_count(out, store.MIP_SERIES) is None
+
+
+def test_frame_count_reads_zarr_v3_metadata_and_misses_cleanly(tmp_path):
+    v3 = tmp_path / "v3.ome.zarr"
+    (v3 / "0" / "0").mkdir(parents=True)
+    (v3 / "zarr.json").write_text(
+        json.dumps({"attributes": {"ome": {store.LAYOUT_KEY: 3}}})
+    )
+    (v3 / "0" / "0" / "zarr.json").write_text(json.dumps({"shape": [5, 1, 2, 3, 4]}))
+    assert store.frame_count(v3) == 5
+    assert store.frame_count(tmp_path / "missing.ome.zarr") is None
+    (v3 / "0" / "0" / "zarr.json").write_text("{}")
+    assert store.frame_count(v3) is None

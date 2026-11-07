@@ -6,10 +6,12 @@ module, so a change on one end that the other does not follow fails on both.
 
 from __future__ import annotations
 
+import typing
+
 import numpy as np
 import pytest
 
-from opym.stream import bfill, protocol
+from opym.stream import bfill, outcome, protocol
 from opym.testing import stream as golden
 
 
@@ -141,3 +143,56 @@ def test_numpy_scalars_are_times_too(scalar):
     assert protocol.frame_epoch({"timestamp": scalar}) == (float(scalar), "timestamp")
     assert protocol.epoch_s_or_none(np.float32(3408.0)) is None
     assert protocol.epoch_s_or_none(np.bool_(True)) is None
+
+
+def test_session_end_reasons_are_one_set_of_words():
+    reasons = (
+        protocol.REASON_COMPLETE,
+        protocol.REASON_IDLE_TIMEOUT,
+        protocol.REASON_CLIENT_ABORT,
+        protocol.REASON_PAUSED,
+        protocol.REASON_CLIENT_ERROR,
+        protocol.REASON_STALLED,
+    )
+    assert reasons == golden.SESSION_END_REASONS
+    assert typing.get_args(protocol.SessionEndReason) == golden.SESSION_END_REASONS
+    # every word reaches its own branch of the end record (a stall, whether the
+    # client went silent or kept reporting in, reads the same), none the fallback
+    summaries = {
+        r: outcome.summarize(r, {(0, 0)}, 3, 1, detail="why")["summary"]
+        for r in reasons
+    }
+    assert summaries[protocol.REASON_IDLE_TIMEOUT] == summaries[protocol.REASON_STALLED]
+    assert len(set(summaries.values())) == len(reasons) - 1
+    assert "only" in summaries[protocol.REASON_COMPLETE]  # the short-run fallback
+    assert all("only" not in v for k, v in summaries.items() if k != "complete")
+
+
+def test_stream_health_names_and_path(tmp_path, monkeypatch):
+    assert outcome.HEALTH_NAME == golden.HEALTH_NAME
+    assert outcome.HEALTH_EVERY_S == golden.HEALTH_EVERY_S
+    assert outcome.HEALTH_STALE_S == golden.HEALTH_STALE_S
+    assert outcome.health_path(tmp_path) == tmp_path / "stream_health.json"
+    monkeypatch.setenv("PETAKIT_JOBS_DIR", str(tmp_path / "jobs"))
+    assert outcome.health_path() == tmp_path / "jobs" / "stream_health.json"
+
+
+def test_read_health(tmp_path):
+    path = outcome.health_path(tmp_path)
+    assert outcome.read_health(path) is None  # missing
+    path.write_text("{not json")
+    assert outcome.read_health(path) is None  # unreadable
+    path.write_text("[1]")
+    assert outcome.read_health(path) is None  # not a record
+    path.write_text('{"updated_at": 1.5, "sessions": []}')
+    assert outcome.read_health(path) == {"updated_at": 1.5, "sessions": []}
+
+
+def test_the_receivers_use_the_shared_health_and_backfill_constants():
+    from opym.stream import backfill_receiver, receiver
+
+    assert receiver._HEALTH_EVERY_S == outcome.HEALTH_EVERY_S
+    assert bfill.DEFAULT_SETTLE_S == golden.DEFAULT_SETTLE_S
+    assert bfill.LOCK_STALE_S == golden.LOCK_STALE_S
+    assert backfill_receiver.DEFAULT_SETTLE_S == bfill.DEFAULT_SETTLE_S
+    assert backfill_receiver.LOCK_STALE_S == bfill.LOCK_STALE_S

@@ -28,6 +28,7 @@ LIGHT_MODULES = [
     "opym.stream",
     "opym.stream.protocol",
     "opym.stream.bfill",
+    "opym.stream.outcome",
     "opym.stream.bfill_run",
     "opym.stream.backfill_runs",
     "opym.timeline",

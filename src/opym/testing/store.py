@@ -6,7 +6,8 @@ built by the writer's own helpers (numpy only). `write_golden_store(path)` write
 a real store with `create_processed_store` (zarr, numcodecs and ome-types, imported
 lazily: the `opym[server]` stack), fills it, and marks it complete.
 `write_golden_attrs(path)` writes only the JSON (`.zgroup`, `.zattrs`, the progress
-record), which is all the zarr-free readers in `opym.store` need.
+record and each pyramid level's `.zarray` shape), which is all the zarr-free readers
+in `opym.store` need.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ GOLDEN_LABELS = ("GFP 488", "mScarlet 561")
 GOLDEN_VOXEL_UM = 0.136
 GOLDEN_TIME_INTERVAL_S = 7.5
 # Timepoints with every channel written (the third has channel 0 only).
+GOLDEN_FRAME_COUNT = GOLDEN_N_T  # `opym.store.frame_count`: t, the first axis
 GOLDEN_DONE = ([0, 0], [0, 1], [1, 0], [1, 1], [2, 0])
 
 
@@ -78,6 +80,18 @@ def write_golden_attrs(path: Path | str, *, legacy_red: bool = False) -> Path:
         group.mkdir(parents=True, exist_ok=True)
         (group / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
         (group / ".zattrs").write_text(json.dumps(attrs))
+    for series, z in ((DSR_SERIES, GOLDEN_SHAPE_ZYX[0]), (MIP_SERIES, 1)):
+        for level in range(PYRAMID_LEVELS if series == DSR_SERIES else 1):
+            shape = [
+                GOLDEN_N_T,
+                GOLDEN_N_C,
+                z,
+                GOLDEN_SHAPE_ZYX[1] >> level,
+                GOLDEN_SHAPE_ZYX[2] >> level,
+            ]
+            arr = path / series / str(level)
+            arr.mkdir(parents=True, exist_ok=True)
+            (arr / ".zarray").write_text(json.dumps({"zarr_format": 2, "shape": shape}))
     (path / PROGRESS_NAME).write_text(json.dumps(_progress()))
     return path
 
