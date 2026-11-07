@@ -35,11 +35,11 @@ def _view_root(tmp_path, monkeypatch):
     monkeypatch.setenv(live_zarr.VIEW_ROOT_ENV_VAR, str(tmp_path / "shm_view"))
 
 
-def _lane(tmp_path, psf):
+def _lane(tmp_path, psf, **kw):
     jobs = tmp_path / "jobs"
     for d in ("queue_live", "completed", "failed"):
         (jobs / d).mkdir(parents=True, exist_ok=True)
-    return ZarrLiveLane(psf, jobs=jobs, qc=False), jobs
+    return ZarrLiveLane(psf, jobs=jobs, qc=False, **kw), jobs
 
 
 def _raw(tmp_path, n_t, n_c):
@@ -445,6 +445,145 @@ def test_a_failed_ticket_is_retried_once_then_left_to_the_backfill(tmp_path, psf
     lane.end_session("sess")
     assert _pump_until(lane, lambda: "sess" not in lane.sessions)
     assert read_live_status(s.dsr_dir)["state"] == "failed"
+
+
+def test_a_session_that_ends_without_0_0_finalizes_as_failed(tmp_path, psf):
+    """LIVE-01: (0, 0) never lands, so nothing can be dispatched. The session
+    used to stay "running" for good, holding the live lease and the dataset
+    off the backfill."""
+    lane, jobs = _lane(tmp_path, psf)
+    s = _session(lane, tmp_path, n_t=3, n_c=2)
+    lane.frame_staged("sess", 1, 0)
+    lane.frame_staged("sess", 1, 1)
+    lane.pump()
+    assert _tickets(jobs) == []
+    lane.end_session("sess", {"reason": "no_first_volume"})
+    assert _pump_until(lane, lambda: "sess" not in lane.sessions, timeout=1.0)
+    status = read_live_status(s.dsr_dir)
+    assert status["state"] == "failed"
+    assert status["timepoints_failed"] == [1]
+    assert status["end"] == {"reason": "no_first_volume"}
+    assert w.read_progress(s.archive_store)["state"] == "failed"
+    assert _tickets(jobs) == []
+
+
+def test_a_session_still_waiting_for_0_0_is_not_given_up_before_it_ends(tmp_path, psf):
+    lane, jobs = _lane(tmp_path, psf)
+    _session(lane, tmp_path, n_t=3, n_c=1)
+    lane.frame_staged("sess", 1, 0)
+    for _ in range(3):
+        lane.pump()
+    assert "sess" in lane.sessions
+    lane.frame_staged("sess", 0, 0)  # the run is only late
+    lane.pump()
+    assert len(_tickets(jobs)) == 2
+
+
+def test_tickets_nothing_claims_after_the_end_are_given_up(tmp_path, psf):
+    """LIVE-01, the deadline: a ticket no server ever claims (or finishes)
+    must not hold the session open for ever once the run is over. Progress
+    resets the clock; the queued ticket is withdrawn so a late server can't
+    write into a store that has been finalized."""
+    now = [1000.0]
+    lane, jobs = _lane(tmp_path, psf, clock=lambda: now[0])
+    s = _session(lane, tmp_path, n_t=2, n_c=1)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    lane.frame_staged("sess", 0, 0)
+    lane.frame_staged("sess", 1, 0)
+    lane.pump()
+    assert len(_tickets(jobs)) == 2
+    lane.end_session("sess")
+    now[0] += live_zarr.POST_END_STALL_S - 1
+    lane.pump()
+    assert "sess" in lane.sessions  # not yet
+
+    path, tk = _tickets(jobs)[0]  # one finishes: that is progress
+    _complete(jobs, path, tk, shape)
+    assert _pump_until(lane, lambda: s.done == {tk["parameters"]["t"]})
+    now[0] += live_zarr.POST_END_STALL_S - 1
+    lane.pump()
+    assert "sess" in lane.sessions  # the clock restarted
+
+    now[0] += 2
+    lane.pump()
+    assert "sess" not in lane.sessions
+    assert read_live_status(s.dsr_dir)["state"] == "failed"
+    assert _tickets(jobs) == []
+    assert 1 - tk["parameters"]["t"] in read_live_status(s.dsr_dir)["timepoints_failed"]
+
+
+def test_a_superseding_session_stops_the_old_sessions_archive_copies(tmp_path, psf):
+    """LIVE-06: a re-run with the same name re-creates the GPFS store while
+    the old session's archive copy is still running; the copy used to land
+    in the new store, leaving the old run's chunks behind."""
+    import threading
+
+    lane, jobs = _lane(tmp_path, psf)
+    old = _session(lane, tmp_path, n_t=1, n_c=1)
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)
+    gate = threading.Event()
+    real_archive = lane._archive
+
+    def slow_archive(session, t, c):
+        gate.wait(10)
+        real_archive(session, t, c)
+
+    lane._archive = slow_archive
+    lane.frame_staged("sess", 0, 0)
+    lane.pump()
+    [(path, tk)] = _tickets(jobs)
+    _complete(jobs, path, tk, shape)
+    assert _pump_until(lane, lambda: old.archiving)
+    assert (old.view_arrays.levels[0] / "0" / "0").is_dir()  # something to copy
+
+    def let_it_go():  # once the new session has taken over
+        while not old.superseded:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        gate.set()
+
+    threading.Thread(target=let_it_go, daemon=True).start()
+    new = _session(lane, tmp_path, n_t=1, n_c=1, sid="sess2")
+    lane.close()  # every copy has run (or stopped) by now
+    level0 = new.archive_store / new.view_arrays.levels[0].relative_to(new.view_store)
+    assert (level0 / ".zarray").exists()
+    assert not (level0 / "0").exists()  # nothing of t=0 from the old run
+    assert not list(new.archive_store.rglob("*.copying"))
+    lane.pump()
+    assert "sess" not in lane.sessions
+    assert w.read_progress(new.archive_store)["done"] == []
+
+
+def test_a_resumed_session_follows_tickets_already_queued_or_claimed(tmp_path, psf):
+    """LIVE-09: after a receiver restart the old tickets are still in the
+    queue (or claimed by a server); resume used to queue the same (t, c)
+    again, two servers on one view buffer."""
+    lane, jobs = _lane(tmp_path, psf)
+    _session(lane, tmp_path, n_t=1, n_c=2)
+    lane.frame_staged("sess", 0, 0)
+    lane.frame_staged("sess", 0, 1)
+    lane.pump()
+    first = {tk["parameters"]["c"]: p for p, tk in _tickets(jobs)}
+    assert set(first) == {0, 1}
+    claimed = first[0].with_name(f".active_{first[0].name}")
+    os.replace(first[0], claimed)  # a server has taken (0, 0)
+
+    # The receiver restarts: a new lane, the same session resumed.
+    lane2, _ = _lane(tmp_path, psf)
+    s2 = _session(lane2, tmp_path, n_t=1, n_c=2, resume=True)
+    lane2.frame_staged("sess", 0, 0)
+    lane2.frame_staged("sess", 0, 1)
+    lane2.pump()
+    assert sorted(p.name for p in jobs.joinpath("queue_live").glob("*.json")) == sorted(
+        [claimed.name, first[1].name]
+    )
+    assert set(s2.tickets) == {first[0].name, first[1].name}
+
+    shape = dsr_shape_zyx(RAW_ZYX, 0.5)  # and they finish under the new lane
+    os.replace(claimed, first[0])
+    for p in first.values():
+        _complete(jobs, p, json.loads(p.read_text()), shape)
+    assert _pump_until(lane2, lambda: s2.viewed == {(0, 0), (0, 1)})
 
 
 def test_finalize_keeps_the_view_until_a_later_session(tmp_path, psf):

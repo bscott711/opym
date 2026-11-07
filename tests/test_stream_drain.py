@@ -403,3 +403,89 @@ def test_an_unsafe_session_id_never_names_a_manifest(tmp_path):
     pool = DrainPool(manifest_dir=manifests)
     pool.enqueue(DrainJob("../../escape", [(stage_dir, tmp_path / "raw" / "s")]))
     assert not list(tmp_path.rglob("escape*"))
+
+
+# --- LIVE-04 / ING-F8: no eviction under a session the live lane reads ---------
+
+
+def test_a_session_in_use_is_never_evicted_until_it_is_released(tmp_path):
+    """The live lane's tickets read the drained raw store on the RAM disk; a
+    missing chunk reads as zeros, so a ticket whose input was evicted
+    "succeeds" with a blank volume. Retention, the high-water mark, free_up
+    and release all skip a protected session."""
+    in_use = {"sess-a"}
+    stage = {k: tmp_path / "stage" / k for k in "ab"}
+    for p in stage.values():
+        _make_tree(p, {"f.bin": b"x" * 1000})
+    # Retention already expired and the high-water mark exceeded: sweeps want both.
+    pool = DrainPool(
+        num_workers=1, retention_s=0.0, high_water_bytes=1, protected=lambda: in_use
+    )
+    pool.start()
+    try:
+        for k, p in stage.items():
+            pool.enqueue(DrainJob(f"sess-{k}", [(p, tmp_path / "raw" / k)]))
+            assert _wait_until(lambda k=k: (tmp_path / "raw" / k).exists())
+        assert _wait_until(lambda: not stage["b"].exists())  # the sweep ran...
+        time.sleep(1.5)
+        assert stage["a"].exists()  # ...and left the one in use
+        assert pool.free_up(10**9) == 0 and stage["a"].exists()
+        pool.release([stage["a"]])
+        assert stage["a"].exists()
+
+        in_use.clear()  # the live lane is done with it
+        assert _wait_until(lambda: not stage["a"].exists(), timeout=5.0)
+        assert (tmp_path / "raw" / "a" / "f.bin").exists()  # GPFS copy untouched
+    finally:
+        pool.stop()
+
+
+def test_nothing_is_evicted_when_the_sessions_in_use_cannot_be_listed(tmp_path):
+    def broken():
+        raise RuntimeError("no list")
+
+    stage = tmp_path / "stage" / "a"
+    _make_tree(stage, {"f.bin": b"x"})
+    pool = DrainPool(
+        num_workers=1, retention_s=0.0, high_water_bytes=1, protected=broken
+    )
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-a", [(stage, tmp_path / "raw" / "a")]))
+        assert _wait_until(lambda: (tmp_path / "raw" / "a").exists())
+        time.sleep(1.5)
+        assert stage.exists() and pool.free_up(10**9) == 0
+    finally:
+        pool.stop()
+
+
+def test_reclaim_waits_for_an_eviction_already_under_way(tmp_path, monkeypatch):
+    """ING-F8: a resumed session's `reclaim` used to return while a sweep was
+    still deleting its staging copy, so the session went on writing into a
+    directory being removed. It now returns once the eviction is over, and the
+    caller sees the copy gone (and falls back to the GPFS one)."""
+    import shutil
+    import threading
+
+    real_rmtree = shutil.rmtree
+    started = threading.Event()
+
+    def slow_rmtree(path, *args, **kwargs):
+        started.set()
+        time.sleep(0.6)
+        real_rmtree(path, *args, **kwargs)
+
+    stage = tmp_path / "stage" / "sample"
+    dest = tmp_path / "raw" / "sample"
+    _make_tree(stage, {"a.bin": b"hello"})
+    pool = DrainPool(num_workers=1, retention_s=0.05, high_water_bytes=10**12)
+    pool.start()
+    try:
+        pool.enqueue(DrainJob("sess-1", [(stage, dest)]))
+        assert _wait_until(lambda: dest.exists())
+        monkeypatch.setattr(shutil, "rmtree", slow_rmtree)
+        assert started.wait(5.0)  # the sweep has claimed it and is deleting
+        pool.reclaim([stage])
+        assert not stage.exists()  # not half-deleted under the caller
+    finally:
+        pool.stop()

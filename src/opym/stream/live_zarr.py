@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import shutil
+from concurrent.futures import wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,6 +75,11 @@ DEFAULT_VIEW_ROOT = Path("/dev/shm/opym_live_view")
 # Newest timepoints whose uncompressed view buffers stay on the RAM disk
 # (about 1 GB per channel each at 161 planes).
 BUFFER_KEEP_T = 3
+# The processed view store on the RAM disk is about as large as the raw store
+# it comes from (100 T x 2 C: 45 GB view against 46 GB raw, with the newest
+# uncompressed buffers on top): what a SESSION_START must find room for besides
+# the raw bytes (LIVE-05).
+VIEW_STORE_RAW_RATIO = 0.9
 SHEET_ANGLE_DEG = 60.0
 # Written at every session start (see `ZarrLiveLane.start_session`): each GPU
 # server, when idle, runs one warm-up on it -- the session's PSF cache, a
@@ -101,6 +107,14 @@ def view_bits() -> int:
 # (idle timeout, crash) would otherwise never warm for it.
 PREPARE_RESPEC_S = 300.0
 PSF_CACHE_DIR = "psf_cache"
+# Once a session has ended, tickets that make no progress at all for this long
+# (no server claiming them, a dead GPU) are given up on, so the session can
+# finalize as failed and release the live lease and the dataset to the
+# backfill (LIVE-01). Any ticket finishing or failing counts as progress.
+POST_END_STALL_S = 1800.0
+# How long a superseding session waits for the old session's running archive
+# copies to notice and stop (each checks between files).
+ARCHIVE_STOP_WAIT_S = 60.0
 
 
 def _view_dir_finished(d: Path) -> bool:
@@ -237,6 +251,9 @@ class ZarrLiveSession:
     """How the receiver says the session ended (opym.stream.outcome)."""
     superseded: bool = False
     started_at: float = 0.0
+    ended_at: float = 0.0
+    last_progress_at: float = 0.0
+    """When a ticket last finished or failed (see `POST_END_STALL_S`)."""
     first_done_at: float | None = None
     last_status_write: float = 0.0
 
@@ -250,6 +267,10 @@ class ZarrLiveSession:
 
     def buffer(self, t: int, c: int) -> Path:
         return self.buffers_dir / buffer_name(t, c)
+
+    def dispatchable(self) -> bool:
+        """The edge-erosion mask comes from (0, 0), so nothing runs without it."""
+        return 0 in self.staged.get(0, ())
 
     def settled(self) -> bool:
         """Every fully staged timepoint is archived or failed, nothing in flight."""
@@ -318,6 +339,11 @@ class ZarrLiveLane(LiveLane):
         for other in self.sessions.values():
             if other.dsr_dir == session.dsr_dir and not other.superseded:
                 self._supersede(other, by=session_id)
+        # Their archive copies write into the GPFS store this session is about
+        # to re-create: stop them first, or stale chunks land in the new one.
+        self._stop_archives(
+            [o for o in self.sessions.values() if o.superseded and o.archiving]
+        )
         self._evict_views(keep={session_id, *self.sessions})
 
         shape = dsr_shape_zyx(
@@ -383,17 +409,72 @@ class ZarrLiveLane(LiveLane):
         if self.qc and raw is not None and not session.superseded:
             self._submit_qc(session, t, cidx, raw)
 
+    def end_session(self, session_id: str, end: dict | None = None) -> None:
+        session = self.sessions.get(session_id)
+        if session is not None and not session.ended:
+            session.ended_at = self._clock()
+        super().end_session(session_id, end)
+
     # --- pump steps ---------------------------------------------------------
+
+    def pump(self) -> None:
+        super().pump()
+        for session in list(self.sessions.values()):
+            if self._give_up_unfinishable(session) and session.settled():
+                self._finalize(session)
+
+    def _give_up_unfinishable(self, session: ZarrLiveSession) -> bool:
+        """After `ended`, fail what can never finish so the session settles
+        (LIVE-01): volumes waiting on a (0, 0) that did not arrive can never
+        be dispatched, and tickets that nothing has claimed or finished for
+        `POST_END_STALL_S` are not coming back. Without this the session
+        stayed "running" for good, holding the live lease and the dataset off
+        the backfill until the receiver restarted. Returns True if it gave
+        something up."""
+        if not session.ended or session.superseded:
+            return False
+        gave_up = False
+        if session.ready and not session.dispatchable():
+            ts = sorted({t for t, _ in session.ready})
+            logger.error(
+                "Live lane (zarr): session %s ended without T=0 C=0, so nothing "
+                "can be dispatched; T=%s left to the batch backfill",
+                session.session_id,
+                ts,
+            )
+            session.failed.update(ts)
+            session.ready.clear()
+            gave_up = True
+        waited = self._clock() - max(session.ended_at, session.last_progress_at)
+        if session.tickets and waited >= POST_END_STALL_S:
+            ts = sorted({tk.t for tk in session.tickets.values()})
+            logger.error(
+                "Live lane (zarr): session %s ended %.0f s ago and %d ticket(s) "
+                "have made no progress; giving up, T=%s left to the batch backfill",
+                session.session_id,
+                waited,
+                len(session.tickets),
+                ts,
+            )
+            queue_dir = lanes.live_queue_dir(self.jobs)
+            for name in session.tickets:  # a server must not claim them later
+                (queue_dir / name).unlink(missing_ok=True)
+            session.failed.update(ts)
+            session.tickets.clear()
+            gave_up = True
+        return gave_up
 
     def _dispatch(self, session: ZarrLiveSession) -> None:
         if session.superseded or not session.ready:
             return
-        if 0 not in session.staged or 0 not in session.staged[0]:
+        if not session.dispatchable():
             return  # the erosion mask comes from (0, 0)
         free = self.max_outstanding - self._in_flight()
         session.ready.sort()
         while session.ready and free > 0:
             t, c = session.ready.pop(0)
+            if any((tk.t, tk.c) == (t, c) for tk in session.tickets.values()):
+                continue  # already out (a volume staged twice)
             self._submit(session, t, c, attempt=1)
             free -= 1
 
@@ -498,7 +579,41 @@ class ZarrLiveLane(LiveLane):
         except OSError as exc:
             logger.warning("Live lane (zarr): no warm-up spec written: %s", exc)
 
+    def _queued_ticket(self, session: ZarrLiveSession, t: int, c: int) -> str | None:
+        """The name of a ticket for this very (t, c) that is already queued or
+        claimed: one a previous receiver process left behind (LIVE-09). A
+        second one would put two servers on the same view buffer and chunks."""
+        queue_dir = lanes.live_queue_dir(self.jobs)
+        want = (str(session.raw_arrays[c]), str(session.buffer(t, c)))
+        try:
+            paths = list(queue_dir.glob("*.json"))  # includes `.active_*` claims
+        except OSError:
+            return None
+        for path in sorted(paths):
+            try:
+                tk = json.loads(path.read_text())
+                p = tk["parameters"]
+                if tk["jobType"] != "live_zarr" or (p["t"], p["c"]) != (t, c):
+                    continue
+                if (p["raw_store"], p["view_npy"]) == want:
+                    return path.name.removeprefix(".active_")
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # not (yet) a readable ticket
+        return None
+
     def _submit(self, session: ZarrLiveSession, t: int, c: int, attempt: int) -> None:
+        queued = self._queued_ticket(session, t, c)
+        if queued is not None:
+            logger.info(
+                "Live lane (zarr): T=%d C=%d of %s already has ticket %s; "
+                "following it instead of queueing another",
+                t,
+                c,
+                session.base_name,
+                queued,
+            )
+            session.tickets[queued] = _ZTicket(queued, t, c, attempt)
+            return
         ticket = submit_live_zarr_job(
             session.raw_arrays[c],
             t,
@@ -533,6 +648,7 @@ class ZarrLiveLane(LiveLane):
                 )
             if (self.jobs / "completed" / name).exists():
                 del session.tickets[name]
+                session.last_progress_at = self._clock()
                 trace.record(
                     "ticket_done",
                     jobs=self._jobs,
@@ -556,6 +672,7 @@ class ZarrLiveLane(LiveLane):
                 session.archiving[tc] = self._pool.submit(self._archive, session, *tc)
             elif (self.jobs / "failed" / name).exists():
                 del session.tickets[name]
+                session.last_progress_at = self._clock()
                 if session.superseded:
                     continue
                 if ticket.attempt < 2:
@@ -576,6 +693,20 @@ class ZarrLiveLane(LiveLane):
                     session.failed.add(ticket.t)
         self._trim_buffers(session)
 
+    @staticmethod
+    def _stop_archives(sessions: list[ZarrLiveSession]) -> None:
+        """Cancel the archive copies not started and wait for those running
+        (`_archive` stops at its next file once its session is superseded), so
+        nothing of these sessions writes to GPFS afterwards (LIVE-06)."""
+        futures = [f for s in sessions for f in s.archiving.values()]
+        for fut in futures:
+            fut.cancel()
+        wait([f for f in futures if not f.cancelled()], timeout=ARCHIVE_STOP_WAIT_S)
+        for s in sessions:
+            for tc, fut in list(s.archiving.items()):
+                if fut.cancelled():
+                    del s.archiving[tc]
+
     def _archive(self, session: ZarrLiveSession, t: int, c: int) -> None:
         """Copy (t, c)'s chunk files, unchanged, from the RAM-disk store to
         the GPFS one. Each file lands under a temp name and is renamed into
@@ -590,6 +721,8 @@ class ZarrLiveLane(LiveLane):
             dst_dir = session.archive_store / arr.relative_to(session.view_store)
             dst_dir = dst_dir / str(t) / str(c)
             for src in src_dir.rglob("*"):
+                if session.superseded:
+                    return  # a newer session owns the store now (LIVE-06)
                 if not src.is_file():
                     continue
                 dst = dst_dir / src.relative_to(src_dir)
@@ -616,6 +749,8 @@ class ZarrLiveLane(LiveLane):
                 )
                 session.failed.add(tc[0])
                 continue
+            if session.superseded:
+                continue  # its store is the newer session's now
             session.archived.add(tc)
             changed = True
             if self._all_channels(session, session.archived, tc[0]):

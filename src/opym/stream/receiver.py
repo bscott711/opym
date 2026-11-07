@@ -431,6 +431,14 @@ def _estimate_session_bytes(header: dict[str, Any]) -> int:
     return nz * ny * nx * itemsize * header["num_timepoints"] * len(header["channels"])
 
 
+def _estimate_view_bytes(raw_bytes: int) -> int:
+    """What the one-format live lane's view store adds on the RAM disk, which
+    it shares with the raw staging (0 when that lane is off; LIVE-05)."""
+    if _live_lane_enabled() and _decon_enabled() and live_zarr.live_format() == "zarr":
+        return int(raw_bytes * live_zarr.VIEW_STORE_RAW_RATIO)
+    return 0
+
+
 @dataclass
 class _SlabAssembly:
     """One (t, c) volume arriving as z-slabs (FRAME headers with `z0`)."""
@@ -500,6 +508,10 @@ class SessionState:
     live_zarr: bool = False
     """...by the one-format lane (opym.stream.live_zarr): its GPU tickets read
     the raw store directly, so no decon TIFF is staged."""
+    live_view_skipped: str = ""
+    """Why this session runs without a live view although the lane is on (the
+    RAM disk had room for the raw data but not for the view store as well;
+    LIVE-05). Empty when the view was not skipped. Shown in stream_health.json."""
     t_interval_s: float = 0.0
     accepts_qc: bool = False
     """The client listed "qc" in SESSION_START's `accepts`: forward MSG_QC."""
@@ -600,12 +612,18 @@ class StreamReceiver:
         # needing the receiver process restarted -- mirrors `_decon_enabled`
         # being read fresh per SESSION_START rather than cached at startup.
         stage_root = _stage_root_from_env()
+        # Created on the first live session (see _maybe_start_live), so the
+        # env switches stay readable per session like the others here. Set
+        # before the drain pool starts: its threads ask which sessions the
+        # lane is still reading (LIVE-04, ING-F8).
+        self._live: LiveLane | None = None
         self._drain_pool = drain.DrainPool(
             num_workers=drain_workers,
             retention_s=drain_retention_s,
             high_water_bytes=drain_high_water_bytes,
             manifest_dir=stage_root / ".drain_manifests" if stage_root else None,
             on_state=self._drain_state,
+            protected=self._running_live_sessions,
         )
         self._drain_pool.start()
         self._lease = lanes.LeaseKeeper()
@@ -613,9 +631,6 @@ class StreamReceiver:
         self._stage_short = False
         self._last_short_warning = float("-inf")
         self._freeing: threading.Thread | None = None
-        # Created on the first live session (see _maybe_start_live), so the
-        # env switches stay readable per session like the others here.
-        self._live: LiveLane | None = None
 
         self._ctx = zmq.Context.instance()
         self._socket = self._ctx.socket(zmq.ROUTER)
@@ -1015,6 +1030,7 @@ class StreamReceiver:
                     "STREAMING_PROTOCOL.md's SESSION_START fields"
                 )
 
+            live_view_skipped = ""
             stage_root = _stage_root_from_env()
             write_root = (
                 stage_root / _stage_namespace(raw_root)
@@ -1033,14 +1049,25 @@ class StreamReceiver:
                 # mid-session, and 2x turned a back-to-back movie down
                 # while the previous one was still draining (2026-09-28:
                 # 114.8 GB free for a 64.7 GB session). See module docstring.
-                need_bytes = estimated_bytes + _stage_floor_bytes()
+                # The live view store (LIVE-05) is the convenience: when only
+                # it does not fit, the session is accepted and runs without a
+                # live view; only the raw data not fitting rejects it.
+                view_bytes = _estimate_view_bytes(estimated_bytes)
+                raw_need = estimated_bytes + _stage_floor_bytes()
+                need_bytes = raw_need + view_bytes
                 if need_bytes > free_bytes:
                     free_bytes = self._free_stage_space(stage_root, need_bytes)
                 if need_bytes > free_bytes:
-                    raise _StageShort(
+                    if raw_need > free_bytes:
+                        raise _StageShort(
+                            f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
+                            f"free, need {raw_need / 1e9:.1f} GB (this session's "
+                            f"estimated {estimated_bytes / 1e9:.1f} GB + the floor)"
+                        )
+                    live_view_skipped = (
                         f"RAM disk {stage_root} has {free_bytes / 1e9:.1f} GB "
-                        f"free, need {need_bytes / 1e9:.1f} GB (this session's "
-                        f"estimated {estimated_bytes / 1e9:.1f} GB + the floor)"
+                        f"free, the raw data needs {raw_need / 1e9:.1f} GB and "
+                        f"the live view store {view_bytes / 1e9:.1f} GB more"
                     )
 
             base_name = self._resolve_base_name(
@@ -1096,6 +1123,7 @@ class StreamReceiver:
                 t_interval_s=float(header.get("t_interval_s") or 0.0),
                 ack_floor=-1 if resume_through is None else resume_through,
                 resumed=resume_through is not None,
+                live_view_skipped=live_view_skipped,
             )
         except (KeyError, ValueError, TypeError, OSError) as exc:
             logger.warning("Rejecting SESSION_START for %s: %s", session_id, exc)
@@ -1109,8 +1137,15 @@ class StreamReceiver:
 
         self.sessions[session_id] = session
         self._unknown_noticed.pop(session_id, None)
+        if session.live_view_skipped:
+            logger.warning(
+                "Session %s: receiving without a live view (%s)",
+                session_id,
+                session.live_view_skipped,
+            )
         try:
-            self._maybe_start_live(session)
+            if not session.live_view_skipped:
+                self._maybe_start_live(session)
         except Exception:
             # The live view is a convenience; the acquisition is not. An
             # unreachable PSF (GPFS down after a reboot, 2026-10-23) used to
@@ -2375,6 +2410,8 @@ class StreamReceiver:
                     ),
                     "client": s.client_status,
                     "client_summary": outcome.describe_client(s.client_status),
+                    "live_view": s.live,
+                    "live_view_skipped": s.live_view_skipped or None,
                 }
             )
         record = {
