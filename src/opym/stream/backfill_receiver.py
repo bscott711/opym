@@ -577,6 +577,27 @@ class BackfillReceiver:
 
     # ---- metadata --------------------------------------------------------------------------
     def _meta(self, header: dict) -> dict[str, Any]:
+        """Apply the small files. A refusal leaves a store that was marked complete
+        marked: the marker is taken down for the edit (so a crash mid-way never
+        leaves a half-edited "complete" store) and put back when the edit fails."""
+        dest, err = self._store_dir(header)
+        if err:
+            return self._meta_apply(header)
+        marker = dest / bfill.MARKER_NAME
+        lock = dest / bfill.LOCK_NAME
+        try:
+            saved = marker.read_bytes()
+        except OSError:
+            saved = None
+        had_lock = lock.exists()
+        reply = self._meta_apply(header)
+        if saved is not None and not reply.get("ok") and not marker.exists():
+            bfill.atomic_write(marker, saved)
+            if not had_lock:
+                lock.unlink(missing_ok=True)
+        return reply
+
+    def _meta_apply(self, header: dict) -> dict[str, Any]:
         dest, err = self._store_dir(header)
         if err:
             self._count("rejected")

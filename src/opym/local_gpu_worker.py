@@ -43,11 +43,13 @@ import re
 import shutil
 import signal
 import subprocess  # nosec B404
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from opym import lanes
 from opym.consolidate import run_pending_consolidations
@@ -142,6 +144,13 @@ MAX_REQUEUES = 2
 DEFAULT_HANG_AFTER_S = 60 * 60
 HANG_CHECK_EVERY_S = 300.0
 ORPHAN_SWEEP_EVERY_S = 60.0
+# A `.active_` ticket that no claim record names, seen for this long while a
+# server is running, is an orphan: run_petakit_server.m writes the record
+# right after the rename, so a gap this long is not a claim in progress.
+STRAY_CLAIM_GRACE_S = 120.0
+# Ticket types run_petakit_server.m dispatches to a parfeval worker and then
+# forgets (claim cleared at once): an in-flight one is never a stray claim.
+ASYNC_JOB_TYPES = frozenset({"pipeline", "pipeline_batch"})
 DEFAULT_PREEMPT_AFTER_S = 30.0
 KILL_GRACE_S = 20.0
 # A live ticket runs in ~0.5 s warm and ~10 s cold (PSF cache built, code
@@ -330,6 +339,41 @@ def oldest_claimable_age(queue_dir: Path, now: float) -> float | None:
     return now - min(mtimes) if mtimes else None
 
 
+def spawn_thread(fn: Callable[[], Any]) -> Future:
+    """Run `fn` on a daemon thread; the Future carries its result. The slow
+    GPFS work of a tick (the hang-check walk, consolidation) goes through
+    this, so live deadline, preemption and launches never wait on it."""
+    fut: Future = Future()
+
+    def run() -> None:
+        try:
+            fut.set_result(fn())
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            fut.set_exception(exc)
+
+    threading.Thread(target=run, name="opym-serve-worker", daemon=True).start()
+    return fut
+
+
+def run_inline(fn: Callable[[], Any]) -> Future:
+    """`spawn_thread` without the thread: for tests that need a tick to finish
+    its work before they look."""
+    fut: Future = Future()
+    try:
+        fut.set_result(fn())
+    except Exception as exc:  # noqa: BLE001
+        fut.set_exception(exc)
+    return fut
+
+
+class HangWalk(NamedTuple):
+    """A newest-file walk of a claimed ticket's dataDir, running off the tick."""
+
+    future: Future
+    claim: Claim
+    data_dir: str
+
+
 @dataclass
 class ServerSlot:
     server_id: str
@@ -342,13 +386,15 @@ class ServerSlot:
     hang_flagged_ticket: str | None = None
     preempting: bool = False
     last_exit_code: int | None = None
+    hang_walk: HangWalk | None = None
 
 
 class ServerSupervisor:
     """Drives the servers one `tick()` at a time; `process_queue` loops it.
 
     `launch(slot) -> Popen`, `clock() -> float`, `any_server_alive()`,
-    `lease_active()` and `warm_active()` are injectable for tests.
+    `lease_active()`, `warm_active()` and `spawn()` (how slow work leaves the
+    tick) are injectable for tests.
     """
 
     def __init__(
@@ -366,6 +412,7 @@ class ServerSupervisor:
         lease_active: Callable[[], bool] | None = None,
         warm_active: Callable[[], bool] | None = None,
         live_deadline_s: float | None = DEFAULT_LIVE_DEADLINE_S,
+        spawn: Callable[[Callable[[], Any]], Future] = spawn_thread,
     ) -> None:
         self.base_dir = Path(base_dir)
         self.queue_dir = lanes.backfill_queue_dir(self.base_dir)
@@ -386,10 +433,13 @@ class ServerSupervisor:
         self.kill_hung = kill_hung
         self.slots = [ServerSlot(sid, dev) for sid, dev in SERVERS]
         self._launch = launch or self._launch_matlab
+        self._spawn = spawn
+        self._consolidation: Future | None = None
         self._clock = clock
         self._any_server_alive = any_server_alive
         self._clean_exit_pending_consolidation = False
         self._last_orphan_sweep = float("-inf")
+        self._stray_seen: dict[Path, float] = {}
         for d in (
             self.queue_dir,
             self.live_queue_dir,
@@ -407,13 +457,21 @@ class ServerSupervisor:
             if slot.proc is not None and slot.proc.poll() is not None:
                 self._on_exit(slot, now)
 
-        if not any(s.proc is not None for s in self.slots):
-            if now - self._last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
-                self._last_orphan_sweep = now
-                self._reclaim_unowned()
-            if self._clean_exit_pending_consolidation:
-                self._clean_exit_pending_consolidation = False
-                self._run_consolidations()
+        if now - self._last_orphan_sweep >= ORPHAN_SWEEP_EVERY_S:
+            self._last_orphan_sweep = now
+            if not any(s.proc is not None for s in self.slots):
+                self._reclaim_unowned(now)
+            else:
+                self._reclaim_strays(now)
+        if (
+            not any(s.proc is not None for s in self.slots)
+            and self._clean_exit_pending_consolidation
+            and (self._consolidation is None or self._consolidation.done())
+        ):
+            # Off the tick: it walks GPFS for minutes, and a live lease
+            # appearing meanwhile must still get its servers.
+            self._clean_exit_pending_consolidation = False
+            self._consolidation = self._spawn(self._run_consolidations)
 
         # A fresh live or warm lease starts servers before the first ticket
         # lands: Matlab takes ~16 s to come up, then warms for the shape.
@@ -425,6 +483,7 @@ class ServerSupervisor:
         ):
             for slot in self.slots:
                 if slot.proc is None and now >= slot.next_launch_at:
+                    self._kill_leftovers(slot)
                     print(
                         f"🚀 Launching server {slot.server_id} "
                         f"on GPU {slot.cuda_device}...",
@@ -439,6 +498,7 @@ class ServerSupervisor:
             ):
                 slot.last_hang_check = now
                 self._check_hang(slot, now)
+            self._collect_hang_walk(slot, now)
 
         if self.live_deadline_s and self.live_deadline_s > 0:
             self._check_live_deadline(now)
@@ -456,6 +516,10 @@ class ServerSupervisor:
         slot.last_exit_code = rc
         slot.idle_s = None
         slot.hang_flagged_ticket = None
+        slot.hang_walk = None
+        # Before the ticket goes back (and its partial outputs go): the exit of
+        # the `bash -c` wrapper does not mean MATLAB is gone.
+        self._kill_leftovers(slot)
         if slot.preempting:
             # Our own kill, to hand the GPU to live work: not a failure, so no
             # backoff, and the backfill ticket's requeue doesn't count.
@@ -502,13 +566,33 @@ class ServerSupervisor:
             flush=True,
         )
 
+    def _kill_leftovers(self, slot: ServerSlot) -> None:
+        """Kill whatever still carries this slot's PETAKIT_SERVER_ID although
+        the server it belongs to is gone (MATLAB or a parpool worker that
+        outlived the wrapper). Left running, it would write into a dataDir the
+        requeue is about to sweep and fight the next server for the GPU."""
+        if slot.proc is not None and slot.proc.poll() is None:
+            return
+        pids = _server_pids(slot.server_id, self.base_dir)
+        if not pids:
+            return
+        print(
+            f"🔪 Server {slot.server_id}: {len(pids)} process(es) outlived it "
+            f"(pids {', '.join(map(str, sorted(pids)[:5]))}); killing them.",
+            flush=True,
+        )
+        self._kill(slot)
+
     def _claim_path(self, slot: ServerSlot) -> Path:
         return self.claims_dir / f"S{slot.server_id}.json"
 
     def _read_claim(self, slot: ServerSlot) -> Claim | None:
         """The ticket this server holds, or None. Records written before
         lanes existed have no "queue" field and came from the backfill queue."""
-        path = self._claim_path(slot)
+        return self._read_claim_file(self._claim_path(slot))
+
+    @staticmethod
+    def _read_claim_file(path: Path) -> Claim | None:
         try:
             rec = json.loads(path.read_text())
             lane = str(rec.get("queue") or lanes.BACKFILL_QUEUE_NAME)
@@ -549,36 +633,121 @@ class ServerSupervisor:
                 flush=True,
             )
 
-    def _reclaim_unowned(self) -> None:
+    def _reclaim_unowned(self, now: float | None = None) -> None:
         """With no server process alive at all, nothing can legitimately hold
         a claim, so every `.active_` ticket is an orphan. Also finishes any
-        requeue interrupted between its write and its rename."""
+        requeue interrupted between its write and its rename. Reclaiming does
+        not count against the ticket's requeue cap: the ticket did nothing
+        wrong, a supervisor restart is not a failure of it (three restarts
+        used to send a ticket to failed/)."""
         if self._any_server_alive():
-            return  # e.g. a server launched by hand outside this supervisor
+            # e.g. a server launched by hand outside this supervisor: its
+            # tickets have claim records, the rest are strays
+            self._reclaim_strays(self._clock() if now is None else now)
+            return
         for lane_dir in (self.live_queue_dir, self.queue_dir):
             for staging in lane_dir.glob(".requeue_*.json"):
                 os.replace(staging, lane_dir / staging.name.removeprefix(".requeue_"))
             for active in sorted(lane_dir.glob(".active_*.json")):
-                outcome = requeue_claim(active, "orphaned claim: no server was running")
+                if lane_dir == self.queue_dir:
+                    # No server runs, so nothing is writing: the killed
+                    # server's half-written outputs go before the ticket does
+                    # (live tickets share their session's dataDir; not swept).
+                    self._sweep_partials(active)
+                outcome = requeue_claim(
+                    active, "orphaned claim: no server was running", count=False
+                )
                 print(f"♻️  {active.name}: {outcome} (orphaned claim)", flush=True)
         for rec in self.claims_dir.glob("S*.json"):
             rec.unlink(missing_ok=True)
 
+    def _claimed_tickets(self) -> set[tuple[str, str]]:
+        """(lane, ticket) of every claim record, whichever server wrote it."""
+        held = set()
+        for rec in self.claims_dir.glob("S*.json"):
+            claim = self._read_claim_file(rec)
+            if claim is not None:
+                held.add((claim.lane, claim.ticket))
+        return held
+
+    @staticmethod
+    def _is_async_ticket(active: Path) -> bool:
+        try:
+            job_type = json.loads(active.read_text()).get("jobType")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return job_type in ASYNC_JOB_TYPES
+
+    def _reclaim_strays(self, now: float) -> None:
+        """Servers are running, but a `.active_` ticket that no claim record
+        names (its server died before writing one, or its record was lost) has
+        no owner and would sit until the idle timeout, its dataset `running`.
+        Seen unowned for STRAY_CLAIM_GRACE_S, it is put back like any
+        orphan, per lane, with its partial outputs swept first (backfill).
+
+        Async pipeline tickets (ASYNC_JOB_TYPES) are skipped: the server hands
+        them to a parfeval worker and clears its claim record at once, and the
+        worker moves `.active_` to completed/ or failed/ when it finishes. An
+        in-flight one has no record, so it is neither swept nor requeued here
+        (if the whole host dies, the orphan reclaim at the next start takes
+        it)."""
+        held = self._claimed_tickets()
+        unowned: dict[Path, float] = {}
+        for lane_dir in (self.live_queue_dir, self.queue_dir):
+            for active in sorted(lane_dir.glob(".active_*.json")):
+                if (lane_dir.name, active.name.removeprefix(".active_")) in held:
+                    continue
+                if self._is_async_ticket(active):
+                    continue
+                first = self._stray_seen.get(active, now)
+                unowned[active] = first
+                if now - first < STRAY_CLAIM_GRACE_S:
+                    continue
+                if lane_dir == self.queue_dir:
+                    self._sweep_partials(active)
+                outcome = requeue_claim(
+                    active, "orphaned claim: no server holds it", count=False
+                )
+                print(f"♻️  {active.name}: {outcome} (stray claim)", flush=True)
+                unowned.pop(active)
+        self._stray_seen = unowned
+
     # --- hang detection -------------------------------------------------------
 
     def _check_hang(self, slot: ServerSlot, now: float) -> None:
+        """Start the newest-file walk of the claimed ticket's dataDir. The walk
+        covers the whole tree on GPFS, so it runs off the tick;
+        `_collect_hang_walk` acts on its result."""
+        if slot.hang_walk is not None:
+            return  # the last one is still walking
         claim = self._read_claim(slot)
         if claim is None:
             slot.idle_s = None
             return
-        ticket, claimed_at = claim.ticket, claim.claimed_at
         try:
             data_dir = json.loads(claim.active_path(self.base_dir).read_text())[
                 "dataDir"
             ]
         except (OSError, ValueError, KeyError, TypeError):
             return
-        last_write = max(claimed_at, newest_mtime(Path(data_dir)) or 0.0)
+        slot.hang_walk = HangWalk(
+            self._spawn(lambda: newest_mtime(Path(data_dir))), claim, data_dir
+        )
+
+    def _collect_hang_walk(self, slot: ServerSlot, now: float) -> None:
+        walk = slot.hang_walk
+        if walk is None or not walk.future.done():
+            return
+        slot.hang_walk = None
+        try:
+            newest = walk.future.result()
+        except Exception:  # noqa: BLE001 - an unreadable tree is not a hang
+            return
+        current = self._read_claim(slot)
+        if current is None or current.ticket != walk.claim.ticket:
+            return  # the server moved on while we walked
+        ticket, data_dir = walk.claim.ticket, walk.data_dir
+        last_write = max(walk.claim.claimed_at, newest or 0.0)
         slot.idle_s = now - last_write
         if slot.idle_s < self.hang_after_s or slot.hang_flagged_ticket == ticket:
             return

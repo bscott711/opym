@@ -87,3 +87,84 @@ def test_consolidate_rejects_mismatched_channel_shapes(tmp_path):
 
     # Refuses to write anything, rather than a partially-correct store.
     assert not (tmp_path / f"{base_name}.ome.zarr").exists()
+
+
+def test_the_log_tee_only_takes_the_consolidating_threads_output(tmp_path):
+    """BF-08: consolidation runs on a worker thread while the supervisor's own
+    thread keeps printing to the same sys.stdout: those lines are not
+    consolidation log lines."""
+    import io
+    import threading
+
+    from opym.consolidate import _TeeWriter
+
+    out, log = io.StringIO(), io.StringIO()
+    tee = _TeeWriter(out, log)
+    tee.write("mine\n")
+    t = threading.Thread(target=lambda: tee.write("supervisor\n"))
+    t.start()
+    t.join()
+    assert out.getvalue() == "mine\nsupervisor\n"
+    assert log.getvalue() == "mine\n"
+
+
+def _frame_zarrs(root, base, ts, cs=(0,), shape=(4, 3, 2)):
+    for t in ts:
+        for c in cs:
+            vol = np.full(shape, t * 10 + c + 1, dtype=np.uint16)
+            zarr.save_array(str(root / f"{base}_T{t:04d}_C{c}.zarr"), vol, chunks=shape)
+
+
+def _consolidate(root, base, **kw):
+    return consolidate_to_ome_zarr(
+        decon_dir=root,
+        base_name=base,
+        z_step_um=0.3,
+        xy_pixel_um=0.116,
+        t_interval_s=1.0,
+        channel_names=["C0"],
+        **kw,
+    )
+
+
+def test_a_missing_timepoint_leaves_a_blank_frame_not_a_shifted_series(tmp_path):
+    """BF-09: time indices came from the entries present, so T=1 missing made T=2
+    land on index 1, one frame early, and everything after it too."""
+    _frame_zarrs(tmp_path, "s", ts=[0, 2, 3])
+    assert _consolidate(tmp_path, "s")
+    arr = np.asarray(zarr.open(str(tmp_path / "s.ome.zarr" / "0"), mode="r"))
+    assert arr.shape[:2] == (4, 1)
+    assert [int(arr[t, 0].max()) for t in range(4)] == [1, 0, 21, 31]
+
+
+def test_pending_consolidation_keeps_its_sidecar_while_zarrs_are_missing(tmp_path):
+    """BF-09: the sidecar went away after the first pass: a gap was never repaired."""
+    from opym.consolidate import run_pending_consolidations
+
+    jobs = tmp_path / "jobs"
+    (jobs / "completed").mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    (jobs / "completed" / "t.json").write_text(json.dumps({"dataDir": str(data)}))
+    expected = [f"s_T{t:04d}_C0.zarr" for t in range(3)]
+    (data / ".opym_consolidate.json").write_text(
+        json.dumps(
+            {
+                "base_name": "s",
+                "z_step_um": 0.3,
+                "xy_pixel_um": 0.116,
+                "t_interval_s": 1.0,
+                "channel_names": ["C0"],
+                "expected_zarrs": expected,
+            }
+        )
+    )
+    _frame_zarrs(data, "s", ts=[0, 2])
+    assert run_pending_consolidations(jobs) == 1
+    assert (data / ".opym_consolidate.json").exists()
+
+    _frame_zarrs(data, "s", ts=[1])  # the late frame arrives
+    assert run_pending_consolidations(jobs) == 1
+    assert not (data / ".opym_consolidate.json").exists()
+    arr = np.asarray(zarr.open(str(data / "s.ome.zarr" / "0"), mode="r"))
+    assert [int(arr[t, 0].max()) for t in range(3)] == [1, 11, 21]

@@ -1010,3 +1010,47 @@ def test_a_cut_off_3d_volume_is_finished_not_taken_for_complete(world):
     assert res["result"] == "complete"
     assert arrays_equal(src, there)
     assert bfill.read_marker(there) is not None
+
+
+def test_a_refused_metadata_request_leaves_a_finished_store_marked(world):
+    """BF-03: `_meta` took the completion marker down before validating, so a re-send
+    with a conflicting small file was refused AND the verified store lost its marker."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    assert leaf_report(world.client().run_once(), src.name)["result"] == "complete"
+    dst = remote_store(world)
+    marker_before = (dst / bfill.MARKER_NAME).read_bytes()
+    zarray = json.loads((src / "p0" / ".zarray").read_text())
+    zarray["dtype"] = "<f4"
+    call, sock = _raw(world)
+    try:
+        header = {"leaf": str(dst.parent), "store": dst.name}
+        reply = call(bfill.BF_META, {**header, "files": [
+            {"rel": "p0/.zarray", "data": json.dumps(zarray).encode()}]})
+        assert not reply["ok"] and "differs" in reply["error"]
+        escape = {"rel": "../../escape", "data": b"x"}
+        reply = call(bfill.BF_META, {**header, "files": [escape]})
+        assert not reply["ok"] and "unsafe" in reply["error"]
+    finally:
+        sock.close(0)
+    assert (dst / bfill.MARKER_NAME).read_bytes() == marker_before
+    assert bfill.read_marker(dst)
+    assert not (dst / bfill.LOCK_NAME).exists()
+    assert arrays_equal(src, dst)
+
+
+def test_an_accepted_metadata_request_still_takes_the_marker_down(world):
+    """Control for BF-03: a request that is applied really does modify the store, so
+    its marker stays down until the next commit re-verifies it."""
+    src = make_store(world.local / "exp" / "cell_001_GFP_488.ome.zarr")
+    world.client().run_once()
+    dst = remote_store(world)
+    call, sock = _raw(world)
+    try:
+        zarray = (src / "p0" / ".zarray").read_bytes()
+        header = {"leaf": str(dst.parent), "store": dst.name}
+        files = [{"rel": "p0/.zarray", "data": zarray}]
+        reply = call(bfill.BF_META, {**header, "files": files})
+        assert reply["ok"]
+    finally:
+        sock.close(0)
+    assert bfill.read_marker(dst) is None

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,8 @@ def _make_supervisor(tmp_path, **kwargs):
         return proc
 
     clock = kwargs.pop("clock", _Clock())
+    # Slow work runs inline so a tick has finished it by the time a test looks.
+    kwargs.setdefault("spawn", local_gpu_worker.run_inline)
     sup = ServerSupervisor(
         tmp_path / "petakit_jobs",
         launch=launch,
@@ -716,3 +719,301 @@ def test_rc_127_is_reported_loudly_and_in_the_status(tmp_path, capsys):
     assert s1["launch_env_broken"] is True
     s2 = next(s for s in status["servers"] if s["server_id"] == "2")
     assert s2["launch_env_broken"] is False
+
+
+def _orphaned_backfill_active(sup, data):
+    """A backfill ticket whose server was killed with the whole host
+    (systemctl restart opym-serve): `.active_` ticket, no process, no claim."""
+    active = sup.queue_dir / ".active_bf_orphan.json"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.write_text(json.dumps({"jobType": "deskew", "dataDir": str(data)}))
+    return active
+
+
+def test_orphan_reclaim_sweeps_a_backfill_tickets_partial_outputs(tmp_path):
+    """BF-01: after a restart the killed server's "<name>_<uuid>.tif/.zarr"
+    outputs stayed in the data dir, where globs read them as extra frames."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path)
+    _orphaned_backfill_active(sup, data)
+    sup.tick()
+    assert (sup.queue_dir / "bf_orphan.json").exists()
+    assert not [p for p in data.rglob("*") if UUID in p.name]
+    assert (data / "Decon" / "DSR_decon" / "cell_C0_T000.tif").exists()
+
+
+def test_orphan_reclaim_leaves_a_live_tickets_data_dir_alone(tmp_path):
+    """Negative control for BF-01: live tickets share their session's dataDir."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path)
+    active = sup.live_queue_dir / ".active_LIVE_t000.json"
+    active.write_text(json.dumps({"jobType": "deskew", "dataDir": str(data)}))
+    sup.tick()
+    assert (sup.live_queue_dir / "LIVE_t000.json").exists()
+    assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
+
+
+def test_orphan_reclaim_does_not_sweep_while_a_server_is_alive(tmp_path):
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, _, _ = _make_supervisor(tmp_path, any_server_alive=lambda: True)
+    _orphaned_backfill_active(sup, data)
+    sup.tick()
+    assert len([p for p in data.rglob("*") if UUID in p.name]) == 3
+
+
+# --- BF-06: orphan reclaim per lane, not only when no server runs -------------
+
+
+def test_a_stray_claim_is_reclaimed_while_other_servers_are_busy(tmp_path):
+    """BF-06: an `.active_` ticket no claim record names stayed for as long as ANY
+    server was up, its dataset `running` until the idle timeout."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_busy.json")
+    sup.tick()  # server 1 and 2 start
+    _claim(sup, "1", "bf_busy.json")
+    _orphaned_backfill_active(sup, data)  # claimed by a server that then died
+    stray = sup.queue_dir / ".active_bf_orphan.json"
+
+    clock.t += local_gpu_worker.ORPHAN_SWEEP_EVERY_S
+    sup.tick()  # first seen: could still be a claim in progress
+    assert stray.exists()
+    clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+    sup.tick()
+    assert not stray.exists()
+    assert (sup.queue_dir / "bf_orphan.json").exists()
+    assert (sup.queue_dir / ".active_bf_busy.json").exists()  # the owned one stays
+    assert not [p for p in data.rglob("*") if UUID in p.name]
+
+
+def test_a_claim_with_a_record_is_never_a_stray(tmp_path):
+    """Control for BF-06: a ticket a running server holds is left alone however
+    long it runs."""
+    sup, _, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_busy.json")
+    sup.tick()
+    _claim(sup, "1", "bf_busy.json")
+    for _ in range(5):
+        clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+        sup.tick()
+    assert (sup.queue_dir / ".active_bf_busy.json").exists()
+    assert not (sup.queue_dir / "bf_busy.json").exists()
+
+
+def test_a_claim_record_in_the_other_lane_does_not_own_a_same_named_ticket(tmp_path):
+    sup, _, clock = _make_supervisor(tmp_path)
+    _ticket(sup.live_queue_dir, "same.json")
+    sup.tick()
+    _claim(sup, "1", "same.json", lane="queue_live")
+    _ticket(sup.queue_dir, ".active_same.json")
+    for _ in range(2):
+        clock.t += local_gpu_worker.STRAY_CLAIM_GRACE_S
+        sup.tick()
+    assert (sup.queue_dir / "same.json").exists()
+    assert (sup.live_queue_dir / ".active_same.json").exists()
+
+
+@pytest.mark.parametrize("job_type", ["pipeline", "pipeline_batch"])
+def test_an_async_pipeline_ticket_in_flight_is_not_a_stray(tmp_path, job_type):
+    """BF-06 (R10): the server hands `pipeline`/`pipeline_batch` to a parfeval
+    worker and clears its claim record at once, so an in-flight one has an
+    `.active_` file and no record for as long as it runs. It must be neither
+    requeued nor have its live outputs swept."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, clock = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "next.json")
+    sup.tick()
+    inflight = sup.queue_dir / ".active_batch.json"
+    inflight.write_text(json.dumps({"jobType": job_type, "dataDir": str(data)}))
+    _claim(sup, "1", "next.json")
+    for _ in range(4):
+        clock.t += local_gpu_worker.ORPHAN_SWEEP_EVERY_S
+        sup.tick()
+    assert inflight.exists()
+    assert not (sup.queue_dir / "batch.json").exists()
+    assert [p for p in data.rglob("*") if UUID in p.name]
+
+
+def test_reclaiming_orphans_does_not_count_against_the_requeue_cap(tmp_path):
+    """BF-06: three supervisor restarts sent a ticket to failed/."""
+    sup, _, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, ".active_bf.json")
+    for _ in range(MAX_REQUEUES + 2):
+        sup._reclaim_unowned()
+        assert (sup.queue_dir / "bf.json").exists()
+        os.replace(sup.queue_dir / "bf.json", sup.queue_dir / ".active_bf.json")
+    assert not list((sup.base_dir / "failed").glob("bf.json"))
+    ticket = json.loads((sup.queue_dir / ".active_bf.json").read_text())
+    assert ticket.get("requeueCount", 0) == 0
+
+
+# --- BF-07: a surviving MATLAB is killed before the ticket is requeued --------
+
+
+def _survivor(sup, server_id="1"):
+    """A process that carries the server's PETAKIT_SERVER_ID and jobs dir, like
+    MATLAB after its `bash -c` wrapper died."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "PETAKIT_JOBS_DIR"}
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        env=env
+        | {"PETAKIT_SERVER_ID": server_id, "PETAKIT_JOBS_DIR": str(sup.base_dir)},
+    )
+
+
+def test_a_matlab_that_outlives_its_wrapper_is_killed_before_the_requeue(tmp_path):
+    """BF-07: `_on_exit` trusted the wrapper. The ticket was requeued, a second
+    server started, and the partial sweep deleted the live process's outputs."""
+    data = _dataset_with_partials(tmp_path / "data")
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_a.json", data_dir=data)
+    sup.tick()
+    procs = dict(launched)
+    _claim(sup, "1", "bf_a.json")
+    survivor = _survivor(sup, "1")
+    try:
+        assert local_gpu_worker._server_pids("1", sup.base_dir) == [survivor.pid]
+        procs["1"].exit(1)  # the wrapper is gone, MATLAB is not
+        sup.tick()
+        assert survivor.wait(timeout=30) in (-15, -9)
+        assert (sup.queue_dir / "bf_a.json").exists()
+        assert not [p for p in data.rglob("*") if UUID in p.name]
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+
+def test_a_leftover_process_is_killed_before_the_server_is_launched_again(tmp_path):
+    sup, _, _ = _make_supervisor(tmp_path)
+    survivor = _survivor(sup, "1")
+    try:
+        _ticket(sup.queue_dir, "bf_a.json")
+        sup.tick()  # would launch server 1
+        assert survivor.wait(timeout=30) in (-15, -9)
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+
+def test_another_servers_process_is_not_killed_with_a_dead_one(tmp_path):
+    """Control for BF-07: only the dead slot's own id is swept."""
+    sup, launched, _ = _make_supervisor(tmp_path)
+    _ticket(sup.queue_dir, "bf_a.json")
+    sup.tick()
+    procs = dict(launched)
+    other = _survivor(sup, "2")
+    try:
+        procs["1"].exit(1)
+        sup.tick()
+        assert other.poll() is None
+    finally:
+        other.kill()
+        other.wait()
+
+
+# --- BF-08: slow GPFS work stays off the supervisor tick ----------------------
+
+
+def test_the_hang_walk_does_not_hold_up_the_tick(tmp_path, monkeypatch):
+    """BF-08: the full os.walk of a dataDir (every 5 min, GPFS) and inline
+    consolidation ran inside tick(); live deadline, preemption and launches
+    waited meanwhile."""
+    import threading
+
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow_walk(root):
+        started.set()
+        gate.wait(10)
+        return None
+
+    monkeypatch.setattr(local_gpu_worker, "newest_mtime", slow_walk)
+    sup, launched, clock = _make_supervisor(
+        tmp_path, hang_after_s=600, spawn=local_gpu_worker.spawn_thread
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    _ticket(sup.queue_dir, "job.json", data_dir=data)
+    sup.tick()
+    _claim(sup, "1", "job.json")
+    rec = sup.claims_dir / "S1.json"
+    os.utime(rec, (clock.t - 7200, clock.t - 7200))  # claimed two hours ago
+    clock.t += local_gpu_worker.HANG_CHECK_EVERY_S
+    t0 = time.monotonic()
+    sup.tick()  # starts the walk and returns
+    assert time.monotonic() - t0 < 2
+    assert started.wait(5)
+    assert sup.slots[0].hang_walk is not None
+    clock.t += 3600
+    sup.tick()  # walk still running: nothing decided, nothing blocked
+    assert not sup.slots[0].hang_flagged_ticket
+    gate.set()
+    sup.slots[0].hang_walk.future.result(timeout=5)
+    sup.tick()
+    assert sup.slots[0].hang_flagged_ticket == "job.json"  # the verdict arrives later
+
+
+def test_a_walk_for_a_ticket_the_server_has_left_is_discarded(tmp_path):
+    sup, launched, clock = _make_supervisor(tmp_path, hang_after_s=600)
+    data = tmp_path / "data"
+    data.mkdir()
+    _ticket(sup.queue_dir, "job.json", data_dir=data)
+    sup.tick()
+    _claim(sup, "1", "job.json")
+    release = []
+    def spawn(fn):
+        from concurrent.futures import Future
+
+        fut = Future()
+        release.append(lambda: fut.set_result(fn()))
+        return fut
+
+    sup._spawn = spawn
+    clock.t += local_gpu_worker.HANG_CHECK_EVERY_S + 7200
+    sup.tick()
+    (sup.claims_dir / "S1.json").unlink()  # the ticket resolved meanwhile
+    release[0]()
+    sup.tick()
+    assert not sup.slots[0].hang_flagged_ticket
+
+
+def test_consolidation_runs_off_the_tick_and_never_twice_at_once(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    def slow(base):
+        calls.append(base)
+        started.set()
+        gate.wait(10)
+        return 0
+
+    monkeypatch.setattr(local_gpu_worker, "run_pending_consolidations", slow)
+    sup, launched, clock = _make_supervisor(
+        tmp_path, spawn=local_gpu_worker.spawn_thread
+    )
+    _ticket(sup.queue_dir, "job.json")
+    sup.tick()
+    (sup.queue_dir / "job.json").unlink()
+    for _, proc in launched:
+        proc.exit(0)
+    t0 = time.monotonic()
+    sup.tick()
+    assert time.monotonic() - t0 < 2
+    assert started.wait(5)
+    # a live lease appears while consolidation walks GPFS: servers launch anyway
+    sup._lease_active = lambda: True
+    clock.t += local_gpu_worker.FAILURE_BACKOFF_BASE_SEC
+    launched.clear()
+    sup._clean_exit_pending_consolidation = True  # another spin-down meanwhile
+    sup.tick()
+    assert launched, "servers must not wait for the consolidation"
+    assert len(calls) == 1
+    gate.set()
+    sup._consolidation.result(timeout=5)
